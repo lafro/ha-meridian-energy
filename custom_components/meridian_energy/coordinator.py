@@ -148,7 +148,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         """Fetch backwards until the requested UTC cutoff, with loop guards."""
         before: str | None = None
         measurements: dict[tuple[datetime, str], MeridianMeasurement] = {}
-        end_on = datetime.now(_NZ).date().isoformat()
+        now = datetime.now(UTC)
+        end_on = now.astimezone(_NZ).date().isoformat()
 
         for _page_number in range(24):
             page = await self.client.async_get_measurements(
@@ -161,7 +162,11 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             if not page.measurements:
                 break
             for measurement in page.measurements:
-                if measurement.start.astimezone(UTC) >= since:
+                interval_end = measurement.end or measurement.start
+                if (
+                    measurement.start.astimezone(UTC) >= since
+                    and interval_end.astimezone(UTC) <= now
+                ):
                     key = (measurement.start, measurement.channel_id)
                     existing = measurements.get(key)
                     if existing is None or (

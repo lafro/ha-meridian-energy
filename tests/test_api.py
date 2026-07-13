@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import json
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
@@ -485,6 +487,30 @@ def test_parse_firebase_tokens_rejects_invalid_expiry(expires) -> None:
                 "refreshToken": "refresh",
                 "localId": "uid",
                 "expiresIn": expires,
+            }
+        )
+
+
+def test_parse_firebase_tokens_derives_current_user_id_from_jwt() -> None:
+    claims = base64.urlsafe_b64encode(json.dumps({"sub": "uid"}).encode()).decode()
+    tokens = _parse_firebase_tokens(
+        {
+            "idToken": f"header.{claims.rstrip('=')}.signature",
+            "refreshToken": "refresh",
+            "expiresIn": "3600",
+        }
+    )
+    assert tokens.user_id == "uid"
+
+
+@pytest.mark.parametrize("id_token", ["invalid", "a.b.c"])
+def test_parse_firebase_tokens_rejects_missing_user_id(id_token: str) -> None:
+    with pytest.raises(MeridianAuthenticationError, match="user identifier"):
+        _parse_firebase_tokens(
+            {
+                "idToken": id_token,
+                "refreshToken": "refresh",
+                "expiresIn": "3600",
             }
         )
 

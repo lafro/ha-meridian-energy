@@ -143,7 +143,9 @@ async def test_update_maps_errors(
 @pytest.mark.asyncio
 async def test_fetch_since_prefers_actual_for_same_channel(hass) -> None:
     client = MagicMock()
-    start = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+    start = datetime.now(UTC).replace(minute=0, second=0, microsecond=0) - timedelta(
+        hours=2
+    )
     estimate = _measurement(start, quality="ESTIMATE")
     actual = _measurement(start, quality="ACTUAL")
     other_channel = _measurement(start, channel="meter:controlled")
@@ -170,7 +172,9 @@ async def test_fetch_since_prefers_actual_for_same_channel(hass) -> None:
 @pytest.mark.asyncio
 async def test_fetch_since_paginates_backwards(hass) -> None:
     client = MagicMock()
-    now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+    now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0) - timedelta(
+        hours=2
+    )
     client.async_get_measurements = AsyncMock(
         side_effect=[
             MeasurementPage((_measurement(now),), True, "cursor-1"),
@@ -195,7 +199,9 @@ async def test_fetch_since_paginates_backwards(hass) -> None:
 @pytest.mark.asyncio
 async def test_fetch_since_rejects_stalled_cursor(hass) -> None:
     client = MagicMock()
-    now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+    now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0) - timedelta(
+        hours=2
+    )
     client.async_get_measurements = AsyncMock(
         side_effect=[
             MeasurementPage((_measurement(now),), True, "cursor-1"),
@@ -243,7 +249,9 @@ async def test_fetch_since_stops_on_empty_or_older_page(hass) -> None:
 @pytest.mark.asyncio
 async def test_fetch_since_has_hard_page_limit(hass) -> None:
     client = MagicMock()
-    now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+    now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0) - timedelta(
+        hours=2
+    )
     client.async_get_measurements = AsyncMock(
         side_effect=[
             MeasurementPage((_measurement(now),), True, f"cursor-{index}")
@@ -258,3 +266,29 @@ async def test_fetch_since_has_hard_page_limit(hass) -> None:
             direction="CONSUMPTION",
             since=now - timedelta(days=365),
         )
+
+
+@pytest.mark.asyncio
+async def test_fetch_since_ignores_incomplete_and_future_intervals(hass) -> None:
+    client = MagicMock()
+    now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+    completed = _measurement(now - timedelta(hours=2), quality="ESTIMATE")
+    current = _measurement(now, quality="ESTIMATE")
+    future = _measurement(now + timedelta(hours=1), quality="ESTIMATE")
+    client.async_get_measurements = AsyncMock(
+        return_value=MeasurementPage(
+            measurements=(completed, current, future),
+            has_previous_page=False,
+            start_cursor=None,
+        )
+    )
+    coordinator = MeridianDataCoordinator(hass, client)
+
+    result = await coordinator._async_fetch_since(
+        account_number="A-SYNTHETIC",
+        property_id="property",
+        direction="CONSUMPTION",
+        since=now - timedelta(days=1),
+    )
+
+    assert result == (completed,)

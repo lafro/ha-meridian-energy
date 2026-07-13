@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
@@ -191,10 +193,7 @@ class MeridianApiClient:
         data = await self._async_graphql(
             "accountsList",
             _ACCOUNTS_QUERY,
-            {
-                "activeFrom": "1970-01-01T00:00:00Z",
-                "allowedBrandCodes": ["MERIDIAN_ENERGY"],
-            },
+            {"allowedBrandCodes": ["MERIDIAN_ENERGY"]},
         )
         viewer = require_mapping(data.get("viewer"), "viewer")
         raw_accounts = require_list(viewer.get("accounts"), "viewer.accounts")
@@ -394,7 +393,7 @@ class _MeridianHttpError(MeridianError):
 def _parse_firebase_tokens(payload: dict[str, Any]) -> MeridianTokenSet:
     id_token = _required_string(payload, "idToken")
     refresh_token = _required_string(payload, "refreshToken")
-    user_id = _required_string(payload, "localId")
+    user_id = _firebase_user_id(payload, id_token)
     raw_expires = payload.get("expiresIn")
     try:
         if not isinstance(raw_expires, (str, int)):
@@ -412,6 +411,30 @@ def _parse_firebase_tokens(payload: dict[str, Any]) -> MeridianTokenSet:
         expires_at=datetime.now(UTC) + timedelta(seconds=expires_in),
         user_id=user_id,
     )
+
+
+def _firebase_user_id(payload: dict[str, Any], id_token: str) -> str:
+    """Return the Firebase UID from a legacy field or the issued ID token."""
+    local_id = payload.get("localId")
+    if isinstance(local_id, str) and local_id:
+        return local_id
+
+    try:
+        encoded_claims = id_token.split(".")[1]
+        padding = "=" * (-len(encoded_claims) % 4)
+        claims = json.loads(
+            base64.urlsafe_b64decode(encoded_claims + padding).decode("utf-8")
+        )
+        if not isinstance(claims, dict):
+            raise TypeError
+        subject = claims.get("sub")
+        if not isinstance(subject, str) or not subject:
+            raise TypeError
+    except (IndexError, TypeError, ValueError) as err:
+        raise MeridianAuthenticationError(
+            "Firebase returned no authenticated user identifier"
+        ) from err
+    return subject
 
 
 def _parse_measurement(
@@ -501,7 +524,7 @@ _AUTH_GRAPHQL_CODES = frozenset(
 )
 
 _ACCOUNTS_QUERY = """
-query accountsList($activeFrom: DateTime, $allowedBrandCodes: [BrandChoices]) {
+query accountsList($allowedBrandCodes: [BrandChoices]) {
   viewer {
     accounts(allowedBrandCodes: $allowedBrandCodes) {
       number
