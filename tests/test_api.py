@@ -15,12 +15,14 @@ from custom_components.meridian_energy.api import (
     MeridianAuthenticationError,
     MeridianGraphQLError,
     MeridianOtpError,
+    MeridianRateLimitError,
     _graphql_error_code,
     _MeridianHttpError,
     _optional_string,
     _parse_datetime,
     _parse_firebase_tokens,
     _parse_measurement,
+    _parse_retry_after,
     _required_string,
 )
 from custom_components.meridian_energy.models import (
@@ -40,10 +42,18 @@ def _tokens() -> MeridianTokenSet:
 
 
 class _FakeResponse:
-    def __init__(self, payload, *, status: int = 200, error: Exception | None = None):
+    def __init__(
+        self,
+        payload,
+        *,
+        status: int = 200,
+        error: Exception | None = None,
+        headers=None,
+    ):
         self.payload = payload
         self.status = status
         self.error = error
+        self.headers = headers or {}
 
     async def __aenter__(self):
         return self
@@ -210,6 +220,20 @@ async def test_refresh_propagates_server_error() -> None:
     )
     with pytest.raises(_MeridianHttpError):
         await client.async_refresh_tokens()
+
+
+@pytest.mark.asyncio
+async def test_refresh_propagates_rate_limit_delay() -> None:
+    expired = MeridianTokenSet(
+        "id", "refresh", datetime.now(UTC) - timedelta(seconds=1), "uid"
+    )
+    client = MeridianApiClient(MagicMock(), tokens=expired)
+    client._async_json_request = AsyncMock(
+        side_effect=_MeridianHttpError(429, {}, retry_after=123)
+    )
+    with pytest.raises(MeridianRateLimitError) as raised:
+        await client.async_refresh_tokens()
+    assert raised.value.retry_after == 123
 
 
 @pytest.mark.asyncio
@@ -432,11 +456,33 @@ async def test_graphql_retries_once_after_unauthorized() -> None:
 
 
 @pytest.mark.asyncio
+async def test_graphql_second_unauthorized_requires_reauth() -> None:
+    client = MeridianApiClient(MagicMock(), tokens=_tokens())
+    client.async_refresh_tokens = AsyncMock(return_value=_tokens())
+    client._async_json_request = AsyncMock(
+        side_effect=[_MeridianHttpError(401, {}), _MeridianHttpError(403, {})]
+    )
+    with pytest.raises(MeridianAuthenticationError):
+        await client._async_graphql("operation", "query", {})
+
+
+@pytest.mark.asyncio
 async def test_graphql_propagates_non_auth_http_error() -> None:
     client = MeridianApiClient(MagicMock(), tokens=_tokens())
     client._async_json_request = AsyncMock(side_effect=_MeridianHttpError(500, {}))
     with pytest.raises(_MeridianHttpError):
         await client._async_graphql("operation", "query", {})
+
+
+@pytest.mark.asyncio
+async def test_graphql_propagates_rate_limit_delay() -> None:
+    client = MeridianApiClient(MagicMock(), tokens=_tokens())
+    client._async_json_request = AsyncMock(
+        side_effect=_MeridianHttpError(429, {}, retry_after=456)
+    )
+    with pytest.raises(MeridianRateLimitError) as raised:
+        await client._async_graphql("operation", "query", {})
+    assert raised.value.retry_after == 456
 
 
 @pytest.mark.asyncio
@@ -461,6 +507,39 @@ async def test_json_request_success_and_http_error() -> None:
     )
     with pytest.raises(_MeridianHttpError):
         await client._async_json_request("https://example.test", authenticated=False)
+
+
+@pytest.mark.asyncio
+async def test_json_request_preserves_rate_limit_header_on_non_json_error() -> None:
+    client = MeridianApiClient(
+        _FakeSession(
+            _FakeResponse(
+                None,
+                status=429,
+                error=ValueError(),
+                headers={"Retry-After": "120"},
+            )
+        )
+    )
+    with pytest.raises(_MeridianHttpError) as raised:
+        await client._async_json_request("https://example.test", authenticated=False)
+    assert raised.value.status == 429
+    assert raised.value.retry_after == 120
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("30", 60),
+        ("120", 120),
+        ("999999", 86400),
+        ("invalid", 3600),
+        (None, 3600),
+        ("Wed, 21 Oct 2015 07:28:00 GMT", 60),
+    ],
+)
+def test_retry_after_is_parsed_and_clamped(value, expected: float) -> None:
+    assert _parse_retry_after(value) == expected
 
 
 @pytest.mark.parametrize("error", [ValueError(), TypeError()])

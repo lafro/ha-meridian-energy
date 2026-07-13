@@ -24,12 +24,36 @@ async def async_get_config_entry_diagnostics(
             "last_update_success": entry.runtime_data.coordinator.last_update_success,
             "account_count": data.account_count,
             "property_count": data.property_count,
+            "sync_mode": data.sync_mode,
+            "topology_refreshed": data.topology_refreshed,
+            "topology_cache_age_seconds": data.topology_cache_age_seconds,
             "property_results": [
                 {
-                    "consumption_rows": result.consumption_rows,
-                    "generation_rows": result.generation_rows,
+                    "sync_mode": result.sync_mode,
+                    "requested_window_start": result.requested_since,
+                    "requested_window_end": data.synced_at,
+                    "api_pages": {
+                        "consumption": result.consumption_pages,
+                        "generation": result.generation_pages,
+                    },
+                    "rows_received": {
+                        "consumption": result.consumption_received_rows,
+                        "generation": result.generation_received_rows,
+                    },
+                    "rows_retained": {
+                        "consumption": result.consumption_retained_rows,
+                        "generation": result.generation_retained_rows,
+                    },
+                    "rows_imported": {
+                        "consumption": result.consumption_rows,
+                        "generation": result.generation_rows,
+                    },
                     "latest_reading": result.latest_reading,
                     "estimated_rows": result.estimated_rows,
+                    "oldest_provisional_interval": result.oldest_estimated,
+                    "newest_provisional_interval": result.newest_estimated,
+                    "upstream_quality_counts": dict(result.quality_counts),
+                    "observed_rows_per_hour": result.observed_rows_per_hour,
                 }
                 for result in data.results
             ],

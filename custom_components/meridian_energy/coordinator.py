@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import math
+from collections import Counter
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
@@ -15,20 +17,34 @@ from .api import (
     MeridianAuthenticationError,
     MeridianConnectionError,
     MeridianError,
+    MeridianGraphQLError,
+    MeridianRateLimitError,
 )
 from .const import (
+    FULL_RECONCILIATION_INTERVAL,
     INITIAL_BACKFILL,
+    MAX_MEASUREMENT_PAGES,
+    MIN_PAGE_SIZE,
     NAME,
+    PAGE_SIZE,
     READING_CONSUMPTION,
     READING_GENERATION,
+    RECONCILIATION_SAFETY_MARGIN,
     REVISION_OVERLAP,
+    TARGETED_RECONCILIATION_INTERVAL,
+    TARGETED_RECONCILIATION_MINIMUM,
+    TIP_WINDOW,
+    TOPOLOGY_CACHE_INTERVAL,
     UPDATE_INTERVAL,
 )
 from .models import (
+    MeasurementFetchResult,
+    MeridianAccount,
     MeridianMeasurement,
     MeridianProperty,
     MeridianSyncData,
     PropertySyncResult,
+    SyncMode,
 )
 from .statistics import (
     async_has_statistics,
@@ -40,6 +56,18 @@ from .statistics import (
 
 _LOGGER = logging.getLogger(__name__)
 _NZ = ZoneInfo("Pacific/Auckland")
+_ACTUAL = "ACTUAL"
+_TOPOLOGY_ERROR_CODES = frozenset(
+    {"ACCOUNT_NOT_FOUND", "METER_NOT_FOUND", "PROPERTY_NOT_FOUND", "NOT_FOUND"}
+)
+
+MeasurementKey = tuple[datetime, str]
+CacheKey = tuple[str, str]
+
+
+def _utcnow() -> datetime:
+    """Return the current UTC time through a patchable seam."""
+    return datetime.now(UTC)
 
 
 class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
@@ -60,85 +88,346 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             update_interval=UPDATE_INTERVAL,
         )
         self.client = client
+        self._topology: tuple[MeridianAccount, ...] | None = None
+        self._topology_cached_at: datetime | None = None
+        self._measurement_cache: dict[
+            CacheKey, dict[MeasurementKey, MeridianMeasurement]
+        ] = {}
+        self._row_density: dict[CacheKey, float] = {}
+        self._known_statistics: dict[str, bool] = {}
+        self._initial_refresh_complete = False
+        self._last_targeted_reconciliation: datetime | None = None
+        self._last_full_reconciliation: datetime | None = None
 
     async def _async_update_data(self) -> MeridianSyncData:
         return await self.async_fetch_and_import()
 
     async def async_fetch_and_import(self) -> MeridianSyncData:
         """Fetch Meridian data and import statistics for setup or polling."""
+        now = _utcnow()
+        topology_refreshed = False
         try:
-            accounts = await self.client.async_get_accounts()
-            results: list[PropertySyncResult] = []
-            for account in accounts:
-                for property_data in account.properties:
-                    results.append(
-                        await self._async_sync_property(
-                            account.number,
-                            property_data,
-                        )
-                    )
+            accounts, topology_refreshed = await self._async_get_topology(now)
+            mode = (
+                await self._async_startup_mode(accounts)
+                if not self._initial_refresh_complete
+                else self._select_sync_mode(now)
+            )
+            try:
+                results = await self._async_sync_accounts(accounts, mode, now)
+            except MeridianGraphQLError as err:
+                if topology_refreshed or not _is_topology_error(err):
+                    raise
+                accounts, topology_refreshed = await self._async_get_topology(
+                    now, force=True
+                )
+                results = await self._async_sync_accounts(accounts, mode, now)
+
+            self._initial_refresh_complete = True
+            if mode in {SyncMode.INITIAL, SyncMode.RESTART}:
+                self._last_targeted_reconciliation = now
+                self._last_full_reconciliation = now
+            elif mode is SyncMode.TARGETED_RECONCILIATION:
+                self._last_targeted_reconciliation = now
+            elif mode is SyncMode.FULL_RECONCILIATION:
+                self._last_targeted_reconciliation = now
+                self._last_full_reconciliation = now
+
             return MeridianSyncData(
                 account_count=len(accounts),
                 property_count=sum(len(account.properties) for account in accounts),
-                results=tuple(results),
-                synced_at=datetime.now(UTC),
+                results=results,
+                synced_at=now,
+                sync_mode=mode,
+                topology_refreshed=topology_refreshed,
+                topology_cache_age_seconds=self._topology_cache_age(now),
             )
         except MeridianAuthenticationError as err:
             raise ConfigEntryAuthFailed from err
+        except MeridianRateLimitError as err:
+            raise UpdateFailed(
+                "Meridian asked Home Assistant to retry later",
+                retry_after=err.retry_after,
+            ) from err
         except MeridianConnectionError as err:
             raise UpdateFailed("Unable to reach Meridian") from err
         except (MeridianError, ValueError) as err:
             raise UpdateFailed("Meridian returned invalid energy data") from err
 
+    def _select_sync_mode(self, now: datetime) -> SyncMode:
+        if not self._initial_refresh_complete:
+            return SyncMode.INITIAL
+        if (
+            self._last_full_reconciliation is None
+            or now - self._last_full_reconciliation >= FULL_RECONCILIATION_INTERVAL
+        ):
+            return SyncMode.FULL_RECONCILIATION
+        if (
+            self._last_targeted_reconciliation is None
+            or now - self._last_targeted_reconciliation
+            >= TARGETED_RECONCILIATION_INTERVAL
+        ):
+            return SyncMode.TARGETED_RECONCILIATION
+        return SyncMode.TIP
+
+    async def _async_get_topology(
+        self, now: datetime, *, force: bool = False
+    ) -> tuple[tuple[MeridianAccount, ...], bool]:
+        expired = (
+            self._topology_cached_at is None
+            or now - self._topology_cached_at >= TOPOLOGY_CACHE_INTERVAL
+        )
+        if force or self._topology is None or expired:
+            self._topology = await self.client.async_get_accounts()
+            self._topology_cached_at = now
+            return self._topology, True
+        return self._topology, False
+
+    async def _async_startup_mode(
+        self, accounts: tuple[MeridianAccount, ...]
+    ) -> SyncMode:
+        """Distinguish a new install from a restart without changing IDs."""
+        has_all_statistics = True
+        for account in accounts:
+            for property_data in account.properties:
+                key = property_key(account.number, property_data.id)
+                required_ids = [consumption_ids(key)[0]]
+                if any(meter.has_feed_in for meter in property_data.meter_points):
+                    required_ids.append(generation_ids(key)[0])
+                for statistic_id in required_ids:
+                    if statistic_id not in self._known_statistics:
+                        self._known_statistics[
+                            statistic_id
+                        ] = await async_has_statistics(self.hass, statistic_id)
+                    has_all_statistics &= self._known_statistics[statistic_id]
+        return SyncMode.RESTART if has_all_statistics else SyncMode.INITIAL
+
+    def _topology_cache_age(self, now: datetime) -> float:
+        if self._topology_cached_at is None:
+            return 0.0
+        return max(0.0, (now - self._topology_cached_at).total_seconds())
+
+    async def _async_sync_accounts(
+        self,
+        accounts: tuple[MeridianAccount, ...],
+        mode: SyncMode,
+        now: datetime,
+    ) -> tuple[PropertySyncResult, ...]:
+        results: list[PropertySyncResult] = []
+        for account in accounts:
+            for property_data in account.properties:
+                results.append(
+                    await self._async_sync_property(
+                        account.number, property_data, mode, now
+                    )
+                )
+        return tuple(results)
+
     async def _async_sync_property(
         self,
         account_number: str,
         property_data: MeridianProperty,
+        mode: SyncMode,
+        now: datetime,
     ) -> PropertySyncResult:
         key = property_key(account_number, property_data.id)
         consumption_energy_id, consumption_cost_id = consumption_ids(key)
-        existing = await async_has_statistics(self.hass, consumption_energy_id)
-        since = datetime.now(UTC) - (REVISION_OVERLAP if existing else INITIAL_BACKFILL)
-
+        consumption_mode = await self._direction_mode(consumption_energy_id, mode)
+        consumption_since = self._requested_since(
+            (key, READING_CONSUMPTION), consumption_mode, now
+        )
         consumption = await self._async_fetch_since(
             account_number=account_number,
             property_id=property_data.id,
             direction=READING_CONSUMPTION,
-            since=since,
+            since=consumption_since,
+            page_size=self._page_size(
+                (key, READING_CONSUMPTION), consumption_since, now
+            ),
         )
-        consumption_rows, _ = await async_import_measurements(
-            self.hass,
-            stat_energy_id=consumption_energy_id,
-            stat_cost_id=consumption_cost_id,
-            energy_name=f"Meridian electricity consumption — {property_data.address}",
-            cost_name=f"Meridian electricity cost — {property_data.address}",
-            measurements=consumption,
+        self._remember_density((key, READING_CONSUMPTION), consumption)
+        consumption_import = self._merge_measurements(
+            (key, READING_CONSUMPTION),
+            consumption.measurements,
+            now,
+            initial_import=consumption_mode is SyncMode.INITIAL,
         )
+        consumption_rows = 0
+        if consumption_import:
+            consumption_rows, _ = await async_import_measurements(
+                self.hass,
+                stat_energy_id=consumption_energy_id,
+                stat_cost_id=consumption_cost_id,
+                energy_name=(
+                    f"Meridian electricity consumption — {property_data.address}"
+                ),
+                cost_name=f"Meridian electricity cost — {property_data.address}",
+                measurements=consumption_import,
+            )
+            self._known_statistics[consumption_energy_id] = True
 
         generation_rows = 0
+        generation = _empty_fetch()
+        generation_since = consumption_since
         if any(meter.has_feed_in for meter in property_data.meter_points):
+            generation_energy_id, generation_credit_id = generation_ids(key)
+            generation_mode = await self._direction_mode(generation_energy_id, mode)
+            generation_since = self._requested_since(
+                (key, READING_GENERATION), generation_mode, now
+            )
             generation = await self._async_fetch_since(
                 account_number=account_number,
                 property_id=property_data.id,
                 direction=READING_GENERATION,
-                since=since,
+                since=generation_since,
+                page_size=self._page_size(
+                    (key, READING_GENERATION), generation_since, now
+                ),
             )
-            generation_energy_id, generation_credit_id = generation_ids(key)
-            generation_rows, _ = await async_import_measurements(
-                self.hass,
-                stat_energy_id=generation_energy_id,
-                stat_cost_id=generation_credit_id,
-                energy_name=f"Meridian solar export — {property_data.address}",
-                cost_name=f"Meridian solar export credit — {property_data.address}",
-                measurements=generation,
+            self._remember_density((key, READING_GENERATION), generation)
+            generation_import = self._merge_measurements(
+                (key, READING_GENERATION),
+                generation.measurements,
+                now,
+                initial_import=generation_mode is SyncMode.INITIAL,
             )
+            if generation_import:
+                generation_rows, _ = await async_import_measurements(
+                    self.hass,
+                    stat_energy_id=generation_energy_id,
+                    stat_cost_id=generation_credit_id,
+                    energy_name=f"Meridian solar export — {property_data.address}",
+                    cost_name=(
+                        f"Meridian solar export credit — {property_data.address}"
+                    ),
+                    measurements=generation_import,
+                )
+                self._known_statistics[generation_energy_id] = True
 
+        consumption_cache = self._measurement_cache.get((key, READING_CONSUMPTION), {})
+        qualities = Counter(item.quality for item in consumption_cache.values())
+        provisional = sorted(
+            item.start.astimezone(UTC)
+            for item in consumption_cache.values()
+            if item.quality != _ACTUAL
+        )
+        observed_density = max(
+            consumption.observed_rows_per_hour,
+            generation.observed_rows_per_hour,
+        )
         return PropertySyncResult(
             property_key=key,
             consumption_rows=consumption_rows,
             generation_rows=generation_rows,
-            latest_reading=max((item.start for item in consumption), default=None),
-            estimated_rows=sum(item.quality != "ACTUAL" for item in consumption),
+            latest_reading=max(
+                (item.start for item in consumption_cache.values()), default=None
+            ),
+            estimated_rows=len(provisional),
+            sync_mode=mode,
+            requested_since=min(consumption_since, generation_since),
+            consumption_pages=consumption.pages,
+            generation_pages=generation.pages,
+            consumption_received_rows=consumption.received_rows,
+            generation_received_rows=generation.received_rows,
+            consumption_retained_rows=len(consumption.measurements),
+            generation_retained_rows=len(generation.measurements),
+            oldest_estimated=provisional[0] if provisional else None,
+            newest_estimated=provisional[-1] if provisional else None,
+            quality_counts=tuple(sorted(qualities.items())),
+            observed_rows_per_hour=observed_density,
+        )
+
+    async def _direction_mode(
+        self, energy_statistic_id: str, requested_mode: SyncMode
+    ) -> SyncMode:
+        if energy_statistic_id not in self._known_statistics:
+            self._known_statistics[energy_statistic_id] = await async_has_statistics(
+                self.hass, energy_statistic_id
+            )
+        if not self._known_statistics[energy_statistic_id]:
+            return SyncMode.INITIAL
+        if not self._initial_refresh_complete:
+            return SyncMode.RESTART
+        return requested_mode
+
+    def _requested_since(
+        self, cache_key: CacheKey, mode: SyncMode, now: datetime
+    ) -> datetime:
+        if mode is SyncMode.INITIAL:
+            return now - INITIAL_BACKFILL
+        if mode in {SyncMode.RESTART, SyncMode.FULL_RECONCILIATION}:
+            return now - REVISION_OVERLAP
+        if mode is SyncMode.TIP:
+            return now - TIP_WINDOW
+
+        minimum = now - TARGETED_RECONCILIATION_MINIMUM
+        oldest_provisional = min(
+            (
+                item.start.astimezone(UTC)
+                for item in self._measurement_cache.get(cache_key, {}).values()
+                if item.quality != _ACTUAL
+            ),
+            default=None,
+        )
+        if oldest_provisional is None:
+            return minimum
+        widened = oldest_provisional - RECONCILIATION_SAFETY_MARGIN
+        return max(now - REVISION_OVERLAP, min(minimum, widened))
+
+    def _page_size(self, cache_key: CacheKey, since: datetime, now: datetime) -> int:
+        hours = max(1, math.ceil((now - since).total_seconds() / 3600))
+        density = max(1.0, self._row_density.get(cache_key, 1.0))
+        requested = math.ceil(hours * density * 1.25) + 4
+        return min(PAGE_SIZE, max(MIN_PAGE_SIZE, requested))
+
+    def _merge_measurements(
+        self,
+        cache_key: CacheKey,
+        incoming: tuple[MeridianMeasurement, ...],
+        now: datetime,
+        *,
+        initial_import: bool = False,
+    ) -> tuple[MeridianMeasurement, ...]:
+        cache = self._measurement_cache.setdefault(cache_key, {})
+        cutoff = now - REVISION_OVERLAP
+        for key in tuple(cache):
+            if key[0] < cutoff:
+                del cache[key]
+
+        earliest_changed: datetime | None = None
+        for measurement in incoming:
+            start = measurement.start.astimezone(UTC)
+            if start < cutoff:
+                continue
+            key = (start, measurement.channel_id)
+            existing = cache.get(key)
+            if (
+                existing is not None
+                and existing.quality == _ACTUAL
+                and measurement.quality != _ACTUAL
+            ):
+                continue
+            if existing != measurement:
+                cache[key] = measurement
+                earliest_changed = (
+                    start if earliest_changed is None else min(earliest_changed, start)
+                )
+
+        if initial_import:
+            return tuple(
+                sorted(incoming, key=lambda item: (item.start, item.channel_id))
+            )
+        if earliest_changed is None:
+            return ()
+        return tuple(
+            sorted(
+                (
+                    item
+                    for item in cache.values()
+                    if item.start.astimezone(UTC) >= earliest_changed
+                ),
+                key=lambda item: (item.start, item.channel_id),
+            )
         )
 
     async def _async_fetch_since(
@@ -148,33 +437,38 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         property_id: str,
         direction: str,
         since: datetime,
-    ) -> tuple[MeridianMeasurement, ...]:
+        page_size: int | None = None,
+    ) -> MeasurementFetchResult:
         """Fetch backwards until the requested UTC cutoff, with loop guards."""
         before: str | None = None
-        measurements: dict[tuple[datetime, str], MeridianMeasurement] = {}
-        now = datetime.now(UTC)
+        measurements: dict[MeasurementKey, MeridianMeasurement] = {}
+        now = _utcnow()
         end_on = now.astimezone(_NZ).date().isoformat()
+        received_rows = 0
+        pages = 0
+        resolved_page_size = page_size or PAGE_SIZE
 
-        for _page_number in range(24):
+        for _page_number in range(MAX_MEASUREMENT_PAGES):
             page = await self.client.async_get_measurements(
                 account_number=account_number,
                 property_id=property_id,
                 direction=direction,
                 end_on=end_on,
                 before=before,
+                page_size=resolved_page_size,
             )
+            pages += 1
+            received_rows += len(page.measurements)
             if not page.measurements:
                 break
             for measurement in page.measurements:
-                interval_end = measurement.end or measurement.start
-                if (
-                    measurement.start.astimezone(UTC) >= since
-                    and interval_end.astimezone(UTC) <= now
-                ):
-                    key = (measurement.start, measurement.channel_id)
+                start = measurement.start.astimezone(UTC)
+                interval_end = (measurement.end or measurement.start).astimezone(UTC)
+                if start >= since and interval_end <= now:
+                    key = (start, measurement.channel_id)
                     existing = measurements.get(key)
                     if existing is None or (
-                        existing.quality != "ACTUAL" and measurement.quality == "ACTUAL"
+                        existing.quality != _ACTUAL and measurement.quality == _ACTUAL
                     ):
                         measurements[key] = measurement
             oldest = min(item.start.astimezone(UTC) for item in page.measurements)
@@ -186,4 +480,36 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         else:
             raise ValueError("Meridian pagination exceeded the safety limit")
 
-        return tuple(sorted(measurements.values(), key=lambda item: item.start))
+        hours = max(1.0, (now - since).total_seconds() / 3600)
+        observed_density = len(measurements) / hours
+        result = tuple(
+            sorted(
+                measurements.values(), key=lambda item: (item.start, item.channel_id)
+            )
+        )
+        return MeasurementFetchResult(
+            measurements=result,
+            pages=pages,
+            received_rows=received_rows,
+            observed_rows_per_hour=observed_density,
+        )
+
+    def _remember_density(
+        self, cache_key: CacheKey, result: MeasurementFetchResult
+    ) -> None:
+        if result.observed_rows_per_hour <= 0:
+            return
+        previous = self._row_density.get(cache_key)
+        if previous is None:
+            self._row_density[cache_key] = result.observed_rows_per_hour
+            return
+        smoothed = previous * 0.75 + result.observed_rows_per_hour * 0.25
+        self._row_density[cache_key] = max(result.observed_rows_per_hour, smoothed)
+
+
+def _empty_fetch() -> MeasurementFetchResult:
+    return MeasurementFetchResult((), 0, 0, 0.0)
+
+
+def _is_topology_error(err: MeridianGraphQLError) -> bool:
+    return bool(_TOPOLOGY_ERROR_CODES.intersection(err.codes))

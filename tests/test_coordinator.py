@@ -17,6 +17,7 @@ from custom_components.meridian_energy.api import (
 )
 from custom_components.meridian_energy.coordinator import MeridianDataCoordinator
 from custom_components.meridian_energy.models import (
+    MeasurementFetchResult,
     MeasurementPage,
     MeridianAccount,
     MeridianMeasurement,
@@ -63,13 +64,22 @@ def _account(*, feed_in: bool = False) -> MeridianAccount:
     )
 
 
+def _fetch(*measurements: MeridianMeasurement) -> MeasurementFetchResult:
+    return MeasurementFetchResult(
+        measurements=measurements,
+        pages=1,
+        received_rows=len(measurements),
+        observed_rows_per_hour=float(len(measurements)),
+    )
+
+
 @pytest.mark.asyncio
 async def test_update_imports_consumption(hass) -> None:
     client = MagicMock()
     client.async_get_accounts = AsyncMock(return_value=(_account(),))
     coordinator = MeridianDataCoordinator(hass, client)
     now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
-    coordinator._async_fetch_since = AsyncMock(return_value=(_measurement(now),))
+    coordinator._async_fetch_since = AsyncMock(return_value=_fetch(_measurement(now)))
 
     with (
         patch(
@@ -104,8 +114,8 @@ async def test_update_imports_generation_for_feed_in(hass) -> None:
     now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
     coordinator._async_fetch_since = AsyncMock(
         side_effect=[
-            (_measurement(now),),
-            (_measurement(now, direction="GENERATION"),),
+            _fetch(_measurement(now)),
+            _fetch(_measurement(now, direction="GENERATION")),
         ]
     )
     with (
@@ -177,8 +187,8 @@ async def test_fetch_since_prefers_actual_for_same_channel(hass) -> None:
         since=start - timedelta(hours=1),
     )
 
-    assert len(result) == 2
-    assert {item.quality for item in result} == {"ACTUAL"}
+    assert len(result.measurements) == 2
+    assert {item.quality for item in result.measurements} == {"ACTUAL"}
 
 
 @pytest.mark.asyncio
@@ -202,7 +212,7 @@ async def test_fetch_since_paginates_backwards(hass) -> None:
         since=now - timedelta(days=3),
     )
 
-    assert len(result) == 2
+    assert len(result.measurements) == 2
     assert (
         client.async_get_measurements.await_args_list[1].kwargs["before"] == "cursor-1"
     )
@@ -254,8 +264,8 @@ async def test_fetch_since_stops_on_empty_or_older_page(hass) -> None:
         direction="CONSUMPTION",
         since=now - timedelta(days=1),
     )
-    assert empty == ()
-    assert older == ()
+    assert empty.measurements == ()
+    assert older.measurements == ()
 
 
 @pytest.mark.asyncio
@@ -267,11 +277,14 @@ async def test_fetch_since_has_hard_page_limit(hass) -> None:
     client.async_get_measurements = AsyncMock(
         side_effect=[
             MeasurementPage((_measurement(now),), True, f"cursor-{index}")
-            for index in range(24)
+            for index in range(2)
         ]
     )
     coordinator = MeridianDataCoordinator(hass, client)
-    with pytest.raises(ValueError, match="safety limit"):
+    with (
+        patch("custom_components.meridian_energy.coordinator.MAX_MEASUREMENT_PAGES", 2),
+        pytest.raises(ValueError, match="safety limit"),
+    ):
         await coordinator._async_fetch_since(
             account_number="A-SYNTHETIC",
             property_id="property",
@@ -303,4 +316,4 @@ async def test_fetch_since_ignores_incomplete_and_future_intervals(hass) -> None
         since=now - timedelta(days=1),
     )
 
-    assert result == (completed,)
+    assert result.measurements == (completed,)
