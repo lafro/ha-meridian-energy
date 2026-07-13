@@ -1,0 +1,67 @@
+{
+  "title": "Meridian Energy",
+  "config": {
+    "abort": {
+      "already_configured": "This Meridian account is already configured.",
+      "login_expired": "The login attempt expired. Start setup again to request a new code.",
+      "initial_import_failed": "The initial Meridian history import did not complete. Check the connection and start setup again; no login code or password was stored.",
+      "reauth_entry_missing": "The Meridian configuration entry could not be found.",
+      "reauth_successful": "Meridian Energy was reauthenticated successfully."
+    },
+    "error": {
+      "cannot_connect": "Unable to reach Meridian. Check your internet connection and try again.",
+      "email_not_found": "Meridian did not accept that email address.",
+      "invalid_auth": "Meridian rejected the login attempt. Request a new code and try again.",
+      "otp_expired": "The code has expired. Start setup again to request a new one.",
+      "otp_invalid": "The code is incorrect. Check the email and try again.",
+      "otp_not_found": "The code has already been used or was not found. Start setup again.",
+      "otp_too_many_attempts": "Too many attempts were made. Start setup again to request a new code."
+    },
+    "step": {
+      "user": {
+        "title": "Connect Meridian Energy",
+        "description": "Enter the email address used for MyMeridian. Meridian will email a six-digit login code. No password is requested or stored. After setup, Home Assistant refreshes the session automatically; another code is only needed if Meridian rejects or revokes that session.",
+        "data": {
+          "email": "Email address"
+        },
+        "data_description": {
+          "email": "The email address you use to sign in at app.meridianenergy.nz."
+        }
+      },
+      "otp": {
+        "title": "Enter the Meridian login code",
+        "description": "Enter the six-digit code Meridian sent to {email}.",
+        "data": {
+          "otp": "Six-digit code"
+        },
+        "data_description": {
+          "otp": "Codes are single-use and expire quickly."
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reconnect Meridian Energy",
+        "description": "Meridian no longer accepts the stored session for {email}. Submit to request a new six-digit code.",
+        "data": {}
+      }
+    },
+    "progress": {
+      "initial_import": "Meridian is importing up to one year of electricity usage and cost history. This usually takes 2–5 minutes. Keep this dialog open; setup will continue automatically when the import is complete."
+    },
+    "create_entry": {
+      "default": "Meridian Energy is connected. Home Assistant will refresh the stored session automatically; a new emailed code is only required if Meridian invalidates it."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "last_sync": {
+        "name": "Last data update"
+      },
+      "latest_meter_data": {
+        "name": "Latest usage period"
+      },
+      "estimated_readings": {
+        "name": "Estimated readings"
+      }
+    }
+  }
+}
