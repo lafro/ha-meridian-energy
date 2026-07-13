@@ -103,7 +103,6 @@ class MeridianDiagnosticSensor(
             configuration_url="https://app.meridianenergy.nz/",
         )
         self._attr_translation_key = description.translation_key
-        self._attr_name = None
 
     @property
     def native_value(self) -> datetime | int | None:
