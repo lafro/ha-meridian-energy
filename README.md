@@ -17,8 +17,6 @@ An unofficial Home Assistant custom integration that imports electricity usage f
 - A one-year initial history import, followed by a fourteen-day overlap on each update so estimated readings can be replaced safely by actual readings.
 - Privacy-preserving diagnostics and diagnostic entities for sync health and meter-data freshness.
 
-The integration polls every three hours. Meridian's meter data can itself be delayed by several days.
-
 ## Security and privacy
 
 The integration never asks for or stores your Meridian password.
@@ -45,6 +43,32 @@ See [SECURITY.md](SECURITY.md) before reporting a security issue.
 5. Enter the six-digit code emailed by Meridian.
 6. Keep the setup dialog open while the integration imports up to one year of history. The progress step normally takes 2–5 minutes and advances automatically.
 
+## Entities and long-term statistics
+
+The integration creates a **Meridian Energy account** service device with three diagnostic entities:
+
+| Entity | What it represents |
+|---|---|
+| **Last data update** | The time Home Assistant last completed a successful Meridian synchronisation. This confirms that the integration ran; it is not the timestamp of the newest meter reading. |
+| **Latest usage period** | The start time of the newest completed consumption interval returned by Meridian. Use this to understand how current Meridian's meter data is. |
+| **Estimated readings** | The number of completed hourly consumption intervals in the latest rolling import that Meridian still marks as estimated rather than actual. It is a count of intervals, not an energy value or number of days. The count covers all properties associated with the configured Meridian login. |
+
+For each property with consumption data, the integration creates these external long-term statistics:
+
+| Statistic | Unit | What it represents |
+|---|---:|---|
+| **Meridian electricity consumption — `<property>`** | kWh | Combined grid consumption across the property's meter registers. |
+| **Meridian electricity cost — `<property>`** | NZD | Meridian's returned consumption and standing-charge costs, including tax. |
+
+When Meridian reports a feed-in register and returns generation data, the integration also creates:
+
+| Statistic | Unit | What it represents |
+|---|---:|---|
+| **Meridian solar export — `<property>`** | kWh | Electricity exported to the grid. |
+| **Meridian solar export credit — `<property>`** | NZD | The corresponding export value returned by Meridian. |
+
+These are external long-term statistics, not normal live sensor entities. Their internal statistic IDs contain a stable privacy-preserving property identifier.
+
 ## Energy dashboard
 
 The integration creates external long-term statistics rather than pretending Meridian's delayed settlement data is a live power sensor.
@@ -53,7 +77,7 @@ After the first successful import, configure the Energy dashboard with the gener
 
 Do not add a Meridian statistic alongside another whole-home meter that measures the same grid import; doing so would double-count consumption.
 
-## Data handling
+## Data handling and update schedule
 
 Meridian returns hourly interval values. For each property, the integration:
 
@@ -61,10 +85,28 @@ Meridian returns hourly interval values. For each property, the integration:
 2. converts timestamps to UTC while preserving New Zealand daylight-saving boundaries;
 3. builds monotonic cumulative kWh and NZD statistics;
 4. converts Meridian's cost values from cents to dollars;
-5. upserts existing timestamps, allowing estimates to be corrected later; and
-6. uses stable hashed statistic identifiers that do not expose account or property IDs.
+5. prefers an actual reading over an estimate for the same interval and register;
+6. upserts existing timestamps, allowing estimates to be corrected later; and
+7. uses stable hashed statistic identifiers that do not expose account or property IDs.
 
-The initial history window is 365 days. Subsequent updates re-import the latest 14 days. This bounds API load while covering Meridian's normal estimate-to-actual revision period.
+The integration polls Meridian every three hours. The initial history window is 365 days; subsequent updates re-import the latest 14 days so estimates can be replaced by actual readings at the same timestamps. This bounds API load while covering Meridian's normal revision period.
+
+This integration provides delayed interval and billing data. It does not provide instantaneous household power. Meridian may publish usage several hours or days after electricity is consumed.
+
+## Current validation and known limitations
+
+This release was developed and live-tested with a Meridian login containing one active property, one electricity meter point, an all-day tariff and no solar feed-in.
+
+The implementation can process multiple Meridian accounts and properties, combines multiple meter registers, and includes automated coverage for conditional solar-export imports. The following account types have not yet been verified against live Meridian data:
+
+- solar or other feed-in accounts;
+- day/night or other time-of-use tariff plans;
+- logins containing multiple properties; and
+- properties containing multiple meter points.
+
+For multi-rate plans, the integration is expected to import the correct combined consumption and cost because it uses Meridian's per-interval values. It does not currently expose separate day/night or tariff-specific statistics.
+
+Meridian's customer-service endpoints are private and undocumented, so behaviour may change without notice. Users with one of the account types above are encouraged to report results and attach reviewed, privacy-preserving Home Assistant diagnostics.
 
 ## Removal
 
