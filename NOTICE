@@ -1,0 +1,13 @@
+Meridian Energy for Home Assistant
+Copyright (c) 2026 lafro and contributors
+
+This project is an independent implementation for Meridian Energy's current
+customer application.
+
+The project acknowledges the earlier MIT-licensed ha-meridian-energy integration
+by Cody Cooper and contributors:
+https://github.com/codyc1515/ha-meridian-energy
+
+No Meridian Energy source code, credentials, customer records, or proprietary
+assets are included in this repository.
+
