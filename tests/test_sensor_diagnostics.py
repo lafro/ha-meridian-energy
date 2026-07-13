@@ -81,6 +81,7 @@ async def test_sensor_values_and_device_identifier_are_redacted(hass) -> None:
         "latest_meter_data",
         "estimated_readings",
     ]
+    assert all(not hasattr(entity, "_attr_name") for entity in entities)
 
 
 @pytest.mark.asyncio
