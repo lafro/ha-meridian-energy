@@ -1,5 +1,6 @@
 {
   "name": "Meridian Energy",
+  "country": ["NZ"],
   "render_readme": true,
   "homeassistant": "2026.7.2"
 }

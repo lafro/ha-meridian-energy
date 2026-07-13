@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Any
 from uuid import uuid4
 
@@ -18,8 +20,11 @@ from .api import (
     MeridianOtpError,
 )
 from .const import CONF_FIREBASE_USER_ID, CONF_REFRESH_TOKEN, DOMAIN
+from .coordinator import MeridianDataCoordinator
+from .models import MeridianTokenSet
 
 OTP_LENGTH = 6
+_LOGGER = logging.getLogger(__name__)
 
 
 class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -32,6 +37,8 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
         self._email: str | None = None
         self._journey_id: str | None = None
         self._reauth_entry: ConfigEntry | None = None
+        self._pending_data: dict[str, Any] | None = None
+        self._initial_import_task: asyncio.Task[None] | None = None
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -93,9 +100,51 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
                         data_updates=data,
                         reason="reauth_successful",
                     )
-                return self.async_create_entry(title=self._email, data=data)
+                self._pending_data = data
+                self._initial_import_task = self.hass.async_create_task(
+                    self._async_initial_import(tokens)
+                )
+                return await self.async_step_initial_import()
 
         return self._show_otp_form(errors)
+
+    async def async_step_initial_import(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Show progress while importing the initial year of history."""
+        del user_input
+        if self._initial_import_task is None or self._pending_data is None:
+            return self.async_abort(reason="login_expired")
+        if not self._initial_import_task.done():
+            return self.async_show_progress(
+                step_id="initial_import",
+                progress_action="initial_import",
+                progress_task=self._initial_import_task,
+            )
+        try:
+            self._initial_import_task.result()
+        except Exception:
+            _LOGGER.exception("Initial Meridian history import failed")
+            return self.async_abort(reason="initial_import_failed")
+        return self.async_show_progress_done(next_step_id="finish")
+
+    async def async_step_finish(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Create the config entry after the initial import completes."""
+        del user_input
+        if self._email is None or self._pending_data is None:
+            return self.async_abort(reason="login_expired")
+        return self.async_create_entry(title=self._email, data=self._pending_data)
+
+    async def _async_initial_import(self, tokens: MeridianTokenSet) -> None:
+        """Import history before entry creation so progress is visible to the user."""
+        client = MeridianApiClient(
+            async_get_clientsession(self.hass),
+            tokens=tokens,
+        )
+        coordinator = MeridianDataCoordinator(self.hass, client)
+        await coordinator.async_fetch_and_import()
 
     def _show_otp_form(self, errors: dict[str, str]) -> ConfigFlowResult:
         """Show the serializable six-digit login-code form."""

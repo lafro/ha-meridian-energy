@@ -8,6 +8,7 @@ The project acknowledges the earlier MIT-licensed ha-meridian-energy integration
 by Cody Cooper and contributors:
 https://github.com/codyc1515/ha-meridian-energy
 
-No Meridian Energy source code, credentials, customer records, or proprietary
-assets are included in this repository.
-
+No Meridian Energy source code, credentials, or customer records are included
+in this repository. The Meridian name and logo are used only to identify the
+service supported by the integration. They remain the property of their
+respective owner, and their inclusion does not imply endorsement.

@@ -88,6 +88,12 @@ async def test_update_imports_consumption(hass) -> None:
     assert result.results[0].consumption_rows == 1
     assert result.results[0].generation_rows == 0
     importer.assert_awaited_once()
+    assert importer.await_args.kwargs["energy_name"] == (
+        "Meridian electricity consumption — 1 Synthetic Street"
+    )
+    assert importer.await_args.kwargs["cost_name"] == (
+        "Meridian electricity cost — 1 Synthetic Street"
+    )
 
 
 @pytest.mark.asyncio
@@ -117,6 +123,12 @@ async def test_update_imports_generation_for_feed_in(hass) -> None:
     assert result.results[0].generation_rows == 1
     assert importer.await_count == 2
     assert coordinator._async_fetch_since.await_count == 2
+    assert importer.await_args_list[1].kwargs["energy_name"] == (
+        "Meridian solar export — 1 Synthetic Street"
+    )
+    assert importer.await_args_list[1].kwargs["cost_name"] == (
+        "Meridian solar export credit — 1 Synthetic Street"
+    )
 
 
 @pytest.mark.parametrize(

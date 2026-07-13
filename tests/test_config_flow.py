@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
@@ -49,11 +50,26 @@ async def test_user_flow_success(hass) -> None:
     client.async_send_otp = AsyncMock()
     client.async_validate_otp = AsyncMock(return_value=_tokens())
 
-    with patch.object(
-        MeridianEnergyConfigFlow,
-        "_client",
-        new_callable=PropertyMock,
-        return_value=client,
+    import_started = asyncio.Event()
+    finish_import = asyncio.Event()
+
+    async def initial_import(tokens: MeridianTokenSet) -> None:
+        assert tokens.refresh_token == "synthetic-refresh"
+        import_started.set()
+        await finish_import.wait()
+
+    with (
+        patch.object(
+            MeridianEnergyConfigFlow,
+            "_client",
+            new_callable=PropertyMock,
+            return_value=client,
+        ),
+        patch.object(
+            MeridianEnergyConfigFlow,
+            "_async_initial_import",
+            side_effect=initial_import,
+        ),
     ):
         result = await hass.config_entries.flow.async_init(
             DOMAIN, context={"source": SOURCE_USER}
@@ -71,12 +87,72 @@ async def test_user_flow_success(hass) -> None:
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"], {"otp": "123456"}
         )
+        assert result["type"] is FlowResultType.SHOW_PROGRESS
+        assert result["step_id"] == "initial_import"
+        assert result["progress_action"] == "initial_import"
+        await import_started.wait()
+        finish_import.set()
+        await asyncio.sleep(0)
+        result = await hass.config_entries.flow.async_configure(result["flow_id"])
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == "person@example.com"
     assert result["data"][CONF_REFRESH_TOKEN] == "synthetic-refresh"
     assert "id_token" not in result["data"]
     assert "otp" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_initial_import_failure_aborts(hass) -> None:
+    flow = MeridianEnergyConfigFlow()
+    flow.hass = hass
+    flow.context = {}
+    flow._email = "person@example.com"
+    flow._pending_data = {CONF_EMAIL: flow._email}
+    flow._initial_import_task = hass.async_create_task(_raise_initial_import_error())
+    await asyncio.sleep(0)
+
+    result = await flow.async_step_initial_import()
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "initial_import_failed"
+
+
+async def _raise_initial_import_error() -> None:
+    raise MeridianConnectionError
+
+
+@pytest.mark.asyncio
+async def test_initial_import_and_finish_expired_guards(hass) -> None:
+    flow = MeridianEnergyConfigFlow()
+    flow.hass = hass
+    flow.context = {}
+
+    import_result = await flow.async_step_initial_import()
+    finish_result = await flow.async_step_finish()
+
+    assert import_result["reason"] == "login_expired"
+    assert finish_result["reason"] == "login_expired"
+
+
+@pytest.mark.asyncio
+async def test_initial_import_uses_authenticated_coordinator(hass) -> None:
+    tokens = _tokens()
+    coordinator = MagicMock()
+    coordinator.async_fetch_and_import = AsyncMock()
+
+    with patch(
+        "custom_components.meridian_energy.config_flow.MeridianDataCoordinator",
+        return_value=coordinator,
+    ) as coordinator_class:
+        flow = MeridianEnergyConfigFlow()
+        flow.hass = hass
+        flow.context = {}
+        await flow._async_initial_import(tokens)
+
+    client = coordinator_class.call_args.args[1]
+    assert client.tokens == tokens
+    coordinator.async_fetch_and_import.assert_awaited_once()
 
 
 @pytest.mark.asyncio

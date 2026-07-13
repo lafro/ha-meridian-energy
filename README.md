@@ -2,13 +2,15 @@
 
 An unofficial Home Assistant custom integration that imports electricity usage from Meridian Energy's current MyMeridian service into Home Assistant's long-term statistics and Energy dashboard.
 
+[![Open your Home Assistant instance and open this repository in HACS.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=lafro&repository=ha-meridian-energy&category=integration)
+
 > [!IMPORTANT]
 > This project is not affiliated with, endorsed by, or supported by Meridian Energy. It uses the same private customer-service endpoints as the current MyMeridian application. Meridian can change those endpoints without notice.
 
 ## What it provides
 
 - Passwordless setup using Meridian's emailed six-digit login code.
-- Renewable Firebase sessions, with UI reauthentication if Meridian revokes a session.
+- Automatically renewed Firebase sessions, with UI reauthentication only if Meridian rejects or revokes the stored session.
 - Hourly grid-consumption statistics in kWh.
 - Consumption-cost statistics in NZD, including Meridian's consumption and standing-charge values.
 - Solar-export and export-credit statistics when a feed-in register is present.
@@ -21,7 +23,7 @@ The integration polls every three hours. Meridian's meter data can itself be del
 
 The integration never asks for or stores your Meridian password.
 
-During setup, Meridian emails a single-use code. The integration exchanges it for a Firebase refresh token. Home Assistant stores that token in the config entry, as it does credentials for other integrations. Short-lived ID tokens are held in memory only.
+During setup, Meridian emails a single-use code. The integration exchanges it for a Firebase refresh token. Home Assistant stores that token in the config entry, as it does credentials for other integrations, and uses it to renew short-lived sessions automatically. Routine polling and Home Assistant restarts do not require another code. A new code is only required if Meridian rejects or revokes the refresh session, or the integration is removed and configured again. Short-lived ID tokens are held in memory only.
 
 The integration deliberately avoids logging or diagnostics containing:
 
@@ -36,16 +38,12 @@ See [SECURITY.md](SECURITY.md) before reporting a security issue.
 
 ## Installation
 
-The first release is being validated before general installation is enabled. Do not copy development builds into a production Home Assistant instance unless you have a current backup and understand how to remove a custom integration.
-
-Once a release is available:
-
-1. Add `lafro/ha-meridian-energy` as a custom **Integration** repository in HACS.
-2. Download **Meridian Energy**.
-3. Restart Home Assistant.
-4. Go to **Settings → Devices & services → Add integration**.
-5. Search for **Meridian Energy** and enter the email used for MyMeridian.
-6. Enter the six-digit code emailed by Meridian.
+1. Select the **Open your Home Assistant instance** button above to add this repository to HACS, or add `lafro/ha-meridian-energy` manually as a custom **Integration** repository.
+2. In HACS, download **Meridian Energy** and restart Home Assistant when prompted.
+3. Go to **Settings → Devices & services → Add integration**.
+4. Search for **Meridian Energy** and enter the email used for MyMeridian.
+5. Enter the six-digit code emailed by Meridian.
+6. Keep the setup dialog open while the integration imports up to one year of history. The progress step normally takes 2–5 minutes and advances automatically.
 
 ## Energy dashboard
 
@@ -75,7 +73,7 @@ Removing the integration stops future imports. Home Assistant may retain previou
 ## Troubleshooting
 
 - **Code not found:** codes are single-use. Restart setup to request another.
-- **Reauthentication required:** use the integration's **Reconfigure/Reauthenticate** action and enter the new emailed code.
+- **Reauthentication required:** this is not routine. It means Meridian rejected or revoked the renewable session; use the integration's **Reconfigure/Reauthenticate** action and enter the new emailed code.
 - **Latest meter data is old:** Meridian commonly publishes data after a delay; first check the MyMeridian application.
 - **No Energy data immediately after setup:** the initial historical import is queued through Home Assistant's recorder and may take a short time to appear.
 

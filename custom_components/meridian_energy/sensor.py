@@ -98,8 +98,8 @@ class MeridianDiagnosticSensor(
             identifiers={(DOMAIN, identifier)},
             entry_type=DeviceEntryType.SERVICE,
             manufacturer="Meridian Energy",
-            model="Customer account",
-            name=NAME,
+            model="MyMeridian account",
+            name=f"{NAME} account",
             configuration_url="https://app.meridianenergy.nz/",
         )
         self._attr_translation_key = description.translation_key

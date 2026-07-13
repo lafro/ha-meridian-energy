@@ -62,6 +62,10 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         self.client = client
 
     async def _async_update_data(self) -> MeridianSyncData:
+        return await self.async_fetch_and_import()
+
+    async def async_fetch_and_import(self) -> MeridianSyncData:
+        """Fetch Meridian data and import statistics for setup or polling."""
         try:
             accounts = await self.client.async_get_accounts()
             results: list[PropertySyncResult] = []
@@ -106,8 +110,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             self.hass,
             stat_energy_id=consumption_energy_id,
             stat_cost_id=consumption_cost_id,
-            energy_name=f"Meridian consumption — {property_data.address}",
-            cost_name=f"Meridian cost — {property_data.address}",
+            energy_name=f"Meridian electricity consumption — {property_data.address}",
+            cost_name=f"Meridian electricity cost — {property_data.address}",
             measurements=consumption,
         )
 
@@ -124,8 +128,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 self.hass,
                 stat_energy_id=generation_energy_id,
                 stat_cost_id=generation_credit_id,
-                energy_name=f"Meridian export — {property_data.address}",
-                cost_name=f"Meridian export credit — {property_data.address}",
+                energy_name=f"Meridian solar export — {property_data.address}",
+                cost_name=f"Meridian solar export credit — {property_data.address}",
                 measurements=generation,
             )
 

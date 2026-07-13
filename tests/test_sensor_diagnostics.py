@@ -74,6 +74,13 @@ async def test_sensor_values_and_device_identifier_are_redacted(hass) -> None:
     assert entities[2].native_value == 2
     identifiers = entities[0].device_info["identifiers"]
     assert "private-user" not in str(identifiers)
+    assert entities[0].device_info["name"] == "Meridian Energy account"
+    assert entities[0].device_info["model"] == "MyMeridian account"
+    assert [entity.entity_description.translation_key for entity in entities] == [
+        "last_sync",
+        "latest_meter_data",
+        "estimated_readings",
+    ]
 
 
 @pytest.mark.asyncio
