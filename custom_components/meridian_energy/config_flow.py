@@ -8,6 +8,7 @@ from uuid import uuid4
 import voluptuous as vol
 from homeassistant.config_entries import ConfigEntry, ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_EMAIL
+from homeassistant.helpers import selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import (
@@ -17,6 +18,8 @@ from .api import (
     MeridianOtpError,
 )
 from .const import CONF_FIREBASE_USER_ID, CONF_REFRESH_TOKEN, DOMAIN
+
+OTP_LENGTH = 6
 
 
 class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -65,6 +68,9 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
         if user_input is not None:
             otp = str(user_input["otp"]).strip()
+            if len(otp) != OTP_LENGTH or not otp.isascii() or not otp.isdigit():
+                errors["base"] = "otp_invalid"
+                return self._show_otp_form(errors)
             try:
                 tokens = await self._client.async_validate_otp(
                     self._email, otp, self._journey_id
@@ -89,13 +95,24 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
                     )
                 return self.async_create_entry(title=self._email, data=data)
 
+        return self._show_otp_form(errors)
+
+    def _show_otp_form(self, errors: dict[str, str]) -> ConfigFlowResult:
+        """Show the serializable six-digit login-code form."""
         return self.async_show_form(
             step_id="otp",
             data_schema=vol.Schema(
-                {vol.Required("otp"): vol.All(str, vol.Match(r"^\d{6}$"))}
+                {
+                    vol.Required("otp"): selector.TextSelector(
+                        selector.TextSelectorConfig(
+                            type=selector.TextSelectorType.TEL,
+                            autocomplete="one-time-code",
+                        )
+                    )
+                }
             ),
             errors=errors,
-            description_placeholders={"email": self._email},
+            description_placeholders={"email": self._email or ""},
         )
 
     async def async_step_reauth(self, entry_data: dict[str, Any]) -> ConfigFlowResult:

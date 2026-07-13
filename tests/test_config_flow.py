@@ -9,7 +9,9 @@ import pytest
 from homeassistant.config_entries import SOURCE_REAUTH, SOURCE_USER
 from homeassistant.const import CONF_EMAIL
 from homeassistant.data_entry_flow import FlowResultType
+from homeassistant.helpers import config_validation as cv
 from pytest_homeassistant_custom_component.common import MockConfigEntry
+from voluptuous_serialize import convert
 
 from custom_components.meridian_energy.api import (
     MeridianAuthenticationError,
@@ -75,6 +77,33 @@ async def test_user_flow_success(hass) -> None:
     assert result["data"][CONF_REFRESH_TOKEN] == "synthetic-refresh"
     assert "id_token" not in result["data"]
     assert "otp" not in result["data"]
+
+
+@pytest.mark.asyncio
+async def test_otp_form_is_serializable_and_validates_locally(hass) -> None:
+    """The native config-flow API must be able to serialize the OTP form."""
+    flow = MeridianEnergyConfigFlow()
+    flow.hass = hass
+    flow.context = {}
+    flow._email = "person@example.com"
+    flow._journey_id = "journey"
+    client = MagicMock()
+    client.async_validate_otp = AsyncMock()
+
+    result = await flow.async_step_otp()
+    convert(result["data_schema"], custom_serializer=cv.custom_serializer)
+
+    with patch.object(
+        MeridianEnergyConfigFlow,
+        "_client",
+        new_callable=PropertyMock,
+        return_value=client,
+    ):
+        result = await flow.async_step_otp({"otp": "12ab"})
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["errors"] == {"base": "otp_invalid"}
+    client.async_validate_otp.assert_not_awaited()
 
 
 @pytest.mark.asyncio
