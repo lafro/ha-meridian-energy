@@ -1,0 +1,13 @@
+{
+  "codeowners": ["@lafro"],
+  "config_flow": true,
+  "documentation": "https://github.com/lafro/ha-meridian-energy",
+  "domain": "meridian_energy",
+  "integration_type": "service",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/lafro/ha-meridian-energy/issues",
+  "name": "Meridian Energy",
+  "requirements": [],
+  "version": "0.1.0"
+}
+
