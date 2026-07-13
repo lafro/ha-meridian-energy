@@ -25,6 +25,13 @@ from custom_components.meridian_energy.const import (
 from custom_components.meridian_energy.models import MeridianTokenSet
 
 
+@pytest.fixture(autouse=True)
+def auto_enable_custom_integrations(
+    recorder_mock: object, enable_custom_integrations: None
+) -> None:
+    """Set up recorder before enabling this recorder-dependent integration."""
+
+
 def _tokens() -> MeridianTokenSet:
     return MeridianTokenSet(
         id_token="synthetic-id",

@@ -1,6 +1,7 @@
 {
   "codeowners": ["@lafro"],
   "config_flow": true,
+  "dependencies": ["recorder"],
   "documentation": "https://github.com/lafro/ha-meridian-energy",
   "domain": "meridian_energy",
   "integration_type": "service",
@@ -10,4 +11,3 @@
   "requirements": [],
   "version": "0.1.0"
 }
-
