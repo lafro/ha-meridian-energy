@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
+from typing import Any
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -108,6 +110,42 @@ class MeridianDiagnosticSensor(
     def native_value(self) -> datetime | int | None:
         """Return the current diagnostic value."""
         return self._description.value_fn(self.coordinator.data)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        """Explain the complete rolling estimate count without exposing usage."""
+        if self._description.key != "estimated_readings":
+            return None
+        data = self.coordinator.data
+        oldest = min(
+            (
+                result.oldest_estimated
+                for result in data.results
+                if result.oldest_estimated is not None
+            ),
+            default=None,
+        )
+        newest = max(
+            (
+                result.newest_estimated
+                for result in data.results
+                if result.newest_estimated is not None
+            ),
+            default=None,
+        )
+        reconciliation_start = min(
+            (result.requested_since for result in data.results), default=None
+        )
+        quality_counts: Counter[str] = Counter()
+        for result in data.results:
+            quality_counts.update(dict(result.quality_counts))
+        return {
+            "oldest_provisional_interval": oldest,
+            "newest_provisional_interval": newest,
+            "reconciliation_window_start": reconciliation_start,
+            "upstream_quality_counts": dict(sorted(quality_counts.items())),
+            "last_sync_mode": data.sync_mode,
+        }
 
 
 def _account_identifier(entry: ConfigEntry) -> str:

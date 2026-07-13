@@ -8,6 +8,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 from aiohttp import ClientError, ClientSession, ClientTimeout
@@ -18,11 +19,14 @@ from .const import (
     BRAND,
     CLIENT_PLATFORM,
     COST_STATISTIC_TYPES,
+    DEFAULT_RETRY_AFTER_SECONDS,
     FIREBASE_API_KEY,
     FIREBASE_CUSTOM_TOKEN_URL,
     FIREBASE_REFRESH_URL,
     GENERATION_CREDIT_TYPES,
     GRAPHQL_URL,
+    MAX_RETRY_AFTER_SECONDS,
+    MIN_RETRY_AFTER_SECONDS,
     PAGE_SIZE,
     READING_FREQUENCY_HOUR,
     READING_QUALITY_COMBINED,
@@ -42,6 +46,7 @@ from .models import (
 
 _LOGGER = logging.getLogger(__name__)
 _HTTP_BAD_REQUEST = 400
+_HTTP_TOO_MANY_REQUESTS = 429
 
 TokenUpdateCallback = Callable[[MeridianTokenSet], Awaitable[None]]
 
@@ -56,6 +61,14 @@ class MeridianConnectionError(MeridianError):
 
 class MeridianAuthenticationError(MeridianError):
     """The Meridian session is invalid and requires reauthentication."""
+
+
+class MeridianRateLimitError(MeridianConnectionError):
+    """Meridian asked the client to defer further requests."""
+
+    def __init__(self, retry_after: float) -> None:
+        super().__init__("Meridian rate limited the request")
+        self.retry_after = retry_after
 
 
 class MeridianOtpError(MeridianAuthenticationError):
@@ -172,6 +185,8 @@ class MeridianApiClient:
                 authenticated=False,
             )
         except _MeridianHttpError as err:
+            if err.status == _HTTP_TOO_MANY_REQUESTS:
+                raise MeridianRateLimitError(err.retry_after) from err
             if err.status in {400, 401, 403}:
                 raise MeridianAuthenticationError(
                     "Meridian session refresh was rejected"
@@ -301,21 +316,10 @@ class MeridianApiClient:
     async def _async_graphql(
         self, operation: str, query: str, variables: dict[str, Any]
     ) -> dict[str, Any]:
-        tokens = await self.async_refresh_tokens()
-        try:
-            response = await self._async_json_request(
-                GRAPHQL_URL,
-                json={
-                    "operationName": operation,
-                    "query": query,
-                    "variables": variables,
-                },
-                headers={"Authorization": tokens.id_token},
-                authenticated=True,
-            )
-        except _MeridianHttpError as err:
-            if err.status in {401, 403}:
-                tokens = await self.async_refresh_tokens(force=True)
+        response: dict[str, Any] | None = None
+        for attempt in range(2):
+            tokens = await self.async_refresh_tokens(force=attempt == 1)
+            try:
                 response = await self._async_json_request(
                     GRAPHQL_URL,
                     json={
@@ -326,8 +330,19 @@ class MeridianApiClient:
                     headers={"Authorization": tokens.id_token},
                     authenticated=True,
                 )
-            else:
-                raise
+                break
+            except _MeridianHttpError as err:
+                if err.status == _HTTP_TOO_MANY_REQUESTS:
+                    raise MeridianRateLimitError(err.retry_after) from err
+                if err.status in {401, 403} and attempt == 1:
+                    raise MeridianAuthenticationError(
+                        "Meridian rejected the authenticated session"
+                    ) from err
+                if err.status not in {401, 403}:
+                    raise
+
+        if response is None:
+            raise MeridianAuthenticationError("Meridian authentication retry failed")
 
         errors = response.get("errors")
         if errors:
@@ -366,15 +381,21 @@ class MeridianApiClient:
                 headers=headers,
                 timeout=self._timeout,
             ) as response:
+                response_headers = getattr(response, "headers", {})
+                retry_after = _parse_retry_after(response_headers.get("Retry-After"))
                 try:
                     payload = await response.json(content_type=None)
                 except (ValueError, TypeError) as err:
+                    if response.status >= _HTTP_BAD_REQUEST:
+                        raise _MeridianHttpError(
+                            response.status, {}, retry_after
+                        ) from err
                     raise MeridianConnectionError(
                         "Meridian returned an unreadable response"
                     ) from err
                 parsed = require_mapping(payload, "HTTP response")
                 if response.status >= _HTTP_BAD_REQUEST:
-                    raise _MeridianHttpError(response.status, parsed)
+                    raise _MeridianHttpError(response.status, parsed, retry_after)
                 return parsed
         except _MeridianHttpError:
             raise
@@ -384,10 +405,36 @@ class MeridianApiClient:
 
 
 class _MeridianHttpError(MeridianError):
-    def __init__(self, status: int, payload: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        status: int,
+        payload: dict[str, Any],
+        retry_after: float = DEFAULT_RETRY_AFTER_SECONDS,
+    ) -> None:
         super().__init__(f"Meridian returned HTTP {status}")
         self.status = status
         self.payload = payload
+        self.retry_after = retry_after
+
+
+def _parse_retry_after(value: str | None) -> float:
+    """Return a bounded Retry-After delay from seconds or an HTTP date."""
+    delay = float(DEFAULT_RETRY_AFTER_SECONDS)
+    if value:
+        try:
+            delay = float(value)
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(value)
+                if retry_at.tzinfo is None or retry_at.utcoffset() is None:
+                    raise ValueError
+                delay = (retry_at.astimezone(UTC) - datetime.now(UTC)).total_seconds()
+            except TypeError, ValueError, OverflowError:
+                delay = float(DEFAULT_RETRY_AFTER_SECONDS)
+    return min(
+        float(MAX_RETRY_AFTER_SECONDS),
+        max(float(MIN_RETRY_AFTER_SECONDS), delay),
+    )
 
 
 def _parse_firebase_tokens(payload: dict[str, Any]) -> MeridianTokenSet:

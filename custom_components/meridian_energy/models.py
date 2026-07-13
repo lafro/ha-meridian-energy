@@ -5,7 +5,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+from enum import StrEnum
 from typing import Any
+
+
+class SyncMode(StrEnum):
+    """A Meridian statistics retrieval mode."""
+
+    INITIAL = "initial"
+    RESTART = "restart"
+    TIP = "tip"
+    TARGETED_RECONCILIATION = "targeted_reconciliation"
+    FULL_RECONCILIATION = "full_reconciliation"
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +79,16 @@ class MeasurementPage:
 
 
 @dataclass(frozen=True, slots=True)
+class MeasurementFetchResult:
+    """Measurements and non-sensitive request metrics for one direction."""
+
+    measurements: tuple[MeridianMeasurement, ...]
+    pages: int
+    received_rows: int
+    observed_rows_per_hour: float
+
+
+@dataclass(frozen=True, slots=True)
 class PropertySyncResult:
     """Non-sensitive summary of a property sync."""
 
@@ -76,6 +97,18 @@ class PropertySyncResult:
     generation_rows: int
     latest_reading: datetime | None
     estimated_rows: int
+    sync_mode: SyncMode
+    requested_since: datetime
+    consumption_pages: int
+    generation_pages: int
+    consumption_received_rows: int
+    generation_received_rows: int
+    consumption_retained_rows: int
+    generation_retained_rows: int
+    oldest_estimated: datetime | None
+    newest_estimated: datetime | None
+    quality_counts: tuple[tuple[str, int], ...]
+    observed_rows_per_hour: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +119,9 @@ class MeridianSyncData:
     property_count: int
     results: tuple[PropertySyncResult, ...]
     synced_at: datetime
+    sync_mode: SyncMode
+    topology_refreshed: bool
+    topology_cache_age_seconds: float
 
 
 def require_mapping(value: Any, context: str) -> dict[str, Any]:

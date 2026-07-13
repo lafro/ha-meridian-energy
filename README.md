@@ -14,7 +14,7 @@ An unofficial Home Assistant custom integration that imports electricity usage f
 - Hourly grid-consumption statistics in kWh.
 - Consumption-cost statistics in NZD, including Meridian's consumption and standing-charge values.
 - Solar-export and export-credit statistics when a feed-in register is present.
-- A one-year initial history import, followed by a fourteen-day overlap on each update so estimated readings can be replaced safely by actual readings.
+- A one-year initial history import, then adaptive hourly retrieval with daily and weekly reconciliation so estimated readings can be replaced safely by actual readings.
 - Privacy-preserving diagnostics and diagnostic entities for sync health and meter-data freshness.
 
 ## Security and privacy
@@ -51,7 +51,7 @@ The integration creates a **Meridian Energy account** service device with three 
 |---|---|
 | **Last data update** | The time Home Assistant last completed a successful Meridian synchronisation. This confirms that the integration ran; it is not the timestamp of the newest meter reading. |
 | **Latest usage period** | The start time of the newest completed consumption interval returned by Meridian. Use this to understand how current Meridian's meter data is. |
-| **Estimated readings** | The number of completed hourly consumption intervals in the latest rolling import that Meridian still marks as estimated rather than actual. It is a count of intervals, not an energy value or number of days. The count covers all properties associated with the configured Meridian login. |
+| **Estimated readings** | The number of completed hourly consumption intervals in the complete rolling 14-day quality index that Meridian still marks as estimated or otherwise non-actual. It is a count of meter-channel intervals, not an energy value or number of days. The count covers all properties associated with the configured Meridian login and remains comparable between hourly and reconciliation runs. Its attributes show the oldest and newest provisional intervals, reconciliation-window start, upstream quality counts and last sync mode. |
 
 For each property with consumption data, the integration creates these external long-term statistics:
 
@@ -89,9 +89,21 @@ Meridian returns hourly interval values. For each property, the integration:
 6. upserts existing timestamps, allowing estimates to be corrected later; and
 7. uses stable hashed statistic identifiers that do not expose account or property IDs.
 
-The integration polls Meridian every three hours. The initial history window is 365 days; subsequent updates re-import the latest 14 days so estimates can be replaced by actual readings at the same timestamps. This bounds API load while covering Meridian's normal revision period.
+The integration uses a fixed, deliberately bounded retrieval lifecycle:
 
-This integration provides delayed interval and billing data. It does not provide instantaneous household power. Meridian may publish usage several hours or days after electricity is consumed.
+| When | Retrieval | Purpose |
+|---|---|---|
+| First installation | Up to 365 days | Creates useful historical energy and cost statistics. |
+| Home Assistant restart or integration reload | Complete 14 days | Rebuilds the in-memory quality index and recovers revisions missed while Home Assistant was offline. |
+| Every hour | Latest 24 hours | Provides best-effort freshness with a small request. |
+| Once daily | At least 48 hours, widened back to the oldest provisional interval | Reconciles estimates and delayed readings without routinely transferring the full 14 days. The window is capped at 14 days. |
+| Once weekly | Complete 14 days | Provides a bounded safety reconciliation for gaps and revisions. |
+
+Daily and weekly reconciliation replace that hour's normal 24-hour request; they do not add a second measurement request. Account, property and meter-register topology is cached for 24 hours and refreshed on setup, expiry, reload or a measurement error that indicates the topology changed. Measurement requests remain serial and use adaptive page sizes with pagination through the required cutoff, supporting multi-register, multi-property and feed-in accounts without assuming a fixed number of rows per hour.
+
+Within the running Home Assistant process, an interval already observed as actual is never replaced by a later non-actual version. When Meridian revises an interval, the integration re-imports every cached interval from the earliest change forward so cumulative kWh and cost statistics remain correct. A restart deliberately rebuilds this protection from a complete 14-day response. Revisions older than 14 days are outside the integration's normal correction horizon.
+
+This integration provides delayed interval and billing data. It does not provide instantaneous household power. Hourly retrieval is best-effort: Meridian may publish usage several hours or days after electricity is consumed, and the integration does not promise publication at a particular minute.
 
 ## Current validation and known limitations
 
