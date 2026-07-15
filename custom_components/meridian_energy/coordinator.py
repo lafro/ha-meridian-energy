@@ -5,11 +5,12 @@ from __future__ import annotations
 import logging
 import math
 from collections import Counter
+from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from homeassistant.config_entries import ConfigEntry, ConfigEntryAuthFailed
-from homeassistant.core import HomeAssistant
+from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import (
@@ -171,6 +172,13 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         except (MeridianError, ValueError) as err:
             raise UpdateFailed("Meridian returned invalid energy data") from err
 
+    async def async_refresh_billing_totals(self) -> None:
+        """Refresh Recorder-derived billing totals without polling Meridian usage."""
+        if self.data is None or self.hass.state is not CoreState.running:
+            return
+        account_results = await self._async_account_results(self.accounts, _utcnow())
+        self.async_set_updated_data(replace(self.data, account_results=account_results))
+
     def _select_sync_mode(self, now: datetime) -> SyncMode:
         if not self._initial_refresh_complete:
             return SyncMode.INITIAL
@@ -270,7 +278,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             usage = cost = exported = credit = None
             complete = False
             if (
-                billing_period is not None
+                self.hass.state is CoreState.running
+                and billing_period is not None
                 and billing_period.start is not None
                 and billing_period.end is not None
             ):
