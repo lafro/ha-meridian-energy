@@ -77,6 +77,7 @@ def _fetch(*measurements: MeridianMeasurement) -> MeasurementFetchResult:
 async def test_update_imports_consumption(hass) -> None:
     client = MagicMock()
     client.async_get_accounts = AsyncMock(return_value=(_account(),))
+    client.async_get_billing_period = AsyncMock(return_value=None)
     coordinator = MeridianDataCoordinator(hass, client)
     now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
     coordinator._async_fetch_since = AsyncMock(return_value=_fetch(_measurement(now)))
@@ -110,6 +111,7 @@ async def test_update_imports_consumption(hass) -> None:
 async def test_update_imports_generation_for_feed_in(hass) -> None:
     client = MagicMock()
     client.async_get_accounts = AsyncMock(return_value=(_account(feed_in=True),))
+    client.async_get_billing_period = AsyncMock(return_value=None)
     coordinator = MeridianDataCoordinator(hass, client)
     now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
     coordinator._async_fetch_since = AsyncMock(

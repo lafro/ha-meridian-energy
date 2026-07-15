@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
@@ -20,8 +20,10 @@ from custom_components.meridian_energy.const import (
 )
 from custom_components.meridian_energy.coordinator import MeridianDataCoordinator
 from custom_components.meridian_energy.models import (
+    BillingPeriodTotals,
     MeasurementFetchResult,
     MeridianAccount,
+    MeridianBillingPeriod,
     MeridianMeasurement,
     MeridianMeterPoint,
     MeridianProperty,
@@ -88,6 +90,18 @@ def _fetch(density: float) -> MeasurementFetchResult:
     return MeasurementFetchResult((), 1, 0, density)
 
 
+def _billing_period(*, end: date = date(2026, 7, 31)) -> MeridianBillingPeriod:
+    return MeridianBillingPeriod(
+        period_length="MONTHLY",
+        period_length_multiplier=1,
+        is_fixed=True,
+        start=date(2026, 7, 1),
+        end=end,
+        next_billing_date=date(2026, 8, 1),
+        period_start_day=1,
+    )
+
+
 def test_sync_mode_schedule_replaces_hourly_request(hass) -> None:
     coordinator = MeridianDataCoordinator(hass, MagicMock())
     assert coordinator._select_sync_mode(NOW) is SyncMode.INITIAL
@@ -139,6 +153,93 @@ async def test_topology_is_cached_for_24_hours_and_can_be_forced(hass) -> None:
 
 
 @pytest.mark.asyncio
+async def test_topology_filters_selected_accounts_and_rejects_stale_selection(
+    hass,
+) -> None:
+    first = _account()
+    second = MeridianAccount(
+        number="other-account", status="ACTIVE", properties=first.properties
+    )
+    client = MagicMock()
+    client.async_get_accounts = AsyncMock(return_value=(first, second))
+    coordinator = MeridianDataCoordinator(
+        hass, client, selected_accounts=frozenset({"other-account"})
+    )
+
+    accounts, _ = await coordinator._async_get_topology(NOW)
+    assert [account.number for account in accounts] == ["other-account"]
+    assert coordinator.accounts == accounts
+
+    missing = MeridianDataCoordinator(
+        hass, client, selected_accounts=frozenset({"missing"})
+    )
+    with pytest.raises(ValueError, match="selected"):
+        await missing._async_get_topology(NOW)
+
+
+@pytest.mark.asyncio
+async def test_billing_period_is_cached_and_refreshed_after_period_end(hass) -> None:
+    client = MagicMock()
+    client.async_get_billing_period = AsyncMock(
+        side_effect=[_billing_period(end=date(2026, 7, 13)), _billing_period()]
+    )
+    coordinator = MeridianDataCoordinator(hass, client)
+
+    first = await coordinator._async_billing_period("account", NOW)
+    second = await coordinator._async_billing_period(
+        "account", NOW + timedelta(hours=1)
+    )
+
+    assert first is not None
+    assert first.end == date(2026, 7, 13)
+    assert second is not None
+    assert second.end == date(2026, 7, 31)
+    assert client.async_get_billing_period.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_billing_failure_keeps_cached_metadata(hass) -> None:
+    client = MagicMock()
+    client.async_get_billing_period = AsyncMock(
+        side_effect=MeridianGraphQLError("billingPeriods", ("TEMPORARY",))
+    )
+    coordinator = MeridianDataCoordinator(hass, client)
+    coordinator._billing_periods["account"] = _billing_period()
+    coordinator._billing_cached_at["account"] = NOW - timedelta(days=2)
+
+    result = await coordinator._async_billing_period("account", NOW)
+
+    assert result == _billing_period()
+
+
+@pytest.mark.asyncio
+async def test_account_results_derive_current_period_totals(hass) -> None:
+    client = MagicMock()
+    client.async_get_billing_period = AsyncMock(return_value=_billing_period())
+    coordinator = MeridianDataCoordinator(hass, client)
+    totals = BillingPeriodTotals(
+        usage=Decimal("12.3"),
+        cost=Decimal("4.56"),
+        export=Decimal("1.2"),
+        credit=Decimal("0.3"),
+        complete=True,
+    )
+    with patch(
+        "custom_components.meridian_energy.coordinator.async_account_period_totals",
+        new=AsyncMock(return_value=totals),
+    ) as calculate:
+        result = await coordinator._async_account_results(
+            (_account(feed_in=True),), NOW
+        )
+
+    assert result[0].current_bill_usage == Decimal("12.3")
+    assert result[0].current_bill_cost == Decimal("4.56")
+    assert result[0].has_feed_in is True
+    assert result[0].billing_data_complete is True
+    assert calculate.await_args.kwargs["include_generation"] is True
+
+
+@pytest.mark.asyncio
 async def test_startup_distinguishes_install_restart_and_solar(hass) -> None:
     coordinator = MeridianDataCoordinator(hass, MagicMock())
     with patch(
@@ -180,7 +281,7 @@ async def test_multiple_properties_are_processed_serially(hass) -> None:
 def test_requested_windows_include_provisional_safety_and_cap(hass) -> None:
     coordinator = MeridianDataCoordinator(hass, MagicMock())
     assert coordinator._requested_since(CACHE_KEY, SyncMode.INITIAL, NOW) == NOW - (
-        timedelta(days=365)
+        timedelta(days=90)
     )
     assert coordinator._requested_since(CACHE_KEY, SyncMode.RESTART, NOW) == NOW - (
         REVISION_OVERLAP
@@ -256,6 +357,7 @@ async def test_daily_and_weekly_modes_update_only_their_cadence(hass) -> None:
     coordinator = MeridianDataCoordinator(hass, client)
     coordinator._initial_refresh_complete = True
     coordinator._async_sync_accounts = AsyncMock(return_value=())
+    coordinator._async_account_results = AsyncMock(return_value=())
 
     coordinator._last_full_reconciliation = NOW
     coordinator._last_targeted_reconciliation = NOW - timedelta(days=1)
@@ -290,6 +392,7 @@ async def test_topology_error_forces_one_refresh_and_retry(hass) -> None:
     coordinator._async_sync_accounts = AsyncMock(
         side_effect=[MeridianGraphQLError("measurements", ("PROPERTY_NOT_FOUND",)), ()]
     )
+    coordinator._async_account_results = AsyncMock(return_value=())
 
     with patch(
         "custom_components.meridian_energy.coordinator._utcnow", return_value=NOW

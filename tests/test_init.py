@@ -17,6 +17,7 @@ from custom_components.meridian_energy import (
 from custom_components.meridian_energy.const import (
     CONF_FIREBASE_USER_ID,
     CONF_REFRESH_TOKEN,
+    CONF_SELECTED_ACCOUNTS,
     DOMAIN,
 )
 from custom_components.meridian_energy.models import MeridianTokenSet
@@ -29,6 +30,7 @@ def _entry(*, version: int = 1) -> MockConfigEntry:
             "email": "person@example.com",
             CONF_REFRESH_TOKEN: "old-refresh",
             CONF_FIREBASE_USER_ID: "old-user",
+            CONF_SELECTED_ACCOUNTS: ["synthetic-account"],
         },
         version=version,
         minor_version=1,
@@ -115,8 +117,16 @@ async def test_unload_entry(hass) -> None:
 
 @pytest.mark.asyncio
 async def test_migrate_entry_accepts_current_version(hass) -> None:
-    entry = _entry()
+    entry = _entry(version=2)
     assert await async_migrate_entry(hass, entry) is True
+
+
+@pytest.mark.asyncio
+async def test_migrate_entry_updates_legacy_version(hass) -> None:
+    entry = _entry()
+    entry.add_to_hass(hass)
+    assert await async_migrate_entry(hass, entry) is True
+    assert entry.version == 2
 
 
 @pytest.mark.asyncio

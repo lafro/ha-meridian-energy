@@ -6,7 +6,7 @@ import base64
 import json
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -36,6 +36,7 @@ from .const import (
 from .models import (
     MeasurementPage,
     MeridianAccount,
+    MeridianBillingPeriod,
     MeridianMeasurement,
     MeridianMeterPoint,
     MeridianProperty,
@@ -45,6 +46,7 @@ from .models import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+_LAST_DAY_OF_LONG_MONTH = 31
 _HTTP_BAD_REQUEST = 400
 _HTTP_TOO_MANY_REQUESTS = 429
 
@@ -313,6 +315,47 @@ class MeridianApiClient:
             start_cursor=_optional_string(page_info.get("startCursor")),
         )
 
+    async def async_get_billing_period(
+        self, account_number: str
+    ) -> MeridianBillingPeriod:
+        """Return the retailer-defined current billing period for an account."""
+        data = await self._async_graphql(
+            "billingPeriods",
+            _BILLING_PERIODS_QUERY,
+            {"accountNumber": account_number},
+        )
+        account = require_mapping(data.get("account"), "billing account")
+        options = require_mapping(account.get("billingOptions"), "billing options")
+        period_length = _optional_string(options.get("periodLength"))
+        if period_length not in {None, "MONTHLY", "QUARTERLY"}:
+            raise ValueError("Unsupported Meridian billing period length")
+        multiplier = options.get("periodLengthMultiplier")
+        if multiplier is not None and (
+            not isinstance(multiplier, int)
+            or isinstance(multiplier, bool)
+            or multiplier <= 0
+        ):
+            raise ValueError("Invalid Meridian billing period multiplier")
+        start_day = options.get("periodStartDay")
+        if start_day is not None and (
+            not isinstance(start_day, int)
+            or isinstance(start_day, bool)
+            or not 1 <= start_day <= _LAST_DAY_OF_LONG_MONTH
+        ):
+            raise ValueError("Invalid Meridian billing period start day")
+        is_fixed = options.get("isFixed")
+        if not isinstance(is_fixed, bool):
+            raise ValueError("Invalid Meridian fixed billing-period flag")
+        return MeridianBillingPeriod(
+            period_length=period_length,
+            period_length_multiplier=multiplier,
+            is_fixed=is_fixed,
+            start=_optional_date(options.get("currentBillingPeriodStartDate")),
+            end=_optional_date(options.get("currentBillingPeriodEndDate")),
+            next_billing_date=_optional_date(options.get("nextBillingDate")),
+            period_start_day=start_day,
+        )
+
     async def _async_graphql(
         self, operation: str, query: str, variables: dict[str, Any]
     ) -> dict[str, Any]:
@@ -513,15 +556,23 @@ def _parse_measurement(
         GENERATION_CREDIT_TYPES if direction == "GENERATION" else COST_STATISTIC_TYPES
     )
     cost_cents = Decimal(0)
+    found_cost = False
+    incomplete_cost = False
     for statistic_value in require_list(
         metadata.get("statistics") or [], "measurement statistics"
     ):
         statistic = require_mapping(statistic_value, "measurement statistic")
         if statistic.get("type") not in allowed_cost_types:
             continue
-        cost = require_mapping(statistic.get("costInclTax"), "measurement cost")
+        found_cost = True
+        raw_cost = statistic.get("costInclTax")
+        if not isinstance(raw_cost, dict):
+            incomplete_cost = True
+            continue
+        cost = require_mapping(raw_cost, "measurement cost")
         amount = cost.get("estimatedAmount")
         if amount in {None, ""}:
+            incomplete_cost = True
             continue
         try:
             cost_cents += abs(Decimal(str(amount)))
@@ -535,7 +586,7 @@ def _parse_measurement(
         quality=quality,
         direction=direction,
         channel_id=":".join(channel_parts) or "aggregate",
-        cost_cents=cost_cents,
+        cost_cents=None if not found_cost or incomplete_cost else cost_cents,
     )
 
 
@@ -557,6 +608,17 @@ def _required_string(payload: dict[str, Any], key: str) -> str:
 
 def _optional_string(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _optional_date(value: Any) -> date | None:
+    if value in {None, ""}:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("Invalid Meridian billing date")
+    try:
+        return date.fromisoformat(value)
+    except ValueError as err:
+        raise ValueError("Invalid Meridian billing date") from err
 
 
 def _graphql_error_code(error: dict[str, Any]) -> str:
@@ -651,6 +713,22 @@ query measurements(
           readingFrequencyType: $readingFrequencyType
         }}]
       ) { ... on MeasurementConnection { ...MeasurementFields } }
+    }
+  }
+}
+"""
+
+_BILLING_PERIODS_QUERY = """
+query billingPeriods($accountNumber: String!) {
+  account(accountNumber: $accountNumber) {
+    billingOptions {
+      periodLength
+      periodLengthMultiplier
+      isFixed
+      currentBillingPeriodStartDate
+      currentBillingPeriodEndDate
+      nextBillingDate
+      periodStartDay
     }
   }
 }

@@ -57,6 +57,28 @@ async def async_get_config_entry_diagnostics(
                 }
                 for result in data.results
             ],
+            "account_results": [
+                {
+                    "billing_metadata_available": result.billing_period is not None,
+                    "billing_period_type": (
+                        result.billing_period.period_length
+                        if result.billing_period is not None
+                        else None
+                    ),
+                    "billing_period_fixed": (
+                        result.billing_period.is_fixed
+                        if result.billing_period is not None
+                        else None
+                    ),
+                    "billing_data_complete": result.billing_data_complete,
+                    "has_feed_in": result.has_feed_in,
+                    "usage_available": result.current_bill_usage is not None,
+                    "cost_available": result.current_bill_cost is not None,
+                    "export_available": result.current_bill_export is not None,
+                    "credit_available": result.current_bill_credit is not None,
+                }
+                for result in data.account_results
+            ],
             "synced_at": data.synced_at,
         },
     }
