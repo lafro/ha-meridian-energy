@@ -162,6 +162,7 @@ class MeridianSyncData:
     sync_mode: SyncMode
     topology_refreshed: bool
     topology_cache_age_seconds: float
+    sync_duration_seconds: float = 0.0
 
 
 def require_mapping(value: Any, context: str) -> dict[str, Any]:

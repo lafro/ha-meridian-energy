@@ -8,9 +8,10 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from functools import partial
 from hashlib import sha256
+from itertools import pairwise
 from typing import cast
 
-from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder import get_instance  # type: ignore[attr-defined]
 from homeassistant.components.recorder.models import (
     StatisticData,
     StatisticMeanType,
@@ -29,7 +30,7 @@ from homeassistant.util.unit_conversion import EnergyConverter
 
 from .const import (
     DOMAIN,
-    REVISION_OVERLAP,
+    INITIAL_BACKFILL,
     STAT_CONSUMPTION,
     STAT_CONSUMPTION_COST,
     STAT_GENERATION,
@@ -38,6 +39,7 @@ from .const import (
 from .models import BillingPeriodTotals, MeridianMeasurement
 
 _CENTS_PER_DOLLAR = Decimal(100)
+_SECONDS_PER_HOUR = 3600
 
 
 def property_key(account_number: str, property_id: str) -> str:
@@ -70,6 +72,33 @@ async def async_has_statistics(hass: HomeAssistant, stat_id: str) -> bool:
     return bool(result.get(stat_id))
 
 
+async def async_has_numeric_statistics(hass: HomeAssistant, stat_id: str) -> bool:
+    """Return whether a statistic contains at least one numeric cumulative row."""
+    return await async_latest_numeric_statistic_start(hass, stat_id) is not None
+
+
+async def async_latest_numeric_statistic_start(
+    hass: HomeAssistant, stat_id: str
+) -> datetime | None:
+    """Return the newest trustworthy cumulative row timestamp, if one exists."""
+    instance = get_instance(hass)
+    result = await instance.async_add_executor_job(
+        get_last_statistics,
+        hass,
+        int(INITIAL_BACKFILL.total_seconds() // 3600) + 72,
+        stat_id,
+        False,
+        {"sum"},
+    )
+    numeric_rows = [
+        row for row in result.get(stat_id, []) if row.get("sum") is not None
+    ]
+    if not numeric_rows:
+        return None
+    latest = max(numeric_rows, key=lambda row: _timestamp(row["start"]))
+    return datetime.fromtimestamp(_timestamp(latest["start"]), tz=UTC)
+
+
 async def async_clear_statistics(hass: HomeAssistant, statistic_ids: set[str]) -> None:
     """Remove statistics created by an incomplete first-install import."""
     if not statistic_ids:
@@ -97,9 +126,11 @@ async def async_import_measurements(
     first_start = min(aggregated)
     energy_baseline = await _async_baseline_sum(hass, stat_energy_id, first_start)
     cost_baseline = await _async_baseline_sum(hass, stat_cost_id, first_start)
+    if energy_baseline is None:
+        return (0, 0)
 
     energy_total = Decimal(str(energy_baseline))
-    cost_total = Decimal(str(cost_baseline))
+    cost_total = Decimal(str(cost_baseline or 0.0))
     energy_rows: list[StatisticData] = []
     cost_rows: list[StatisticData] = []
     for start in sorted(aggregated):
@@ -107,7 +138,7 @@ async def async_import_measurements(
         energy_total += energy
         energy_value = float(energy_total)
         energy_rows.append({"start": start, "state": energy_value, "sum": energy_value})
-        if cost is not None:
+        if cost is not None and cost_baseline is not None:
             cost_total += cost / _CENTS_PER_DOLLAR
             cost_value = float(cost_total)
             cost_rows.append({"start": start, "state": cost_value, "sum": cost_value})
@@ -128,10 +159,13 @@ async def async_import_measurements(
 
 async def _async_baseline_sum(
     hass: HomeAssistant, stat_id: str, first_start: datetime
-) -> float:
+) -> float | None:
     """Return the cumulative sum immediately before an overlap import."""
     instance = get_instance(hass)
-    number_of_stats = int(REVISION_OVERLAP.total_seconds() // 3600) + 72
+    # A direction recovery can replay the complete supported backfill window.
+    # Request enough rows to retain a trustworthy predecessor even when the
+    # replay begins 90 days in the past and newer rows already exist.
+    number_of_stats = int(INITIAL_BACKFILL.total_seconds() // 3600) + 72
     result = await instance.async_add_executor_job(
         partial(
             get_last_statistics,
@@ -146,11 +180,13 @@ async def _async_baseline_sum(
         row
         for row in result.get(stat_id, [])
         if _timestamp(row["start"]) < first_start.timestamp()
-        and row.get("sum") is not None
     ]
     if not candidates:
         return 0.0
-    latest = max(candidates, key=lambda row: _timestamp(row["start"]))
+    numeric_candidates = [row for row in candidates if row.get("sum") is not None]
+    if not numeric_candidates:
+        return None
+    latest = max(numeric_candidates, key=lambda row: _timestamp(row["start"]))
     return float(cast("float", latest["sum"]))
 
 
@@ -222,25 +258,52 @@ async def async_account_period_totals(
     saw_consumption = False
     saw_generation = False
 
-    for energy_id, money_id, generation in pairs:
-        energy_rows = _change_rows(result.get(energy_id, []), start, end)
-        money_rows = _change_rows(result.get(money_id, []), start, end)
+    pair_rows = [
+        (
+            _change_rows(result.get(energy_id, []), start, end),
+            _change_rows(result.get(money_id, []), start, end),
+            generation,
+        )
+        for energy_id, money_id, generation in pairs
+    ]
+    consumption_horizon = max(
+        (
+            row[0]
+            for energy_rows, _money_rows, generation in pair_rows
+            if not generation
+            for row in energy_rows
+        ),
+        default=None,
+    )
+    generation_horizon = max(
+        (
+            row[0]
+            for energy_rows, _money_rows, generation in pair_rows
+            if generation
+            for row in energy_rows
+        ),
+        default=None,
+    )
+
+    for energy_rows, money_rows, generation in pair_rows:
         energy_starts = {row[0] for row in energy_rows}
         money_starts = {row[0] for row in money_rows}
-        starts_at_boundary = (
-            bool(energy_rows) and min(energy_starts) <= start.timestamp()
+        energy_contiguous = _hourly_rows_are_contiguous(
+            energy_starts,
+            start,
+            generation_horizon if generation else consumption_horizon,
         )
         if generation:
             if not energy_rows:
                 continue
             saw_generation = True
-            generation_complete &= starts_at_boundary
+            generation_complete &= energy_contiguous
             credit_complete &= energy_starts == money_starts
             exported += sum((row[1] for row in energy_rows), Decimal(0))
             credit += sum((row[1] for row in money_rows), Decimal(0))
         else:
             saw_consumption |= bool(energy_rows)
-            consumption_complete &= starts_at_boundary
+            consumption_complete &= energy_contiguous
             cost_complete &= energy_starts == money_starts
             usage += sum((row[1] for row in energy_rows), Decimal(0))
             cost += sum((row[1] for row in money_rows), Decimal(0))
@@ -256,6 +319,23 @@ async def async_account_period_totals(
             else None
         ),
         complete=complete,
+    )
+
+
+def _hourly_rows_are_contiguous(
+    starts: set[float], period_start: datetime, expected_horizon: float | None
+) -> bool:
+    """Return whether published rows cover every UTC hour from period start."""
+    if (
+        not starts
+        or expected_horizon is None
+        or min(starts) != period_start.timestamp()
+        or max(starts) != expected_horizon
+    ):
+        return False
+    ordered = sorted(starts)
+    return all(
+        later - earlier == _SECONDS_PER_HOUR for earlier, later in pairwise(ordered)
     )
 
 

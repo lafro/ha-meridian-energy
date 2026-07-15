@@ -14,19 +14,32 @@ async def async_get_config_entry_diagnostics(
 ) -> dict[str, Any]:
     """Return diagnostics without account, address, email, usage or token data."""
     del hass
-    data = entry.runtime_data.coordinator.data
+    coordinator = entry.runtime_data.coordinator
+    data = coordinator.data
+    last_exception = coordinator.last_exception
+    billing_cache_age = coordinator.billing_metadata_cache_age_seconds
     return {
         "config_entry": {
             "version": entry.version,
             "minor_version": entry.minor_version,
         },
         "coordinator": {
-            "last_update_success": entry.runtime_data.coordinator.last_update_success,
+            "last_update_success": coordinator.last_update_success,
+            "last_exception_type": (
+                type(last_exception).__name__ if last_exception is not None else None
+            ),
             "account_count": data.account_count,
             "property_count": data.property_count,
             "sync_mode": data.sync_mode,
             "topology_refreshed": data.topology_refreshed,
             "topology_cache_age_seconds": data.topology_cache_age_seconds,
+            "sync_duration_seconds": round(data.sync_duration_seconds, 3),
+            "billing_metadata_unavailable_count": (
+                coordinator.billing_metadata_unavailable_count
+            ),
+            "billing_metadata_cache_age_seconds": (
+                round(billing_cache_age, 3) if billing_cache_age is not None else None
+            ),
             "property_results": [
                 {
                     "sync_mode": result.sync_mode,

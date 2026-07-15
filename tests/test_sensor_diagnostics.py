@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from homeassistant.helpers.update_coordinator import UpdateFailed
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.meridian_energy.const import (
@@ -232,31 +233,89 @@ async def test_feed_in_entities_are_added_when_topology_changes(hass) -> None:
     entry = _entry(coordinator)
     entities = []
 
-    await async_setup_entry(hass, entry, entities.extend)
-    assert len(entities) == 8
+    entity_registry = MagicMock()
+    entity_registry.async_get_entity_id.return_value = None
+    with patch(
+        "custom_components.meridian_energy.sensor.er.async_get",
+        return_value=entity_registry,
+    ):
+        await async_setup_entry(hass, entry, entities.extend)
+        assert len(entities) == 8
 
-    coordinator.async_set_updated_data(
-        replace(
-            coordinator.data,
-            account_results=(
-                replace(
-                    coordinator.data.account_results[0],
-                    has_feed_in=True,
-                    current_bill_export=Decimal(2),
-                    current_bill_credit=Decimal("0.4"),
-                ),
-            ),
+        feed_in_result = replace(
+            coordinator.data.account_results[0],
+            has_feed_in=True,
+            current_bill_export=Decimal(2),
+            current_bill_credit=Decimal("0.4"),
         )
-    )
+        coordinator.async_set_updated_data(
+            replace(coordinator.data, account_results=(feed_in_result,))
+        )
+        assert len(entities) == 10
+        assert entities[-2].native_value == Decimal(2)
+        assert entities[-1].native_value == Decimal("0.4")
 
-    assert len(entities) == 10
-    assert entities[-2].native_value == Decimal(2)
-    assert entities[-1].native_value == Decimal("0.4")
+        entity_registry.async_get_entity_id.side_effect = [
+            "sensor.current_bill_export",
+            "sensor.current_bill_credit",
+        ]
+        entity_registry.async_get.side_effect = [
+            SimpleNamespace(config_entry_id=entry.entry_id),
+            SimpleNamespace(config_entry_id=entry.entry_id),
+        ]
+        coordinator.async_set_updated_data(
+            replace(
+                coordinator.data,
+                account_results=(
+                    replace(
+                        feed_in_result,
+                        has_feed_in=False,
+                        current_bill_export=None,
+                        current_bill_credit=None,
+                    ),
+                ),
+            )
+        )
+        assert entity_registry.async_remove.call_count == 2
+
+        coordinator.async_set_updated_data(
+            replace(coordinator.data, account_results=(feed_in_result,))
+        )
+        assert len(entities) == 12
+
     coordinator._topology = ()
     coordinator.async_set_updated_data(
         replace(coordinator.data, results=(), account_results=())
     )
-    assert len(entities) == 10
+    await entry._async_process_on_unload(hass)
+
+
+@pytest.mark.asyncio
+async def test_stale_feed_in_entities_are_removed_after_platform_reload(hass) -> None:
+    """Reconcile persistent conditional entities with a fresh runtime set."""
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    coordinator._topology = (_account(),)
+    coordinator.data = _data()
+    entry = _entry(coordinator)
+    entities = []
+    entity_registry = MagicMock()
+    entity_registry.async_get_entity_id.side_effect = [
+        "sensor.current_bill_export",
+        "sensor.current_bill_credit",
+    ]
+    entity_registry.async_get.side_effect = [
+        SimpleNamespace(config_entry_id=entry.entry_id),
+        SimpleNamespace(config_entry_id=entry.entry_id),
+    ]
+
+    with patch(
+        "custom_components.meridian_energy.sensor.er.async_get",
+        return_value=entity_registry,
+    ):
+        await async_setup_entry(hass, entry, entities.extend)
+
+    assert len(entities) == 8
+    assert entity_registry.async_remove.call_count == 2
     await entry._async_process_on_unload(hass)
 
 
@@ -301,6 +360,9 @@ async def test_diagnostics_exclude_all_sensitive_fields(hass) -> None:
     coordinator = MagicMock()
     coordinator.data = _data()
     coordinator.last_update_success = True
+    coordinator.last_exception = UpdateFailed("safe")
+    coordinator.billing_metadata_unavailable_count = 1
+    coordinator.billing_metadata_cache_age_seconds = 3600.125
     entry = _entry(coordinator)
 
     diagnostics = await async_get_config_entry_diagnostics(hass, entry)
@@ -308,6 +370,10 @@ async def test_diagnostics_exclude_all_sensitive_fields(hass) -> None:
 
     assert diagnostics["coordinator"]["account_count"] == 1
     assert diagnostics["coordinator"]["sync_mode"] == SyncMode.TIP
+    assert diagnostics["coordinator"]["last_exception_type"] == "UpdateFailed"
+    assert diagnostics["coordinator"]["sync_duration_seconds"] == 0
+    assert diagnostics["coordinator"]["billing_metadata_unavailable_count"] == 1
+    assert diagnostics["coordinator"]["billing_metadata_cache_age_seconds"] == 3600.125
     assert diagnostics["coordinator"]["property_results"][0]["api_pages"] == {
         "consumption": 1,
         "generation": 0,

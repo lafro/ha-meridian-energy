@@ -4,7 +4,9 @@ rules:
     status: exempt
     comment: The integration does not provide actions.
   appropriate-polling: done
-  brands: done
+  brands:
+    status: todo
+    comment: Local HACS brand assets are complete; an official brands repository submission belongs with any future Core proposal.
   common-modules: done
   config-flow-test-coverage: done
   config-flow: done
@@ -55,7 +57,9 @@ rules:
     status: exempt
     comment: Meridian accounts are authenticated cloud resources, not discoverable devices.
   docs-data-update: done
-  docs-examples: done
+  docs-examples:
+    status: todo
+    comment: No supported automation blueprint has been published yet.
   docs-known-limitations: done
   docs-supported-devices: done
   docs-supported-functions: done
@@ -76,7 +80,7 @@ rules:
 
   # Platinum
   async-dependency:
-    status: exempt
-    comment: The small private API client is embedded and fully asynchronous; there is no external client dependency.
+    status: todo
+    comment: The HACS integration deliberately embeds its asynchronous private-API client; Core submission would require an external library.
   inject-websession: done
   strict-typing: done

@@ -13,6 +13,7 @@ from aiohttp import ClientError
 from custom_components.meridian_energy.api import (
     MeridianApiClient,
     MeridianAuthenticationError,
+    MeridianConnectionError,
     MeridianGraphQLError,
     MeridianOtpError,
     MeridianRateLimitError,
@@ -104,6 +105,52 @@ async def test_send_otp_rejected() -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_otp_maps_server_error_without_leaking_payload() -> None:
+    client = MeridianApiClient(MagicMock())
+    client._async_json_request = AsyncMock(
+        side_effect=_MeridianHttpError(503, {"secret": "must-not-leak"})
+    )
+
+    with pytest.raises(MeridianConnectionError) as raised:
+        await client.async_send_otp("person@example.com", "journey")
+
+    assert "must-not-leak" not in str(raised.value)
+
+
+@pytest.mark.asyncio
+async def test_send_otp_maps_request_timeout_to_connection_failure() -> None:
+    client = MeridianApiClient(MagicMock())
+    client._async_json_request = AsyncMock(
+        side_effect=_MeridianHttpError(408, {"error": "redacted"})
+    )
+
+    with pytest.raises(MeridianConnectionError):
+        await client.async_send_otp("person@example.com", "journey")
+
+
+@pytest.mark.parametrize(
+    ("status", "error_type"),
+    [
+        (400, MeridianAuthenticationError),
+        (429, MeridianRateLimitError),
+    ],
+)
+@pytest.mark.asyncio
+async def test_send_otp_maps_client_errors(
+    status: int, error_type: type[Exception]
+) -> None:
+    client = MeridianApiClient(MagicMock())
+    client._async_json_request = AsyncMock(
+        side_effect=_MeridianHttpError(status, {"secret": "must-not-leak"}, 123)
+    )
+
+    with pytest.raises(error_type) as raised:
+        await client.async_send_otp("person@example.com", "journey")
+
+    assert "must-not-leak" not in str(raised.value)
+
+
+@pytest.mark.asyncio
 async def test_validate_otp_exchanges_custom_token() -> None:
     callback = AsyncMock()
     client = MeridianApiClient(MagicMock(), token_update_callback=callback)
@@ -139,6 +186,68 @@ async def test_validate_otp_maps_error_without_leaking_payload() -> None:
         await client.async_validate_otp("person@example.com", "123456", "journey")
 
     assert raised.value.code == "OTP_NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_validate_otp_maps_server_error_to_connection_failure() -> None:
+    client = MeridianApiClient(MagicMock())
+    client._async_json_request = AsyncMock(
+        side_effect=_MeridianHttpError(500, {"error": "redacted"})
+    )
+
+    with pytest.raises(MeridianConnectionError):
+        await client.async_validate_otp("person@example.com", "123456", "journey")
+
+
+@pytest.mark.asyncio
+async def test_validate_otp_maps_request_timeout_to_connection_failure() -> None:
+    client = MeridianApiClient(MagicMock())
+    client._async_json_request = AsyncMock(
+        side_effect=_MeridianHttpError(408, {"error": "redacted"})
+    )
+
+    with pytest.raises(MeridianConnectionError):
+        await client.async_validate_otp("person@example.com", "123456", "journey")
+
+
+@pytest.mark.asyncio
+async def test_validate_otp_maps_rate_limit() -> None:
+    client = MeridianApiClient(MagicMock())
+    client._async_json_request = AsyncMock(
+        side_effect=_MeridianHttpError(429, {}, retry_after=123)
+    )
+
+    with pytest.raises(MeridianRateLimitError) as raised:
+        await client.async_validate_otp("person@example.com", "123456", "journey")
+
+    assert raised.value.retry_after == 123
+
+
+@pytest.mark.parametrize(
+    ("status", "error_type"),
+    [
+        (400, MeridianAuthenticationError),
+        (408, MeridianConnectionError),
+        (429, MeridianRateLimitError),
+        (503, MeridianConnectionError),
+    ],
+)
+@pytest.mark.asyncio
+async def test_validate_otp_maps_custom_token_exchange_error(
+    status: int, error_type: type[Exception]
+) -> None:
+    client = MeridianApiClient(MagicMock())
+    client._async_json_request = AsyncMock(
+        side_effect=[
+            {"customToken": "custom"},
+            _MeridianHttpError(status, {"secret": "must-not-leak"}),
+        ]
+    )
+
+    with pytest.raises(error_type) as raised:
+        await client.async_validate_otp("person@example.com", "123456", "journey")
+
+    assert "must-not-leak" not in str(raised.value)
 
 
 @pytest.mark.asyncio
@@ -211,7 +320,7 @@ async def test_refresh_rejected_requires_reauth(status: int) -> None:
 
 
 @pytest.mark.asyncio
-async def test_refresh_propagates_server_error() -> None:
+async def test_refresh_maps_server_error_to_connection_failure() -> None:
     expired = MeridianTokenSet(
         "id", "refresh", datetime.now(UTC) - timedelta(seconds=1), "uid"
     )
@@ -219,7 +328,21 @@ async def test_refresh_propagates_server_error() -> None:
     client._async_json_request = AsyncMock(
         side_effect=_MeridianHttpError(500, {"error": "redacted"})
     )
-    with pytest.raises(_MeridianHttpError):
+    with pytest.raises(MeridianConnectionError):
+        await client.async_refresh_tokens()
+
+
+@pytest.mark.asyncio
+async def test_refresh_maps_request_timeout_to_connection_failure() -> None:
+    expired = MeridianTokenSet(
+        "id", "refresh", datetime.now(UTC) - timedelta(seconds=1), "uid"
+    )
+    client = MeridianApiClient(MagicMock(), tokens=expired)
+    client._async_json_request = AsyncMock(
+        side_effect=_MeridianHttpError(408, {"error": "redacted"})
+    )
+
+    with pytest.raises(MeridianConnectionError):
         await client.async_refresh_tokens()
 
 
@@ -535,10 +658,10 @@ async def test_graphql_second_unauthorized_requires_reauth() -> None:
 
 
 @pytest.mark.asyncio
-async def test_graphql_propagates_non_auth_http_error() -> None:
+async def test_graphql_maps_non_auth_http_error_to_connection_failure() -> None:
     client = MeridianApiClient(MagicMock(), tokens=_tokens())
     client._async_json_request = AsyncMock(side_effect=_MeridianHttpError(500, {}))
-    with pytest.raises(_MeridianHttpError):
+    with pytest.raises(MeridianConnectionError):
         await client._async_graphql("operation", "query", {})
 
 
@@ -556,11 +679,31 @@ async def test_graphql_propagates_rate_limit_delay() -> None:
 @pytest.mark.asyncio
 async def test_graphql_auth_code_requires_reauth() -> None:
     client = MeridianApiClient(MagicMock(), tokens=_tokens())
+    client.async_refresh_tokens = AsyncMock(return_value=_tokens())
     client._async_json_request = AsyncMock(
         return_value={"errors": [{"extensions": {"errorCode": "KT-CT-1111"}}]}
     )
     with pytest.raises(MeridianAuthenticationError):
         await client._async_graphql("operation", "query", {})
+
+    assert client.async_refresh_tokens.await_args_list[1].kwargs == {"force": True}
+
+
+@pytest.mark.asyncio
+async def test_graphql_auth_code_recovers_after_forced_refresh() -> None:
+    client = MeridianApiClient(MagicMock(), tokens=_tokens())
+    client.async_refresh_tokens = AsyncMock(return_value=_tokens())
+    client._async_json_request = AsyncMock(
+        side_effect=[
+            {"errors": [{"extensions": {"errorCode": "KT-CT-1111"}}]},
+            {"data": {"ok": True}},
+        ]
+    )
+
+    result = await client._async_graphql("operation", "query", {})
+
+    assert result == {"ok": True}
+    assert client.async_refresh_tokens.await_args_list[1].kwargs == {"force": True}
 
 
 @pytest.mark.asyncio
@@ -592,6 +735,25 @@ async def test_json_request_preserves_rate_limit_header_on_non_json_error() -> N
     with pytest.raises(_MeridianHttpError) as raised:
         await client._async_json_request("https://example.test", authenticated=False)
     assert raised.value.status == 429
+    assert raised.value.retry_after == 120
+
+
+@pytest.mark.asyncio
+async def test_json_request_preserves_rate_limit_header_on_non_object_error() -> None:
+    client = MeridianApiClient(
+        _FakeSession(
+            _FakeResponse(
+                ["unexpected"],
+                status=429,
+                headers={"Retry-After": "120"},
+            )
+        )
+    )
+    with pytest.raises(_MeridianHttpError) as raised:
+        await client._async_json_request("https://example.test", authenticated=False)
+
+    assert raised.value.status == 429
+    assert raised.value.payload == {}
     assert raised.value.retry_after == 120
 
 
