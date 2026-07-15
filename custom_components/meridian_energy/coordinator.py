@@ -7,10 +7,12 @@ import math
 from collections import Counter
 from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
+from time import monotonic
 from zoneinfo import ZoneInfo
 
-from homeassistant.config_entries import ConfigEntry, ConfigEntryAuthFailed
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CoreState, HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import (
@@ -56,8 +58,8 @@ from .models import (
 from .statistics import (
     account_key,
     async_account_period_totals,
-    async_has_statistics,
     async_import_measurements,
+    async_latest_numeric_statistic_start,
     consumption_ids,
     generation_ids,
     property_key,
@@ -106,11 +108,17 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         self._topology_cached_at: datetime | None = None
         self._billing_periods: dict[str, MeridianBillingPeriod] = {}
         self._billing_cached_at: dict[str, datetime] = {}
+        self._billing_unavailable: set[str] = set()
         self._measurement_cache: dict[
             CacheKey, dict[MeasurementKey, MeridianMeasurement]
         ] = {}
         self._row_density: dict[CacheKey, float] = {}
         self._known_statistics: dict[str, bool] = {}
+        self._latest_statistics: dict[str, datetime | None] = {}
+        self._backfill_attempted: set[CacheKey] = set()
+        self._pending_backfill: set[CacheKey] = set()
+        self._active_directions: set[CacheKey] = set()
+        self._seen_directions: set[CacheKey] = set()
         self._initial_refresh_complete = False
         self._last_targeted_reconciliation: datetime | None = None
         self._last_full_reconciliation: datetime | None = None
@@ -120,52 +128,27 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         """Return the selected, cached account topology."""
         return self._filtered_topology()
 
+    @property
+    def billing_metadata_unavailable_count(self) -> int:
+        """Return how many selected accounts have a failed billing refresh."""
+        return len(self._billing_unavailable)
+
+    @property
+    def billing_metadata_cache_age_seconds(self) -> float | None:
+        """Return the age of the oldest billing metadata cache entry."""
+        if not self._billing_cached_at:
+            return None
+        now = _utcnow()
+        oldest_cached_at = min(self._billing_cached_at.values())
+        return max(0.0, (now - oldest_cached_at).total_seconds())
+
     async def _async_update_data(self) -> MeridianSyncData:
         return await self.async_fetch_and_import()
 
     async def async_fetch_and_import(self) -> MeridianSyncData:
         """Fetch Meridian data and import statistics for setup or polling."""
-        now = _utcnow()
-        topology_refreshed = False
         try:
-            accounts, topology_refreshed = await self._async_get_topology(now)
-            mode = (
-                await self._async_startup_mode(accounts)
-                if not self._initial_refresh_complete
-                else self._select_sync_mode(now)
-            )
-            try:
-                results = await self._async_sync_accounts(accounts, mode, now)
-            except MeridianGraphQLError as err:
-                if topology_refreshed or not _is_topology_error(err):
-                    raise
-                accounts, topology_refreshed = await self._async_get_topology(
-                    now, force=True
-                )
-                results = await self._async_sync_accounts(accounts, mode, now)
-
-            account_results = await self._async_account_results(accounts, now)
-
-            self._initial_refresh_complete = True
-            if mode in {SyncMode.INITIAL, SyncMode.RESTART}:
-                self._last_targeted_reconciliation = now
-                self._last_full_reconciliation = now
-            elif mode is SyncMode.TARGETED_RECONCILIATION:
-                self._last_targeted_reconciliation = now
-            elif mode is SyncMode.FULL_RECONCILIATION:
-                self._last_targeted_reconciliation = now
-                self._last_full_reconciliation = now
-
-            return MeridianSyncData(
-                account_count=len(accounts),
-                property_count=sum(len(account.properties) for account in accounts),
-                results=results,
-                account_results=account_results,
-                synced_at=now,
-                sync_mode=mode,
-                topology_refreshed=topology_refreshed,
-                topology_cache_age_seconds=self._topology_cache_age(now),
-            )
+            data = await self._async_fetch_and_import_data()
         except MeridianAuthenticationError as err:
             raise ConfigEntryAuthFailed(
                 translation_domain=DOMAIN,
@@ -187,6 +170,88 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 translation_domain=DOMAIN,
                 translation_key="invalid_data",
             ) from err
+        else:
+            return data
+
+    async def _async_fetch_and_import_data(self) -> MeridianSyncData:
+        """Complete one sync and return its privacy-safe operational summary."""
+        now = _utcnow()
+        started_at = monotonic()
+        accounts, topology_refreshed = await self._async_get_topology(now)
+        mode = (
+            await self._async_startup_mode(accounts)
+            if not self._initial_refresh_complete
+            else self._select_sync_mode(now)
+        )
+        try:
+            results = await self._async_sync_accounts(accounts, mode, now)
+        except MeridianGraphQLError as err:
+            if topology_refreshed or not _is_topology_error(err):
+                raise
+            accounts, topology_refreshed = await self._async_get_topology(
+                now, force=True
+            )
+            results = await self._async_sync_accounts(accounts, mode, now)
+
+        self._initial_refresh_complete = True
+        self._record_sync_cadence(mode, now)
+        account_results = await self._async_account_results(accounts, now)
+
+        data = MeridianSyncData(
+            account_count=len(accounts),
+            property_count=sum(len(account.properties) for account in accounts),
+            results=results,
+            account_results=account_results,
+            synced_at=now,
+            sync_mode=mode,
+            topology_refreshed=topology_refreshed,
+            topology_cache_age_seconds=self._topology_cache_age(now),
+            sync_duration_seconds=monotonic() - started_at,
+        )
+        self._log_sync_summary(data)
+        return data
+
+    def _record_sync_cadence(self, mode: SyncMode, now: datetime) -> None:
+        """Record a completed measurement sync before optional billing work."""
+        if mode in {SyncMode.INITIAL, SyncMode.RESTART}:
+            self._last_targeted_reconciliation = now
+            self._last_full_reconciliation = now
+        elif mode is SyncMode.TARGETED_RECONCILIATION:
+            self._last_targeted_reconciliation = now
+        elif mode is SyncMode.FULL_RECONCILIATION:
+            self._last_targeted_reconciliation = now
+            self._last_full_reconciliation = now
+
+    @staticmethod
+    def _log_sync_summary(data: MeridianSyncData) -> None:
+        """Write one privacy-safe summary when debug logging is enabled."""
+        _LOGGER.debug(
+            "Meridian sync completed: mode=%s duration=%.2fs accounts=%d "
+            "properties=%d pages=%d rows_received=%d rows_retained=%d "
+            "rows_imported=%d provisional=%d topology_refreshed=%s",
+            data.sync_mode,
+            data.sync_duration_seconds,
+            data.account_count,
+            data.property_count,
+            sum(
+                result.consumption_pages + result.generation_pages
+                for result in data.results
+            ),
+            sum(
+                result.consumption_received_rows + result.generation_received_rows
+                for result in data.results
+            ),
+            sum(
+                result.consumption_retained_rows + result.generation_retained_rows
+                for result in data.results
+            ),
+            sum(
+                result.consumption_rows + result.generation_rows
+                for result in data.results
+            ),
+            sum(result.estimated_rows for result in data.results),
+            data.topology_refreshed,
+        )
 
     async def async_refresh_billing_totals(self) -> None:
         """Refresh Recorder-derived billing totals without polling Meridian usage."""
@@ -222,8 +287,64 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             self._topology = await self.client.async_get_accounts()
             self._topology_cached_at = now
             self._include_new_accounts()
-            return self._filtered_topology(), True
+            accounts = self._filtered_topology()
+            self._prune_topology_state(accounts)
+            return accounts, True
         return self._filtered_topology(), False
+
+    def _prune_topology_state(self, accounts: tuple[MeridianAccount, ...]) -> None:
+        """Discard runtime caches for accounts and directions no longer selected."""
+        account_numbers = {account.number for account in accounts}
+        property_directions: set[CacheKey] = set()
+        statistic_ids: set[str] = set()
+        for account in accounts:
+            for property_data in account.properties:
+                key = property_key(account.number, property_data.id)
+                property_directions.add((key, READING_CONSUMPTION))
+                statistic_ids.update(consumption_ids(key))
+                if any(meter.has_feed_in for meter in property_data.meter_points):
+                    property_directions.add((key, READING_GENERATION))
+                    statistic_ids.update(generation_ids(key))
+
+        self._billing_periods = {
+            key: value
+            for key, value in self._billing_periods.items()
+            if key in account_numbers
+        }
+        self._billing_cached_at = {
+            key: value
+            for key, value in self._billing_cached_at.items()
+            if key in account_numbers
+        }
+        self._billing_unavailable.intersection_update(account_numbers)
+        self._measurement_cache = {
+            key: value
+            for key, value in self._measurement_cache.items()
+            if key in property_directions
+        }
+        self._row_density = {
+            key: value
+            for key, value in self._row_density.items()
+            if key in property_directions
+        }
+        self._known_statistics = {
+            key: value
+            for key, value in self._known_statistics.items()
+            if key in statistic_ids
+        }
+        self._latest_statistics = {
+            key: value
+            for key, value in self._latest_statistics.items()
+            if key in statistic_ids
+        }
+        reappeared_directions = (
+            property_directions - self._active_directions
+        ) & self._seen_directions
+        self._pending_backfill.update(reappeared_directions)
+        self._backfill_attempted.intersection_update(property_directions)
+        self._pending_backfill.intersection_update(property_directions)
+        self._active_directions = property_directions
+        self._seen_directions.update(property_directions)
 
     def _filtered_topology(self) -> tuple[MeridianAccount, ...]:
         """Return only accounts explicitly selected for this config entry."""
@@ -266,14 +387,11 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         for account in accounts:
             for property_data in account.properties:
                 key = property_key(account.number, property_data.id)
-                required_ids = [consumption_ids(key)[0]]
+                required_ids = list(consumption_ids(key))
                 if any(meter.has_feed_in for meter in property_data.meter_points):
-                    required_ids.append(generation_ids(key)[0])
+                    required_ids.extend(generation_ids(key))
                 for statistic_id in required_ids:
-                    if statistic_id not in self._known_statistics:
-                        self._known_statistics[
-                            statistic_id
-                        ] = await async_has_statistics(self.hass, statistic_id)
+                    await self._async_cache_statistic(statistic_id)
                     has_all_statistics &= self._known_statistics[statistic_id]
         return SyncMode.RESTART if has_all_statistics else SyncMode.INITIAL
 
@@ -370,9 +488,22 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             return cached
         try:
             billing = await self.client.async_get_billing_period(account_number)
+        except MeridianRateLimitError:
+            raise
         except (MeridianConnectionError, MeridianGraphQLError, ValueError) as err:
-            _LOGGER.warning("Unable to refresh Meridian billing metadata: %s", err)
+            was_available = not self._billing_unavailable
+            self._billing_unavailable.add(account_number)
+            if was_available:
+                _LOGGER.info(
+                    "Meridian billing metadata is unavailable; retaining the last "
+                    "known data (%s)",
+                    type(err).__name__,
+                )
             return cached
+        if account_number in self._billing_unavailable:
+            self._billing_unavailable.discard(account_number)
+            if not self._billing_unavailable:
+                _LOGGER.info("Meridian billing metadata is available again")
         self._billing_periods[account_number] = billing
         self._billing_cached_at[account_number] = now
         return billing
@@ -387,23 +518,26 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         disambiguate: bool = False,
     ) -> PropertySyncResult:
         key = property_key(account_number, property_data.id)
+        consumption_cache_key = (key, READING_CONSUMPTION)
         consumption_energy_id, consumption_cost_id = consumption_ids(key)
-        consumption_mode = await self._direction_mode(consumption_energy_id, mode)
+        consumption_mode = await self._direction_mode(
+            consumption_cache_key,
+            (consumption_energy_id, consumption_cost_id),
+            mode,
+        )
         consumption_since = self._requested_since(
-            (key, READING_CONSUMPTION), consumption_mode, now
+            consumption_cache_key, consumption_mode, now
         )
         consumption = await self._async_fetch_since(
             account_number=account_number,
             property_id=property_data.id,
             direction=READING_CONSUMPTION,
             since=consumption_since,
-            page_size=self._page_size(
-                (key, READING_CONSUMPTION), consumption_since, now
-            ),
+            page_size=self._page_size(consumption_cache_key, consumption_since, now),
         )
-        self._remember_density((key, READING_CONSUMPTION), consumption)
+        self._remember_density(consumption_cache_key, consumption)
         consumption_import = self._merge_measurements(
-            (key, READING_CONSUMPTION),
+            consumption_cache_key,
             consumption.measurements,
             now,
             initial_import=consumption_mode is SyncMode.INITIAL,
@@ -421,29 +555,38 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 cost_name=f"Meridian grid import cost{suffix}",
                 measurements=consumption_import,
             )
-            self._known_statistics[consumption_energy_id] = True
+        self._record_direction_fetch(
+            consumption_cache_key,
+            consumption_mode,
+            consumption.measurements,
+            consumption_energy_id,
+            consumption_cost_id,
+        )
 
         generation_rows = 0
         generation = _empty_fetch()
         generation_since = consumption_since
         if any(meter.has_feed_in for meter in property_data.meter_points):
+            generation_cache_key = (key, READING_GENERATION)
             generation_energy_id, generation_credit_id = generation_ids(key)
-            generation_mode = await self._direction_mode(generation_energy_id, mode)
+            generation_mode = await self._direction_mode(
+                generation_cache_key,
+                (generation_energy_id, generation_credit_id),
+                mode,
+            )
             generation_since = self._requested_since(
-                (key, READING_GENERATION), generation_mode, now
+                generation_cache_key, generation_mode, now
             )
             generation = await self._async_fetch_since(
                 account_number=account_number,
                 property_id=property_data.id,
                 direction=READING_GENERATION,
                 since=generation_since,
-                page_size=self._page_size(
-                    (key, READING_GENERATION), generation_since, now
-                ),
+                page_size=self._page_size(generation_cache_key, generation_since, now),
             )
-            self._remember_density((key, READING_GENERATION), generation)
+            self._remember_density(generation_cache_key, generation)
             generation_import = self._merge_measurements(
-                (key, READING_GENERATION),
+                generation_cache_key,
                 generation.measurements,
                 now,
                 initial_import=generation_mode is SyncMode.INITIAL,
@@ -462,7 +605,13 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                     cost_name=f"Meridian grid export credit{suffix}",
                     measurements=generation_import,
                 )
-                self._known_statistics[generation_energy_id] = True
+            self._record_direction_fetch(
+                generation_cache_key,
+                generation_mode,
+                generation.measurements,
+                generation_energy_id,
+                generation_credit_id,
+            )
 
         consumption_cache = self._measurement_cache.get((key, READING_CONSUMPTION), {})
         qualities = Counter(item.quality for item in consumption_cache.values())
@@ -500,17 +649,75 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         )
 
     async def _direction_mode(
-        self, energy_statistic_id: str, requested_mode: SyncMode
+        self,
+        cache_key: CacheKey,
+        statistic_ids: tuple[str, str],
+        requested_mode: SyncMode,
     ) -> SyncMode:
-        if energy_statistic_id not in self._known_statistics:
-            self._known_statistics[energy_statistic_id] = await async_has_statistics(
-                self.hass, energy_statistic_id
+        for statistic_id in statistic_ids:
+            await self._async_cache_statistic(statistic_id)
+        if cache_key in self._pending_backfill:
+            return SyncMode.INITIAL
+        if (
+            not all(
+                self._known_statistics[statistic_id] for statistic_id in statistic_ids
             )
-        if not self._known_statistics[energy_statistic_id]:
+            and cache_key not in self._backfill_attempted
+        ):
+            return SyncMode.INITIAL
+        if not self._initial_refresh_complete and any(
+            latest is None or latest < _utcnow() - REVISION_OVERLAP
+            for latest in (
+                self._latest_statistics[statistic_id] for statistic_id in statistic_ids
+            )
+        ):
             return SyncMode.INITIAL
         if not self._initial_refresh_complete:
             return SyncMode.RESTART
         return requested_mode
+
+    async def _async_cache_statistic(self, statistic_id: str) -> None:
+        """Cache whether Recorder has current numeric history for a statistic."""
+        if statistic_id in self._known_statistics:
+            return
+        latest = await async_latest_numeric_statistic_start(self.hass, statistic_id)
+        self._latest_statistics[statistic_id] = latest
+        self._known_statistics[statistic_id] = latest is not None
+
+    def _record_direction_fetch(
+        self,
+        cache_key: CacheKey,
+        mode: SyncMode,
+        measurements: tuple[MeridianMeasurement, ...],
+        energy_statistic_id: str,
+        money_statistic_id: str,
+    ) -> None:
+        """Track attempted backfills separately from observable numeric history."""
+        energy_was_known = self._known_statistics.get(energy_statistic_id, False)
+        money_was_known = self._known_statistics.get(money_statistic_id, False)
+        energy_observed = bool(measurements)
+        money_observed = any(item.cost_cents is not None for item in measurements)
+
+        if mode is SyncMode.INITIAL:
+            self._backfill_attempted.add(cache_key)
+            self._pending_backfill.discard(cache_key)
+        elif (energy_observed and not energy_was_known) or (
+            money_observed and not money_was_known
+        ):
+            self._pending_backfill.add(cache_key)
+
+        if energy_observed:
+            self._known_statistics[energy_statistic_id] = True
+            self._latest_statistics[energy_statistic_id] = max(
+                item.start.astimezone(UTC) for item in measurements
+            )
+        if money_observed:
+            self._known_statistics[money_statistic_id] = True
+            self._latest_statistics[money_statistic_id] = max(
+                item.start.astimezone(UTC)
+                for item in measurements
+                if item.cost_cents is not None
+            )
 
     def _requested_since(
         self, cache_key: CacheKey, mode: SyncMode, now: datetime

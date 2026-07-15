@@ -76,10 +76,14 @@ class MeridianTransport:
                     raise MeridianTransportError(
                         "Meridian returned an unreadable response"
                     ) from err
-                parsed = require_mapping(payload, "HTTP response")
                 if response.status >= _HTTP_BAD_REQUEST:
-                    raise MeridianHttpError(response.status, parsed, retry_after)
-                return parsed
+                    _LOGGER.debug("Meridian request returned HTTP %d", response.status)
+                    raise MeridianHttpError(
+                        response.status,
+                        payload if isinstance(payload, dict) else {},
+                        retry_after,
+                    )
+                return require_mapping(payload, "HTTP response")
         except MeridianHttpError:
             raise
         except (ClientError, TimeoutError) as err:

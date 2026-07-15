@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -21,6 +23,7 @@ from custom_components.meridian_energy.const import (
     CONF_SELECTED_ACCOUNTS,
     DOMAIN,
     READING_CONSUMPTION,
+    READING_GENERATION,
     REVISION_OVERLAP,
 )
 from custom_components.meridian_energy.coordinator import MeridianDataCoordinator
@@ -35,6 +38,7 @@ from custom_components.meridian_energy.models import (
     MeridianSyncData,
     SyncMode,
 )
+from custom_components.meridian_energy.statistics import consumption_ids, property_key
 
 NOW = datetime(2026, 7, 14, 0, 0, tzinfo=UTC)
 CACHE_KEY = ("property-key", READING_CONSUMPTION)
@@ -222,6 +226,41 @@ async def test_topology_auto_adds_new_accounts_when_all_were_selected(hass) -> N
 
 
 @pytest.mark.asyncio
+async def test_topology_refresh_prunes_removed_account_runtime_state(hass) -> None:
+    remaining = _account()
+    removed = MeridianAccount(
+        number="removed-account", status="ACTIVE", properties=remaining.properties
+    )
+    client = MagicMock()
+    client.async_get_accounts = AsyncMock(
+        side_effect=[(remaining, removed), (remaining,)]
+    )
+    coordinator = MeridianDataCoordinator(hass, client)
+
+    await coordinator._async_get_topology(NOW)
+    coordinator._billing_periods[removed.number] = _billing_period()
+    coordinator._billing_cached_at[removed.number] = NOW
+    coordinator._billing_unavailable.add(removed.number)
+    removed_key = (
+        property_key(removed.number, removed.properties[0].id),
+        READING_CONSUMPTION,
+    )
+    coordinator._measurement_cache[removed_key] = {}
+    coordinator._row_density[removed_key] = 1.0
+    removed_statistic_id = consumption_ids(removed_key[0])[0]
+    coordinator._known_statistics[removed_statistic_id] = True
+
+    await coordinator._async_get_topology(NOW + timedelta(days=1))
+
+    assert removed.number not in coordinator._billing_periods
+    assert removed.number not in coordinator._billing_cached_at
+    assert removed.number not in coordinator._billing_unavailable
+    assert removed_key not in coordinator._measurement_cache
+    assert removed_key not in coordinator._row_density
+    assert removed_statistic_id not in coordinator._known_statistics
+
+
+@pytest.mark.asyncio
 async def test_billing_period_is_cached_and_refreshed_after_period_end(hass) -> None:
     client = MagicMock()
     client.async_get_billing_period = AsyncMock(
@@ -254,6 +293,98 @@ async def test_billing_failure_keeps_cached_metadata(hass) -> None:
     result = await coordinator._async_billing_period("account", NOW)
 
     assert result == _billing_period()
+
+
+@pytest.mark.asyncio
+async def test_billing_failure_logs_once_and_recovery_without_identifiers(
+    hass, caplog
+) -> None:
+    client = MagicMock()
+    client.async_get_billing_period = AsyncMock(
+        side_effect=[
+            MeridianGraphQLError("billingPeriods", ("TEMPORARY",)),
+            _billing_period(),
+        ]
+    )
+    coordinator = MeridianDataCoordinator(hass, client)
+    caplog.set_level(logging.INFO)
+
+    await coordinator._async_billing_period("private-account", NOW)
+    await coordinator._async_billing_period("private-account", NOW + timedelta(hours=1))
+    await coordinator._async_billing_period(
+        "private-account", NOW + timedelta(days=1, minutes=1)
+    )
+
+    assert caplog.text.count("billing metadata is unavailable") == 1
+    assert "billing metadata is available again" in caplog.text
+    assert "private-account" not in caplog.text
+    assert client.async_get_billing_period.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_billing_outage_logs_one_transition_across_accounts(hass, caplog) -> None:
+    client = MagicMock()
+    client.async_get_billing_period = AsyncMock(
+        side_effect=[
+            MeridianGraphQLError("billingPeriods", ("TEMPORARY",)),
+            MeridianGraphQLError("billingPeriods", ("TEMPORARY",)),
+            _billing_period(),
+            _billing_period(),
+        ]
+    )
+    coordinator = MeridianDataCoordinator(hass, client)
+    caplog.set_level(logging.INFO)
+
+    await coordinator._async_billing_period("account-a", NOW)
+    await coordinator._async_billing_period("account-b", NOW)
+    await coordinator._async_billing_period("account-a", NOW + timedelta(hours=1))
+    await coordinator._async_billing_period("account-b", NOW + timedelta(hours=1))
+
+    assert caplog.text.count("billing metadata is unavailable") == 1
+    assert caplog.text.count("billing metadata is available again") == 1
+    assert "account-a" not in caplog.text
+    assert "account-b" not in caplog.text
+    assert coordinator.billing_metadata_unavailable_count == 0
+
+
+@pytest.mark.asyncio
+async def test_billing_rate_limit_is_not_swallowed(hass) -> None:
+    client = MagicMock()
+    client.async_get_billing_period = AsyncMock(side_effect=MeridianRateLimitError(321))
+    coordinator = MeridianDataCoordinator(hass, client)
+
+    with pytest.raises(MeridianRateLimitError) as raised:
+        await coordinator._async_billing_period("account", NOW)
+
+    assert raised.value.retry_after == 321
+
+
+@pytest.mark.asyncio
+async def test_billing_rate_limit_does_not_repeat_completed_reconciliation(
+    hass,
+) -> None:
+    client = MagicMock()
+    client.async_get_accounts = AsyncMock(return_value=(_account(),))
+    coordinator = MeridianDataCoordinator(hass, client)
+    coordinator._initial_refresh_complete = True
+    coordinator._last_full_reconciliation = NOW
+    coordinator._last_targeted_reconciliation = NOW - timedelta(days=1)
+    coordinator._async_sync_accounts = AsyncMock(return_value=())
+    coordinator._async_account_results = AsyncMock(
+        side_effect=MeridianRateLimitError(321)
+    )
+
+    with (
+        patch(
+            "custom_components.meridian_energy.coordinator._utcnow", return_value=NOW
+        ),
+        pytest.raises(UpdateFailed),
+    ):
+        await coordinator.async_fetch_and_import()
+
+    assert coordinator._last_targeted_reconciliation == NOW
+    assert coordinator._last_full_reconciliation == NOW
+    assert coordinator._select_sync_mode(NOW + timedelta(hours=1)) is SyncMode.TIP
 
 
 @pytest.mark.asyncio
@@ -356,27 +487,63 @@ async def test_refresh_billing_totals_reuses_existing_sync_data(hass) -> None:
 
 
 @pytest.mark.asyncio
+async def test_refresh_billing_totals_skips_until_data_and_runtime_are_ready(
+    hass,
+) -> None:
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    coordinator._async_account_results = AsyncMock()
+
+    await coordinator.async_refresh_billing_totals()
+    coordinator._async_account_results.assert_not_awaited()
+
+    coordinator.data = MeridianSyncData(
+        account_count=0,
+        property_count=0,
+        results=(),
+        account_results=(),
+        synced_at=NOW,
+        sync_mode=SyncMode.RESTART,
+        topology_refreshed=False,
+        topology_cache_age_seconds=0,
+    )
+    hass.set_state(CoreState.starting)
+    await coordinator.async_refresh_billing_totals()
+    coordinator._async_account_results.assert_not_awaited()
+
+
+def test_billing_metadata_cache_age_handles_empty_and_future_cache(hass) -> None:
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    assert coordinator.billing_metadata_cache_age_seconds is None
+
+    coordinator._billing_cached_at["synthetic-account"] = NOW + timedelta(hours=1)
+    with patch(
+        "custom_components.meridian_energy.coordinator._utcnow", return_value=NOW
+    ):
+        assert coordinator.billing_metadata_cache_age_seconds == 0
+
+
+@pytest.mark.asyncio
 async def test_startup_distinguishes_install_restart_and_solar(hass) -> None:
     coordinator = MeridianDataCoordinator(hass, MagicMock())
     with patch(
-        "custom_components.meridian_energy.coordinator.async_has_statistics",
-        new=AsyncMock(side_effect=[True, True]),
+        "custom_components.meridian_energy.coordinator.async_latest_numeric_statistic_start",
+        new=AsyncMock(side_effect=[NOW, NOW, NOW, NOW]),
     ) as checker:
         assert (
             await coordinator._async_startup_mode((_account(feed_in=True),))
             is SyncMode.RESTART
         )
-        assert checker.await_count == 2
+        assert checker.await_count == 4
         assert (
             await coordinator._async_startup_mode((_account(feed_in=True),))
             is SyncMode.RESTART
         )
-        assert checker.await_count == 2
+        assert checker.await_count == 4
 
     coordinator = MeridianDataCoordinator(hass, MagicMock())
     with patch(
-        "custom_components.meridian_energy.coordinator.async_has_statistics",
-        new=AsyncMock(return_value=False),
+        "custom_components.meridian_energy.coordinator.async_latest_numeric_statistic_start",
+        new=AsyncMock(return_value=None),
     ):
         assert await coordinator._async_startup_mode((_account(),)) is SyncMode.INITIAL
 
@@ -472,20 +639,173 @@ def test_merge_replays_from_change_and_protects_actual(hass) -> None:
 @pytest.mark.asyncio
 async def test_direction_mode_uses_cached_statistic_state(hass) -> None:
     coordinator = MeridianDataCoordinator(hass, MagicMock())
-    with patch(
-        "custom_components.meridian_energy.coordinator.async_has_statistics",
-        new=AsyncMock(return_value=True),
-    ) as checker:
+    with (
+        patch(
+            "custom_components.meridian_energy.coordinator.async_latest_numeric_statistic_start",
+            new=AsyncMock(return_value=NOW),
+        ) as checker,
+        patch(
+            "custom_components.meridian_energy.coordinator._utcnow", return_value=NOW
+        ),
+    ):
         assert (
-            await coordinator._direction_mode("meridian_energy:test", SyncMode.TIP)
+            await coordinator._direction_mode(
+                CACHE_KEY,
+                ("meridian_energy:energy", "meridian_energy:cost"),
+                SyncMode.TIP,
+            )
             is SyncMode.RESTART
         )
         coordinator._initial_refresh_complete = True
         assert (
-            await coordinator._direction_mode("meridian_energy:test", SyncMode.TIP)
+            await coordinator._direction_mode(
+                CACHE_KEY,
+                ("meridian_energy:energy", "meridian_energy:cost"),
+                SyncMode.TIP,
+            )
             is SyncMode.TIP
         )
-    checker.assert_awaited_once()
+    assert checker.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_direction_mode_recovers_stale_history_after_restart(hass) -> None:
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    stale = NOW - REVISION_OVERLAP - timedelta(hours=1)
+    with (
+        patch(
+            "custom_components.meridian_energy.coordinator.async_latest_numeric_statistic_start",
+            new=AsyncMock(return_value=stale),
+        ),
+        patch(
+            "custom_components.meridian_energy.coordinator._utcnow", return_value=NOW
+        ),
+    ):
+        mode = await coordinator._direction_mode(
+            CACHE_KEY,
+            ("meridian_energy:energy", "meridian_energy:cost"),
+            SyncMode.TIP,
+        )
+
+    assert mode is SyncMode.INITIAL
+
+
+@pytest.mark.asyncio
+async def test_direction_reappearance_forces_one_recovery_backfill(hass) -> None:
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    feed_in_account = _account(feed_in=True)
+    generation_key = (
+        property_key(feed_in_account.number, feed_in_account.properties[0].id),
+        READING_GENERATION,
+    )
+    statistic_ids = ("meridian_energy:export", "meridian_energy:credit")
+
+    coordinator._prune_topology_state((feed_in_account,))
+    assert generation_key not in coordinator._pending_backfill
+    coordinator._prune_topology_state((_account(feed_in=False),))
+    coordinator._prune_topology_state((feed_in_account,))
+
+    with patch(
+        "custom_components.meridian_energy.coordinator.async_latest_numeric_statistic_start",
+        new=AsyncMock(return_value=NOW),
+    ):
+        assert (
+            await coordinator._direction_mode(
+                generation_key, statistic_ids, SyncMode.TIP
+            )
+            is SyncMode.INITIAL
+        )
+
+    coordinator._record_direction_fetch(
+        generation_key,
+        SyncMode.INITIAL,
+        (_measurement(NOW, quality="ACTUAL"),),
+        *statistic_ids,
+    )
+    coordinator._initial_refresh_complete = True
+    assert generation_key not in coordinator._pending_backfill
+
+
+@pytest.mark.asyncio
+async def test_direction_mode_backfills_when_money_statistic_is_missing(hass) -> None:
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    coordinator._initial_refresh_complete = True
+    with patch(
+        "custom_components.meridian_energy.coordinator.async_latest_numeric_statistic_start",
+        new=AsyncMock(side_effect=[NOW, None]),
+    ):
+        mode = await coordinator._direction_mode(
+            CACHE_KEY,
+            ("meridian_energy:energy", "meridian_energy:cost"),
+            SyncMode.TIP,
+        )
+
+    assert mode is SyncMode.INITIAL
+
+
+@pytest.mark.asyncio
+async def test_empty_direction_recovers_with_one_delayed_backfill(hass) -> None:
+    cache_key = ("feed-in-property", READING_GENERATION)
+    statistic_ids = ("meridian_energy:export", "meridian_energy:credit")
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    with patch(
+        "custom_components.meridian_energy.coordinator.async_latest_numeric_statistic_start",
+        new=AsyncMock(return_value=None),
+    ):
+        assert (
+            await coordinator._direction_mode(cache_key, statistic_ids, SyncMode.TIP)
+            is SyncMode.INITIAL
+        )
+
+    coordinator._record_direction_fetch(cache_key, SyncMode.INITIAL, (), *statistic_ids)
+    coordinator._initial_refresh_complete = True
+    assert (
+        await coordinator._direction_mode(cache_key, statistic_ids, SyncMode.TIP)
+        is SyncMode.TIP
+    )
+
+    delayed = _measurement(NOW, quality="ACTUAL")
+    coordinator._record_direction_fetch(
+        cache_key, SyncMode.TIP, (delayed,), *statistic_ids
+    )
+    assert (
+        await coordinator._direction_mode(cache_key, statistic_ids, SyncMode.TIP)
+        is SyncMode.INITIAL
+    )
+
+    coordinator._record_direction_fetch(
+        cache_key, SyncMode.INITIAL, (delayed,), *statistic_ids
+    )
+    assert (
+        await coordinator._direction_mode(cache_key, statistic_ids, SyncMode.TIP)
+        is SyncMode.TIP
+    )
+
+
+@pytest.mark.asyncio
+async def test_delayed_money_schedules_one_recovery_backfill(hass) -> None:
+    statistic_ids = ("meridian_energy:energy", "meridian_energy:cost")
+    missing_cost = replace(_measurement(NOW), cost_cents=None)
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    coordinator._known_statistics = dict.fromkeys(statistic_ids, False)
+
+    coordinator._record_direction_fetch(
+        CACHE_KEY, SyncMode.INITIAL, (missing_cost,), *statistic_ids
+    )
+    coordinator._initial_refresh_complete = True
+    assert (
+        await coordinator._direction_mode(CACHE_KEY, statistic_ids, SyncMode.TIP)
+        is SyncMode.TIP
+    )
+
+    with_cost = _measurement(NOW + timedelta(hours=1), quality="ACTUAL")
+    coordinator._record_direction_fetch(
+        CACHE_KEY, SyncMode.TIP, (with_cost,), *statistic_ids
+    )
+    assert (
+        await coordinator._direction_mode(CACHE_KEY, statistic_ids, SyncMode.TIP)
+        is SyncMode.INITIAL
+    )
 
 
 def test_density_observation_is_smoothed_and_ignores_empty(hass) -> None:
@@ -527,6 +847,29 @@ async def test_daily_and_weekly_modes_update_only_their_cadence(hass) -> None:
 
 
 @pytest.mark.asyncio
+async def test_successful_sync_emits_privacy_safe_debug_summary(hass, caplog) -> None:
+    client = MagicMock()
+    client.async_get_accounts = AsyncMock(return_value=(_account(),))
+    coordinator = MeridianDataCoordinator(hass, client)
+    coordinator._initial_refresh_complete = True
+    coordinator._last_full_reconciliation = NOW
+    coordinator._last_targeted_reconciliation = NOW
+    coordinator._async_sync_accounts = AsyncMock(return_value=())
+    coordinator._async_account_results = AsyncMock(return_value=())
+    caplog.set_level(logging.DEBUG)
+
+    with patch(
+        "custom_components.meridian_energy.coordinator._utcnow", return_value=NOW
+    ):
+        result = await coordinator.async_fetch_and_import()
+
+    assert result.sync_duration_seconds >= 0
+    assert "Meridian sync completed: mode=tip" in caplog.text
+    assert "synthetic-account" not in caplog.text
+    assert "Synthetic address" not in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_topology_error_forces_one_refresh_and_retry(hass) -> None:
     client = MagicMock()
     client.async_get_accounts = AsyncMock(return_value=(_account(),))
@@ -562,8 +905,8 @@ async def test_topology_error_after_refresh_is_not_retried(hass) -> None:
 
     with (
         patch(
-            "custom_components.meridian_energy.coordinator.async_has_statistics",
-            new=AsyncMock(return_value=False),
+            "custom_components.meridian_energy.coordinator.async_latest_numeric_statistic_start",
+            new=AsyncMock(return_value=None),
         ),
         pytest.raises(UpdateFailed),
     ):

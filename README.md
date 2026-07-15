@@ -74,7 +74,7 @@ The integration supports multiple accounts, properties, registers and time-of-us
 - If setup cannot connect, confirm MyMeridian is available and try again later.
 - If Home Assistant requests reauthentication, complete the emailed-code flow.
 - If current-bill cost is unavailable, Meridian may not have supplied cost for every interval yet.
-- Download diagnostics from the integration page when reporting a problem, review the file, and follow the redaction warning in the issue form.
+- For a reproducible problem, use the integration page's three-dot menu to **Enable debug logging**, reproduce the issue, then disable it to download the log. Download diagnostics from the same menu, review both files, and follow the redaction warning in the issue form.
 
 To remove the integration, first remove its sources from the Energy dashboard, then delete **Meridian Energy** from **Settings → Devices & services** and uninstall it from HACS. Existing external statistics can be deleted separately from **Developer tools → Statistics** if you intend to discard that history.
 

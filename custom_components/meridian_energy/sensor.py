@@ -154,6 +154,8 @@ async def async_setup_entry(
         """Add newly discovered entities and remove stale account devices."""
         new_entities: list[MeridianAccountSensor] = []
         current_account_keys: set[str] = set()
+        desired_sensor_keys: set[tuple[str, str]] = set()
+        conditional_sensor_keys: set[tuple[str, str]] = set()
         multiple_properties = (
             sum(len(account.properties) for account in coordinator.accounts) > 1
         )
@@ -163,9 +165,12 @@ async def async_setup_entry(
             current_account_keys.add(key)
             result = _account_result(coordinator.data, key)
             for description in DESCRIPTIONS:
+                sensor_key = (key, description.key)
+                if description.conditional_feed_in:
+                    conditional_sensor_keys.add(sensor_key)
                 if description.conditional_feed_in and not result.has_feed_in:
                     continue
-                sensor_key = (key, description.key)
+                desired_sensor_keys.add(sensor_key)
                 if sensor_key in created_sensors:
                     continue
                 created_sensors.add(sensor_key)
@@ -184,15 +189,36 @@ async def async_setup_entry(
 
         _remove_stale_devices(hass, entry, current_account_keys)
 
-        stale_sensor_keys = {
-            sensor_key
-            for sensor_key in created_sensors
-            if sensor_key[0] not in current_account_keys
-        }
+        # The entity registry survives an integration reload while
+        # ``created_sensors`` does not. Reconcile every conditional key so stale
+        # feed-in entities are removed even on a fresh platform setup.
+        stale_sensor_keys = (created_sensors | conditional_sensor_keys) - (
+            desired_sensor_keys
+        )
+        _remove_stale_entities(hass, entry, stale_sensor_keys)
         created_sensors.difference_update(stale_sensor_keys)
 
     _update_entities()
     entry.async_on_unload(coordinator.async_add_listener(_update_entities))
+
+
+@callback
+def _remove_stale_entities(
+    hass: HomeAssistant,
+    entry: MeridianConfigEntry,
+    stale_sensor_keys: set[tuple[str, str]],
+) -> None:
+    """Remove account entities that no longer apply to current topology."""
+    entity_registry = er.async_get(hass)
+    for account_key_value, sensor_key in stale_sensor_keys:
+        entity_id = entity_registry.async_get_entity_id(
+            "sensor", DOMAIN, f"{account_key_value}_{sensor_key}"
+        )
+        if entity_id is None:
+            continue
+        entity_entry = entity_registry.async_get(entity_id)
+        if entity_entry is not None and entity_entry.config_entry_id == entry.entry_id:
+            entity_registry.async_remove(entity_id)
 
 
 @callback

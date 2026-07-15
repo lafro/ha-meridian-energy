@@ -84,8 +84,8 @@ async def test_update_imports_consumption(hass) -> None:
 
     with (
         patch(
-            "custom_components.meridian_energy.coordinator.async_has_statistics",
-            new=AsyncMock(return_value=False),
+            "custom_components.meridian_energy.coordinator.async_latest_numeric_statistic_start",
+            new=AsyncMock(return_value=None),
         ),
         patch(
             "custom_components.meridian_energy.coordinator.async_import_measurements",
@@ -118,8 +118,8 @@ async def test_update_imports_generation_for_feed_in(hass) -> None:
     )
     with (
         patch(
-            "custom_components.meridian_energy.coordinator.async_has_statistics",
-            new=AsyncMock(return_value=True),
+            "custom_components.meridian_energy.coordinator.async_latest_numeric_statistic_start",
+            new=AsyncMock(return_value=now),
         ),
         patch(
             "custom_components.meridian_energy.coordinator.async_import_measurements",
@@ -161,8 +161,8 @@ async def test_multiple_properties_get_disambiguated_one_line_names(hass) -> Non
 
     with (
         patch(
-            "custom_components.meridian_energy.coordinator.async_has_statistics",
-            new=AsyncMock(return_value=False),
+            "custom_components.meridian_energy.coordinator.async_latest_numeric_statistic_start",
+            new=AsyncMock(return_value=None),
         ),
         patch(
             "custom_components.meridian_energy.coordinator.async_import_measurements",

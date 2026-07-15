@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
 from homeassistant.core import CoreState
+from homeassistant.helpers import entity_registry as er
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.meridian_energy import (
+    MeridianDataCoordinator,
     MeridianRuntimeData,
     _async_update_listener,
     async_migrate_entry,
@@ -26,7 +30,16 @@ from custom_components.meridian_energy.const import (
     DOMAIN,
     NAME,
 )
-from custom_components.meridian_energy.models import MeridianAccount, MeridianTokenSet
+from custom_components.meridian_energy.models import (
+    AccountSyncResult,
+    MeridianAccount,
+    MeridianMeterPoint,
+    MeridianProperty,
+    MeridianSyncData,
+    MeridianTokenSet,
+    PropertySyncResult,
+    SyncMode,
+)
 from custom_components.meridian_energy.statistics import account_key
 
 
@@ -41,6 +54,73 @@ def _entry(*, version: int = 1) -> MockConfigEntry:
         },
         version=version,
         minor_version=1,
+    )
+
+
+def _account(*, feed_in: bool = False) -> MeridianAccount:
+    return MeridianAccount(
+        number="synthetic-account",
+        status="ACTIVE",
+        properties=(
+            MeridianProperty(
+                id="synthetic-property",
+                address="Synthetic address",
+                meter_points=(
+                    MeridianMeterPoint(
+                        id="synthetic-meter",
+                        market_identifier="synthetic-icp",
+                        has_feed_in=feed_in,
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
+def _sync_data(*, feed_in: bool = False) -> MeridianSyncData:
+    now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+    key = account_key("synthetic-account")
+    return MeridianSyncData(
+        account_count=1,
+        property_count=1,
+        results=(
+            PropertySyncResult(
+                property_key="safe-property-key",
+                account_key=key,
+                consumption_rows=24,
+                generation_rows=0,
+                latest_reading=now,
+                estimated_rows=0,
+                sync_mode=SyncMode.TIP,
+                requested_since=now - timedelta(hours=24),
+                consumption_pages=1,
+                generation_pages=0,
+                consumption_received_rows=24,
+                generation_received_rows=0,
+                consumption_retained_rows=24,
+                generation_retained_rows=0,
+                oldest_estimated=None,
+                newest_estimated=None,
+                quality_counts=(("ACTUAL", 24),),
+                observed_rows_per_hour=1.0,
+            ),
+        ),
+        account_results=(
+            AccountSyncResult(
+                account_key=key,
+                billing_period=None,
+                current_bill_usage=Decimal(1),
+                current_bill_cost=Decimal("0.25"),
+                current_bill_export=None,
+                current_bill_credit=None,
+                has_feed_in=feed_in,
+                billing_data_complete=False,
+            ),
+        ),
+        synced_at=now,
+        sync_mode=SyncMode.TIP,
+        topology_refreshed=True,
+        topology_cache_age_seconds=0,
     )
 
 
@@ -223,6 +303,25 @@ async def test_migrate_options_flow_entry_to_reconfiguration_data(hass) -> None:
 
 
 @pytest.mark.asyncio
+async def test_migrate_options_flow_entry_without_account_selection(hass) -> None:
+    """Migrate entries that predate account selection without inventing a value."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            "email": "person@example.com",
+            CONF_REFRESH_TOKEN: "old-refresh",
+            CONF_FIREBASE_USER_ID: "old-user",
+        },
+        version=2,
+    )
+    entry.add_to_hass(hass)
+
+    assert await async_migrate_entry(hass, entry) is True
+    assert CONF_SELECTED_ACCOUNTS not in entry.data
+    assert entry.data[CONF_AUTO_ADD_ACCOUNTS] is False
+
+
+@pytest.mark.asyncio
 async def test_manual_device_removal_only_allows_stale_meridian_devices(hass) -> None:
     entry = _entry(version=3)
     coordinator = MagicMock()
@@ -244,3 +343,57 @@ async def test_update_listener_reloads_entry(hass) -> None:
     with patch.object(hass.config_entries, "async_reload", AsyncMock()) as reload_entry:
         await _async_update_listener(hass, entry)
     reload_entry.assert_awaited_once_with(entry.entry_id)
+
+
+class TestPublicConfigEntryLifecycle:
+    """Exercise the real config-entry and sensor-platform lifecycle."""
+
+    @pytest.fixture
+    def mock_recorder_before_hass(self, recorder_db_url: str) -> None:
+        """Prepare Recorder storage before the Home Assistant fixture starts."""
+        del recorder_db_url
+
+    @pytest.mark.asyncio
+    async def test_load_reload_and_unload(self, recorder_mock, hass) -> None:
+        """Load, reload, and unload through Home Assistant's public APIs."""
+        del recorder_mock
+        entry = _entry(version=3)
+        entry.add_to_hass(hass)
+        topology = {"feed_in": True}
+
+        async def _first_refresh(coordinator: MeridianDataCoordinator) -> None:
+            feed_in = topology["feed_in"]
+            coordinator._topology = (_account(feed_in=feed_in),)
+            coordinator.async_set_updated_data(_sync_data(feed_in=feed_in))
+
+        with patch.object(
+            MeridianDataCoordinator,
+            "async_config_entry_first_refresh",
+            _first_refresh,
+        ):
+            assert await hass.config_entries.async_setup(entry.entry_id)
+            await hass.async_block_till_done()
+            assert entry.state is ConfigEntryState.LOADED
+            first_coordinator = entry.runtime_data.coordinator
+            assert len(first_coordinator._listeners) == 8
+
+            registry = er.async_get(hass)
+            assert (
+                len(er.async_entries_for_config_entry(registry, entry.entry_id)) == 10
+            )
+
+            topology["feed_in"] = False
+            assert await hass.config_entries.async_reload(entry.entry_id)
+            await hass.async_block_till_done()
+            assert entry.state is ConfigEntryState.LOADED
+            assert len(first_coordinator._listeners) == 0
+            reloaded_coordinator = entry.runtime_data.coordinator
+            assert reloaded_coordinator is not first_coordinator
+            assert len(reloaded_coordinator._listeners) == 6
+            assert len(er.async_entries_for_config_entry(registry, entry.entry_id)) == 8
+
+            assert await hass.config_entries.async_unload(entry.entry_id)
+            await hass.async_block_till_done()
+
+        assert entry.state is ConfigEntryState.NOT_LOADED
+        assert len(reloaded_coordinator._listeners) == 0

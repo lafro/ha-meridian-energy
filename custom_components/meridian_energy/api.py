@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -100,7 +101,10 @@ __all__ = [
 ]
 
 _LAST_DAY_OF_LONG_MONTH = 31
+_HTTP_REQUEST_TIMEOUT = 408
 _HTTP_TOO_MANY_REQUESTS = 429
+_HTTP_SERVER_ERROR = 500
+_LOGGER = logging.getLogger(__name__)
 
 TokenUpdateCallback = Callable[[MeridianTokenSet], Awaitable[None]]
 
@@ -178,12 +182,21 @@ class MeridianApiClient:
             "journeyId": journey_id,
             "otpEnabled": True,
         }
-        response = await self._async_json_request(
-            AUTH_EMAIL_URL,
-            json=payload,
-            headers={"X-Client-Platform": CLIENT_PLATFORM},
-            authenticated=False,
-        )
+        try:
+            response = await self._async_json_request(
+                AUTH_EMAIL_URL,
+                json=payload,
+                headers={"X-Client-Platform": CLIENT_PLATFORM},
+                authenticated=False,
+            )
+        except _MeridianHttpError as err:
+            if err.status == _HTTP_TOO_MANY_REQUESTS:
+                raise MeridianRateLimitError(err.retry_after) from err
+            if err.status == _HTTP_REQUEST_TIMEOUT or err.status >= _HTTP_SERVER_ERROR:
+                raise _connection_error(err) from err
+            raise MeridianAuthenticationError(
+                "Meridian did not accept the login request"
+            ) from err
         if response.get("success") is not True:
             raise MeridianAuthenticationError(
                 "Meridian did not accept the login request"
@@ -206,6 +219,10 @@ class MeridianApiClient:
                 authenticated=False,
             )
         except _MeridianHttpError as err:
+            if err.status == _HTTP_TOO_MANY_REQUESTS:
+                raise MeridianRateLimitError(err.retry_after) from err
+            if err.status == _HTTP_REQUEST_TIMEOUT or err.status >= _HTTP_SERVER_ERROR:
+                raise _connection_error(err) from err
             code = str(err.payload.get("code") or "OTP_INVALID")
             message = str(
                 err.payload.get("error") or "Meridian rejected the login code"
@@ -218,11 +235,20 @@ class MeridianApiClient:
                 "Meridian returned no authentication token"
             )
 
-        firebase = await self._async_json_request(
-            f"{FIREBASE_CUSTOM_TOKEN_URL}?key={FIREBASE_API_KEY}",
-            json={"token": custom_token, "returnSecureToken": True},
-            authenticated=False,
-        )
+        try:
+            firebase = await self._async_json_request(
+                f"{FIREBASE_CUSTOM_TOKEN_URL}?key={FIREBASE_API_KEY}",
+                json={"token": custom_token, "returnSecureToken": True},
+                authenticated=False,
+            )
+        except _MeridianHttpError as err:
+            if err.status == _HTTP_TOO_MANY_REQUESTS:
+                raise MeridianRateLimitError(err.retry_after) from err
+            if err.status == _HTTP_REQUEST_TIMEOUT or err.status >= _HTTP_SERVER_ERROR:
+                raise _connection_error(err) from err
+            raise MeridianAuthenticationError(
+                "Meridian authentication exchange was rejected"
+            ) from err
         tokens = _parse_firebase_tokens(firebase)
         await self._async_set_tokens(tokens)
         return tokens
@@ -252,7 +278,7 @@ class MeridianApiClient:
                 raise MeridianAuthenticationError(
                     "Meridian session refresh was rejected"
                 ) from err
-            raise
+            raise _connection_error(err) from err
 
         normalized = {
             "idToken": response.get("id_token"),
@@ -262,6 +288,7 @@ class MeridianApiClient:
         }
         tokens = _parse_firebase_tokens(normalized)
         await self._async_set_tokens(tokens)
+        _LOGGER.debug("Meridian session refreshed")
         return tokens
 
     async def async_get_accounts(self) -> tuple[MeridianAccount, ...]:
@@ -418,7 +445,6 @@ class MeridianApiClient:
     async def _async_graphql(
         self, operation: str, query: str, variables: dict[str, Any]
     ) -> dict[str, Any]:
-        response: dict[str, Any] | None = None
         for attempt in range(2):
             tokens = await self.async_refresh_tokens(force=attempt == 1)
             try:
@@ -432,7 +458,6 @@ class MeridianApiClient:
                     headers={"Authorization": tokens.id_token},
                     authenticated=True,
                 )
-                break
             except _MeridianHttpError as err:
                 if err.status == _HTTP_TOO_MANY_REQUESTS:
                     raise MeridianRateLimitError(err.retry_after) from err
@@ -441,24 +466,31 @@ class MeridianApiClient:
                         "Meridian rejected the authenticated session"
                     ) from err
                 if err.status not in {401, 403}:
-                    raise
+                    raise _connection_error(err) from err
+                continue
 
-        if response is None:
-            raise MeridianAuthenticationError("Meridian authentication retry failed")
-
-        errors = response.get("errors")
-        if errors:
-            error_list = require_list(errors, "GraphQL errors")
-            codes = tuple(
-                _graphql_error_code(require_mapping(error, "GraphQL error"))
-                for error in error_list
-            )
-            if any(code in _AUTH_GRAPHQL_CODES for code in codes):
-                raise MeridianAuthenticationError(
-                    "Meridian rejected the authenticated session"
+            errors = response.get("errors")
+            if errors:
+                error_list = require_list(errors, "GraphQL errors")
+                codes = tuple(
+                    _graphql_error_code(require_mapping(error, "GraphQL error"))
+                    for error in error_list
                 )
-            raise MeridianGraphQLError(operation, codes)
-        return require_mapping(response.get("data"), f"GraphQL {operation} data")
+                if any(code in _AUTH_GRAPHQL_CODES for code in codes):
+                    if attempt == 0:
+                        continue
+                    raise MeridianAuthenticationError(
+                        "Meridian rejected the authenticated session"
+                    )
+                _LOGGER.debug(
+                    "Meridian GraphQL operation %s failed with codes %s",
+                    operation,
+                    ",".join(codes),
+                )
+                raise MeridianGraphQLError(operation, codes)
+            return require_mapping(response.get("data"), f"GraphQL {operation} data")
+
+        raise MeridianAuthenticationError("Meridian authentication retry failed")
 
     async def _async_set_tokens(self, tokens: MeridianTokenSet) -> None:
         self._tokens = tokens
@@ -486,3 +518,8 @@ class MeridianApiClient:
             raise
         except MeridianTransportError as err:
             raise MeridianConnectionError(str(err)) from err
+
+
+def _connection_error(err: _MeridianHttpError) -> MeridianConnectionError:
+    """Return a privacy-safe connection error for an upstream HTTP failure."""
+    return MeridianConnectionError(f"Meridian service returned HTTP {err.status}")
