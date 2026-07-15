@@ -175,7 +175,7 @@ async def test_sensor_values_and_device_identifier_are_redacted(hass) -> None:
     identifiers = entities[0].device_info["identifiers"]
     assert "private-user" not in str(identifiers)
     assert entities[0].device_info["name"] == "Meridian Energy"
-    assert entities[0].device_info["model"] == "Electricity account"
+    assert entities[0].device_info["model"] == "MyMeridian"
     assert [entity.entity_description.translation_key for entity in entities[:3]] == [
         "last_sync",
         "latest_meter_data",

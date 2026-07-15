@@ -255,7 +255,7 @@ class MeridianAccountSensor(CoordinatorEntity[MeridianDataCoordinator], SensorEn
             identifiers={(DOMAIN, key)},
             entry_type=DeviceEntryType.SERVICE,
             manufacturer="Meridian Energy",
-            model="Electricity account",
+            model="MyMeridian",
             name=device_name,
             configuration_url="https://app.meridianenergy.nz/",
         )
