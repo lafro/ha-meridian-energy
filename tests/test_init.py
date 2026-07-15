@@ -79,7 +79,9 @@ async def test_setup_entry_and_rotating_token_persistence(hass) -> None:
 
 
 @pytest.mark.asyncio
-async def test_setup_defers_billing_totals_until_home_assistant_started(hass) -> None:
+async def test_setup_defers_billing_totals_until_home_assistant_started(
+    hass, caplog
+) -> None:
     hass.set_state(CoreState.starting)
     entry = _entry()
     entry.add_to_hass(hass)
@@ -101,6 +103,8 @@ async def test_setup_defers_billing_totals_until_home_assistant_started(hass) ->
         await hass.async_block_till_done()
 
     coordinator.async_refresh_billing_totals.assert_awaited_once()
+    await entry._async_process_on_unload(hass)
+    assert "Unable to remove unknown job listener" not in caplog.text
 
 
 @pytest.mark.asyncio

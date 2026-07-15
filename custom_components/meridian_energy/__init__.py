@@ -6,9 +6,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import EVENT_HOMEASSISTANT_STARTED, Platform
-from homeassistant.core import CoreState, Event, HomeAssistant
+from homeassistant.const import Platform
+from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.start import async_at_started
 
 from .api import MeridianApiClient
 from .const import (
@@ -92,15 +93,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> 
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     if hass.state is not CoreState.running:
 
-        async def async_refresh_billing_after_start(_event: Event) -> None:
+        async def async_refresh_billing_after_start(_hass: HomeAssistant) -> None:
             """Populate Recorder-derived billing totals once startup is complete."""
             await coordinator.async_refresh_billing_totals()
 
-        entry.async_on_unload(
-            hass.bus.async_listen_once(
-                EVENT_HOMEASSISTANT_STARTED, async_refresh_billing_after_start
-            )
-        )
+        entry.async_on_unload(async_at_started(hass, async_refresh_billing_after_start))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
