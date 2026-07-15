@@ -7,7 +7,8 @@
       "initial_import_failed": "The initial Meridian history import did not complete. Check the connection and start setup again; no login code or password was stored.",
       "no_accounts": "No active Meridian electricity accounts were found for this login.",
       "reauth_entry_missing": "The Meridian configuration entry could not be found.",
-      "reauth_successful": "Meridian Energy was reauthenticated successfully."
+      "reauth_successful": "Meridian Energy was reauthenticated successfully.",
+      "reconfigure_successful": "The selected Meridian accounts were updated successfully."
     },
     "error": {
       "cannot_connect": "Unable to reach Meridian. Check your internet connection and try again.",
@@ -50,6 +51,16 @@
           "selected_accounts": "You can change this later from Configure."
         }
       },
+      "reconfigure": {
+        "title": "Choose Meridian accounts",
+        "description": "Choose which accounts Home Assistant should import. Removing an account stops future updates and removes its device and entities, but preserves its existing long-term statistics.",
+        "data": {
+          "selected_accounts": "Accounts"
+        },
+        "data_description": {
+          "selected_accounts": "New accounts and grid-export metering are discovered automatically during regular topology refreshes."
+        }
+      },
       "reauth_confirm": {
         "title": "Reconnect Meridian Energy",
         "description": "Meridian no longer accepts the stored session for {email}. Submit to request a new six-digit code.",
@@ -63,23 +74,18 @@
       "default": "Meridian Energy is connected. Home Assistant will refresh the stored session automatically; a new emailed code is only required if Meridian invalidates it."
     }
   },
-  "options": {
-    "error": {
-      "cannot_connect": "Unable to reach Meridian. Check your internet connection and try again.",
-      "invalid_auth": "Meridian no longer accepts the stored session. Reauthenticate the integration and try again.",
-      "select_account": "Select at least one available Meridian account."
+  "exceptions": {
+    "cannot_connect": {
+      "message": "Unable to reach Meridian. Home Assistant will try again automatically."
     },
-    "step": {
-      "init": {
-        "title": "Choose Meridian accounts",
-        "description": "Choose which accounts Home Assistant should import. Removing an account stops future updates but does not delete its existing long-term statistics.",
-        "data": {
-          "selected_accounts": "Accounts"
-        },
-        "data_description": {
-          "selected_accounts": "Each selected account is represented separately."
-        }
-      }
+    "invalid_auth": {
+      "message": "Meridian no longer accepts the stored session. Reauthenticate the integration."
+    },
+    "invalid_data": {
+      "message": "Meridian returned invalid electricity data. Home Assistant will try again automatically."
+    },
+    "rate_limited": {
+      "message": "Meridian asked Home Assistant to wait before trying again."
     }
   },
   "entity": {

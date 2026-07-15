@@ -12,17 +12,22 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.meridian_energy import (
     MeridianRuntimeData,
+    _async_update_listener,
     async_migrate_entry,
+    async_remove_config_entry_device,
     async_setup_entry,
     async_unload_entry,
 )
 from custom_components.meridian_energy.const import (
+    CONF_AUTO_ADD_ACCOUNTS,
     CONF_FIREBASE_USER_ID,
     CONF_REFRESH_TOKEN,
     CONF_SELECTED_ACCOUNTS,
     DOMAIN,
+    NAME,
 )
-from custom_components.meridian_energy.models import MeridianTokenSet
+from custom_components.meridian_energy.models import MeridianAccount, MeridianTokenSet
+from custom_components.meridian_energy.statistics import account_key
 
 
 def _entry(*, version: int = 1) -> MockConfigEntry:
@@ -148,7 +153,7 @@ async def test_unload_entry(hass) -> None:
 
 @pytest.mark.asyncio
 async def test_migrate_entry_accepts_current_version(hass) -> None:
-    entry = _entry(version=2)
+    entry = _entry(version=3)
     assert await async_migrate_entry(hass, entry) is True
 
 
@@ -157,10 +162,85 @@ async def test_migrate_entry_updates_legacy_version(hass) -> None:
     entry = _entry()
     entry.add_to_hass(hass)
     assert await async_migrate_entry(hass, entry) is True
-    assert entry.version == 2
+    assert entry.version == 3
 
 
 @pytest.mark.asyncio
 async def test_migrate_entry_rejects_unknown_version(hass) -> None:
     entry = _entry(version=99)
     assert await async_migrate_entry(hass, entry) is False
+
+
+@pytest.mark.asyncio
+async def test_setup_populates_missing_account_selection(hass) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            "email": "person@example.com",
+            CONF_REFRESH_TOKEN: "old-refresh",
+            CONF_FIREBASE_USER_ID: "old-user",
+        },
+        version=3,
+    )
+    entry.add_to_hass(hass)
+    coordinator = MagicMock()
+    coordinator.accounts = (MeridianAccount("account-b", "ACTIVE", ()),)
+    coordinator.async_config_entry_first_refresh = AsyncMock()
+    with (
+        patch("custom_components.meridian_energy.MeridianApiClient"),
+        patch(
+            "custom_components.meridian_energy.MeridianDataCoordinator",
+            return_value=coordinator,
+        ),
+        patch.object(hass.config_entries, "async_forward_entry_setups", AsyncMock()),
+    ):
+        await async_setup_entry(hass, entry)
+
+    assert entry.data[CONF_SELECTED_ACCOUNTS] == ["account-b"]
+
+
+@pytest.mark.asyncio
+async def test_migrate_options_flow_entry_to_reconfiguration_data(hass) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            "email": "person@example.com",
+            CONF_REFRESH_TOKEN: "old-refresh",
+            CONF_FIREBASE_USER_ID: "old-user",
+            CONF_SELECTED_ACCOUNTS: ["data-account"],
+        },
+        options={CONF_SELECTED_ACCOUNTS: ["option-account"]},
+        version=2,
+    )
+    entry.add_to_hass(hass)
+
+    assert await async_migrate_entry(hass, entry) is True
+    assert entry.version == 3
+    assert entry.title == NAME
+    assert entry.data[CONF_SELECTED_ACCOUNTS] == ["option-account"]
+    assert entry.options == {}
+    assert entry.data[CONF_AUTO_ADD_ACCOUNTS] is False
+
+
+@pytest.mark.asyncio
+async def test_manual_device_removal_only_allows_stale_meridian_devices(hass) -> None:
+    entry = _entry(version=3)
+    coordinator = MagicMock()
+    coordinator.accounts = (MeridianAccount("active", "ACTIVE", ()),)
+    entry.runtime_data = MeridianRuntimeData(MagicMock(), coordinator)
+
+    active = MagicMock(identifiers={(DOMAIN, account_key("active"))})
+    stale = MagicMock(identifiers={(DOMAIN, account_key("stale"))})
+    unrelated = MagicMock(identifiers={("other", "value")})
+
+    assert not await async_remove_config_entry_device(hass, entry, active)
+    assert await async_remove_config_entry_device(hass, entry, stale)
+    assert not await async_remove_config_entry_device(hass, entry, unrelated)
+
+
+@pytest.mark.asyncio
+async def test_update_listener_reloads_entry(hass) -> None:
+    entry = _entry(version=3)
+    with patch.object(hass.config_entries, "async_reload", AsyncMock()) as reload_entry:
+        await _async_update_listener(hass, entry)
+    reload_entry.assert_awaited_once_with(entry.entry_id)

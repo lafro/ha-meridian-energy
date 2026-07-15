@@ -2,36 +2,43 @@
 
 from __future__ import annotations
 
-import base64
-import json
-import logging
 from collections.abc import Awaitable, Callable
-from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
-from email.utils import parsedate_to_datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from aiohttp import ClientError, ClientSession, ClientTimeout
+from aiohttp import ClientSession
 
 from .const import (
     AUTH_EMAIL_URL,
     AUTH_OTP_URL,
     BRAND,
     CLIENT_PLATFORM,
-    COST_STATISTIC_TYPES,
-    DEFAULT_RETRY_AFTER_SECONDS,
     FIREBASE_API_KEY,
     FIREBASE_CUSTOM_TOKEN_URL,
     FIREBASE_REFRESH_URL,
-    GENERATION_CREDIT_TYPES,
     GRAPHQL_URL,
-    MAX_RETRY_AFTER_SECONDS,
-    MIN_RETRY_AFTER_SECONDS,
     PAGE_SIZE,
     READING_FREQUENCY_HOUR,
     READING_QUALITY_COMBINED,
     REDIRECT_URL,
-    REQUEST_TIMEOUT_SECONDS,
+)
+from .graphql import (
+    ACCOUNT_QUERY as _ACCOUNT_QUERY,
+)
+from .graphql import (
+    ACCOUNTS_QUERY as _ACCOUNTS_QUERY,
+)
+from .graphql import (
+    AUTH_GRAPHQL_CODES as _AUTH_GRAPHQL_CODES,
+)
+from .graphql import (
+    BILLING_PERIODS_QUERY as _BILLING_PERIODS_QUERY,
+)
+from .graphql import (
+    MEASUREMENTS_QUERY as _MEASUREMENTS_QUERY,
+)
+from .graphql import (
+    graphql_error_code as _graphql_error_code,
 )
 from .models import (
     MeasurementPage,
@@ -44,10 +51,55 @@ from .models import (
     require_list,
     require_mapping,
 )
+from .parsers import (
+    TokenParseError,
+    parse_firebase_tokens,
+)
+from .parsers import (
+    optional_date as _optional_date,
+)
+from .parsers import (
+    optional_string as _optional_string,
+)
+from .parsers import (
+    parse_datetime as _parse_datetime,
+)
+from .parsers import (
+    parse_measurement as _parse_measurement,
+)
+from .parsers import (
+    required_string as _required_string,
+)
+from .transport import (
+    MeridianHttpError as _MeridianHttpError,
+)
+from .transport import (
+    MeridianTransport,
+    MeridianTransportError,
+)
+from .transport import (
+    parse_retry_after as _parse_retry_after,
+)
 
-_LOGGER = logging.getLogger(__name__)
+__all__ = [
+    "MeridianApiClient",
+    "MeridianAuthenticationError",
+    "MeridianConnectionError",
+    "MeridianError",
+    "MeridianGraphQLError",
+    "MeridianOtpError",
+    "MeridianRateLimitError",
+    "_MeridianHttpError",
+    "_graphql_error_code",
+    "_optional_string",
+    "_parse_datetime",
+    "_parse_firebase_tokens",
+    "_parse_measurement",
+    "_parse_retry_after",
+    "_required_string",
+]
+
 _LAST_DAY_OF_LONG_MONTH = 31
-_HTTP_BAD_REQUEST = 400
 _HTTP_TOO_MANY_REQUESTS = 429
 
 TokenUpdateCallback = Callable[[MeridianTokenSet], Awaitable[None]]
@@ -90,6 +142,14 @@ class MeridianGraphQLError(MeridianError):
         self.codes = codes
 
 
+def _parse_firebase_tokens(payload: dict[str, Any]) -> MeridianTokenSet:
+    """Translate strict token parsing failures into an authentication error."""
+    try:
+        return parse_firebase_tokens(payload)
+    except TokenParseError as err:
+        raise MeridianAuthenticationError(str(err)) from err
+
+
 class MeridianApiClient:
     """Client for Meridian's OTP, Firebase and GraphQL services."""
 
@@ -100,10 +160,9 @@ class MeridianApiClient:
         tokens: MeridianTokenSet | None = None,
         token_update_callback: TokenUpdateCallback | None = None,
     ) -> None:
-        self._session = session
+        self._transport = MeridianTransport(session)
         self._tokens = tokens
         self._token_update_callback = token_update_callback
-        self._timeout = ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
 
     @property
     def tokens(self) -> MeridianTokenSet | None:
@@ -417,319 +476,13 @@ class MeridianApiClient:
     ) -> dict[str, Any]:
         del authenticated  # Documents intent at each call site; never log the request.
         try:
-            async with self._session.post(
+            return await self._transport.async_json_request(
                 url,
                 json=json,
                 data=data,
                 headers=headers,
-                timeout=self._timeout,
-            ) as response:
-                response_headers = getattr(response, "headers", {})
-                retry_after = _parse_retry_after(response_headers.get("Retry-After"))
-                try:
-                    payload = await response.json(content_type=None)
-                except (ValueError, TypeError) as err:
-                    if response.status >= _HTTP_BAD_REQUEST:
-                        raise _MeridianHttpError(
-                            response.status, {}, retry_after
-                        ) from err
-                    raise MeridianConnectionError(
-                        "Meridian returned an unreadable response"
-                    ) from err
-                parsed = require_mapping(payload, "HTTP response")
-                if response.status >= _HTTP_BAD_REQUEST:
-                    raise _MeridianHttpError(response.status, parsed, retry_after)
-                return parsed
+            )
         except _MeridianHttpError:
             raise
-        except (ClientError, TimeoutError) as err:
-            _LOGGER.debug("Meridian request failed: %s", type(err).__name__)
-            raise MeridianConnectionError("Unable to reach Meridian") from err
-
-
-class _MeridianHttpError(MeridianError):
-    def __init__(
-        self,
-        status: int,
-        payload: dict[str, Any],
-        retry_after: float = DEFAULT_RETRY_AFTER_SECONDS,
-    ) -> None:
-        super().__init__(f"Meridian returned HTTP {status}")
-        self.status = status
-        self.payload = payload
-        self.retry_after = retry_after
-
-
-def _parse_retry_after(value: str | None) -> float:
-    """Return a bounded Retry-After delay from seconds or an HTTP date."""
-    delay = float(DEFAULT_RETRY_AFTER_SECONDS)
-    if value:
-        try:
-            delay = float(value)
-        except ValueError:
-            try:
-                retry_at = parsedate_to_datetime(value)
-                if retry_at.tzinfo is None or retry_at.utcoffset() is None:
-                    raise ValueError
-                delay = (retry_at.astimezone(UTC) - datetime.now(UTC)).total_seconds()
-            except TypeError, ValueError, OverflowError:
-                delay = float(DEFAULT_RETRY_AFTER_SECONDS)
-    return min(
-        float(MAX_RETRY_AFTER_SECONDS),
-        max(float(MIN_RETRY_AFTER_SECONDS), delay),
-    )
-
-
-def _parse_firebase_tokens(payload: dict[str, Any]) -> MeridianTokenSet:
-    id_token = _required_string(payload, "idToken")
-    refresh_token = _required_string(payload, "refreshToken")
-    user_id = _firebase_user_id(payload, id_token)
-    raw_expires = payload.get("expiresIn")
-    try:
-        if not isinstance(raw_expires, (str, int)):
-            raise TypeError
-        expires_in = int(raw_expires)
-    except (TypeError, ValueError) as err:
-        raise MeridianAuthenticationError(
-            "Firebase returned an invalid expiry"
-        ) from err
-    if expires_in <= 0:
-        raise MeridianAuthenticationError("Firebase returned an invalid expiry")
-    return MeridianTokenSet(
-        id_token=id_token,
-        refresh_token=refresh_token,
-        expires_at=datetime.now(UTC) + timedelta(seconds=expires_in),
-        user_id=user_id,
-    )
-
-
-def _firebase_user_id(payload: dict[str, Any], id_token: str) -> str:
-    """Return the Firebase UID from a legacy field or the issued ID token."""
-    local_id = payload.get("localId")
-    if isinstance(local_id, str) and local_id:
-        return local_id
-
-    try:
-        encoded_claims = id_token.split(".")[1]
-        padding = "=" * (-len(encoded_claims) % 4)
-        claims = json.loads(
-            base64.urlsafe_b64decode(encoded_claims + padding).decode("utf-8")
-        )
-        if not isinstance(claims, dict):
-            raise TypeError
-        subject = claims.get("sub")
-        if not isinstance(subject, str) or not subject:
-            raise TypeError
-    except (IndexError, TypeError, ValueError) as err:
-        raise MeridianAuthenticationError(
-            "Firebase returned no authenticated user identifier"
-        ) from err
-    return subject
-
-
-def _parse_measurement(
-    node: dict[str, Any], expected_direction: str
-) -> MeridianMeasurement:
-    start_value = node.get("startAt") or node.get("readAt")
-    start = _parse_datetime(start_value, "measurement start")
-    end_value = node.get("endAt")
-    end = _parse_datetime(end_value, "measurement end") if end_value else None
-    try:
-        value = Decimal(str(node.get("value")))
-    except (InvalidOperation, TypeError) as err:
-        raise ValueError("Invalid measurement value") from err
-    if value < 0:
-        raise ValueError("Negative electricity measurement")
-
-    metadata = require_mapping(node.get("metaData"), "measurement metadata")
-    filters = require_mapping(metadata.get("utilityFilters"), "measurement filters")
-    direction = _required_string(filters, "readingDirection")
-    if direction != expected_direction:
-        raise ValueError("Unexpected measurement direction")
-    quality = _required_string(filters, "readingQuality")
-    channel_parts = [
-        str(filters[key])
-        for key in ("marketSupplyPointId", "deviceId", "registerId")
-        if filters.get(key) not in {None, ""}
-    ]
-    allowed_cost_types = (
-        GENERATION_CREDIT_TYPES if direction == "GENERATION" else COST_STATISTIC_TYPES
-    )
-    cost_cents = Decimal(0)
-    found_cost = False
-    incomplete_cost = False
-    for statistic_value in require_list(
-        metadata.get("statistics") or [], "measurement statistics"
-    ):
-        statistic = require_mapping(statistic_value, "measurement statistic")
-        if statistic.get("type") not in allowed_cost_types:
-            continue
-        found_cost = True
-        raw_cost = statistic.get("costInclTax")
-        if not isinstance(raw_cost, dict):
-            incomplete_cost = True
-            continue
-        cost = require_mapping(raw_cost, "measurement cost")
-        amount = cost.get("estimatedAmount")
-        if amount in {None, ""}:
-            incomplete_cost = True
-            continue
-        try:
-            cost_cents += abs(Decimal(str(amount)))
-        except InvalidOperation as err:
-            raise ValueError("Invalid measurement cost") from err
-
-    return MeridianMeasurement(
-        start=start,
-        end=end,
-        value_kwh=value,
-        quality=quality,
-        direction=direction,
-        channel_id=":".join(channel_parts) or "aggregate",
-        cost_cents=None if not found_cost or incomplete_cost else cost_cents,
-    )
-
-
-def _parse_datetime(value: Any, context: str) -> datetime:
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"Missing {context}")
-    parsed = datetime.fromisoformat(value)
-    if parsed.tzinfo is None or parsed.utcoffset() is None:
-        raise ValueError(f"Naive timestamp for {context}")
-    return parsed
-
-
-def _required_string(payload: dict[str, Any], key: str) -> str:
-    value = payload.get(key)
-    if not isinstance(value, str) or not value:
-        raise ValueError(f"Missing {key}")
-    return value
-
-
-def _optional_string(value: Any) -> str | None:
-    return value if isinstance(value, str) and value else None
-
-
-def _optional_date(value: Any) -> date | None:
-    if value in {None, ""}:
-        return None
-    if not isinstance(value, str):
-        raise ValueError("Invalid Meridian billing date")
-    try:
-        return date.fromisoformat(value)
-    except ValueError as err:
-        raise ValueError("Invalid Meridian billing date") from err
-
-
-def _graphql_error_code(error: dict[str, Any]) -> str:
-    extensions = error.get("extensions")
-    if not isinstance(extensions, dict):
-        return "UNKNOWN"
-    return str(extensions.get("errorCode") or "UNKNOWN")
-
-
-_AUTH_GRAPHQL_CODES = frozenset(
-    {"KT-CT-1111", "KT-CT-1112", "KT-CT-1120", "KT-CT-1124", "KT-CT-1143"}
-)
-
-_ACCOUNTS_QUERY = """
-query accountsList($allowedBrandCodes: [BrandChoices]) {
-  viewer {
-    accounts(allowedBrandCodes: $allowedBrandCodes) {
-      number
-      status
-      ... on AccountType { id }
-    }
-  }
-}
-"""
-
-_ACCOUNT_QUERY = """
-query account($accountNumber: String!, $activeFrom: DateTime) {
-  account(accountNumber: $accountNumber) {
-    number
-    status
-    properties(activeFrom: $activeFrom) {
-      id
-      address
-      meterPoints {
-        id
-        marketIdentifier
-        registers { identifier activeFrom activeTo isFeedIn }
-      }
-    }
-  }
-}
-"""
-
-_MEASUREMENTS_QUERY = """
-fragment MeasurementFields on MeasurementConnection {
-  pageInfo { hasNextPage hasPreviousPage startCursor endCursor }
-  edges {
-    node {
-      source
-      value
-      unit
-      readAt
-      ... on IntervalMeasurementType { startAt endAt }
-      metaData {
-        utilityFilters {
-          ... on ElectricityFiltersOutput {
-            readingFrequencyType
-            readingDirection
-            registerId
-            deviceId
-            marketSupplyPointId
-            readingQuality
-          }
-        }
-        statistics { type costInclTax { estimatedAmount } }
-      }
-    }
-  }
-}
-query measurements(
-  $accountNumber: String!
-  $propertyId: ID!
-  $before: String
-  $last: Int
-  $endOn: Date
-  $readingFrequencyType: ReadingFrequencyType!
-  $readingDirectionType: ReadingDirectionType
-  $readingQualityType: ReadingQualityType
-) {
-  account(accountNumber: $accountNumber) {
-    id
-    property(id: $propertyId) {
-      id
-      measurements(
-        before: $before
-        last: $last
-        endOn: $endOn
-        timezone: "Pacific/Auckland"
-        utilityFilters: [{ electricityFilters: {
-          readingDirection: $readingDirectionType
-          readingQuality: $readingQualityType
-          readingFrequencyType: $readingFrequencyType
-        }}]
-      ) { ... on MeasurementConnection { ...MeasurementFields } }
-    }
-  }
-}
-"""
-
-_BILLING_PERIODS_QUERY = """
-query billingPeriods($accountNumber: String!) {
-  account(accountNumber: $accountNumber) {
-    billingOptions {
-      periodLength
-      periodLengthMultiplier
-      isFixed
-      currentBillingPeriodStartDate
-      currentBillingPeriodEndDate
-      nextBillingDate
-      periodStartDay
-    }
-  }
-}
-"""
+        except MeridianTransportError as err:
+            raise MeridianConnectionError(str(err)) from err

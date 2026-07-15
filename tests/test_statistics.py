@@ -12,8 +12,10 @@ from custom_components.meridian_energy.models import MeridianMeasurement
 from custom_components.meridian_energy.statistics import (
     _aggregate_measurements,
     _async_baseline_sum,
+    _change_rows,
     _timestamp,
     async_account_period_totals,
+    async_clear_statistics,
     async_has_statistics,
     async_import_measurements,
     consumption_ids,
@@ -134,6 +136,21 @@ async def test_has_statistics(rows, expected: bool) -> None:
         assert (
             await async_has_statistics(AsyncMock(), "meridian_energy:test") is expected
         )
+
+
+@pytest.mark.asyncio
+async def test_clear_statistics_handles_empty_and_sorted_ids() -> None:
+    instance = MagicMock()
+    instance.async_add_executor_job = AsyncMock()
+    with patch(
+        "custom_components.meridian_energy.statistics.get_instance",
+        return_value=instance,
+    ):
+        await async_clear_statistics(AsyncMock(), set())
+        instance.async_add_executor_job.assert_not_awaited()
+        await async_clear_statistics(AsyncMock(), {"b", "a"})
+
+    assert instance.async_add_executor_job.await_args.args[2] == ["a", "b"]
 
 
 @pytest.mark.asyncio
@@ -282,3 +299,52 @@ def test_aggregate_marks_hourly_cost_incomplete() -> None:
         cost_cents=None,
     )
     assert _aggregate_measurements([missing])[start] == (Decimal(1), None)
+
+
+@pytest.mark.asyncio
+async def test_import_with_missing_cost_writes_only_energy() -> None:
+    start = datetime(2026, 7, 1, tzinfo=UTC)
+    measurement = _measurement(start, "1", "1")
+    measurement = MeridianMeasurement(
+        start=measurement.start,
+        end=measurement.end,
+        value_kwh=measurement.value_kwh,
+        quality=measurement.quality,
+        direction=measurement.direction,
+        channel_id=measurement.channel_id,
+        cost_cents=None,
+    )
+    with (
+        patch(
+            "custom_components.meridian_energy.statistics._async_baseline_sum",
+            new=AsyncMock(side_effect=[0, 0]),
+        ),
+        patch(
+            "custom_components.meridian_energy.statistics.async_add_external_statistics"
+        ) as add_statistics,
+    ):
+        result = await async_import_measurements(
+            AsyncMock(),
+            stat_energy_id="meridian_energy:energy",
+            stat_cost_id="meridian_energy:cost",
+            energy_name="Energy",
+            cost_name="Cost",
+            measurements=[measurement],
+        )
+
+    assert result == (1, 0)
+    add_statistics.assert_called_once()
+
+
+def test_change_rows_filters_boundaries_and_missing_values() -> None:
+    start = datetime(2026, 7, 1, tzinfo=UTC)
+    end = start + timedelta(hours=1)
+    rows = [
+        {"start": start - timedelta(hours=1), "change": 1},
+        {"start": start, "change": None},
+        {"start": start + timedelta(minutes=30), "change": 2},
+        {"start": end, "change": 3},
+    ]
+    assert _change_rows(rows, start, end) == [
+        ((start + timedelta(minutes=30)).timestamp(), Decimal(2))
+    ]

@@ -9,19 +9,25 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.device_registry import DeviceEntry
 from homeassistant.helpers.start import async_at_started
 
 from .api import MeridianApiClient
 from .const import (
+    CONF_AUTO_ADD_ACCOUNTS,
     CONF_FIREBASE_USER_ID,
     CONF_REFRESH_TOKEN,
     CONF_SELECTED_ACCOUNTS,
+    DOMAIN,
+    NAME,
 )
 from .coordinator import MeridianDataCoordinator
 from .models import MeridianTokenSet
+from .statistics import account_key
 
 PLATFORMS = [Platform.SENSOR]
-CONFIG_ENTRY_VERSION = 2
+CONFIG_ENTRY_VERSION = 3
+_OPTIONS_FLOW_ENTRY_VERSION = 2
 
 
 @dataclass(slots=True)
@@ -64,9 +70,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> 
         tokens=tokens,
         token_update_callback=async_store_tokens,
     )
-    configured_accounts = entry.options.get(
-        CONF_SELECTED_ACCOUNTS, entry.data.get(CONF_SELECTED_ACCOUNTS)
-    )
+    configured_accounts = entry.data.get(CONF_SELECTED_ACCOUNTS)
     selected_accounts = (
         frozenset(str(value) for value in configured_accounts)
         if configured_accounts is not None
@@ -77,6 +81,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> 
         client,
         config_entry=entry,
         selected_accounts=selected_accounts,
+        auto_add_accounts=bool(entry.data.get(CONF_AUTO_ADD_ACCOUNTS, False)),
     )
     await coordinator.async_config_entry_first_refresh()
     if configured_accounts is None:
@@ -108,13 +113,48 @@ async def async_unload_entry(hass: HomeAssistant, entry: MeridianConfigEntry) ->
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Migrate legacy entries; account selection is populated at next setup."""
+    """Migrate legacy account options into reconfigurable entry data."""
     if entry.version == 1:
+        hass.config_entries.async_update_entry(entry, version=2, minor_version=0)
+    if entry.version == _OPTIONS_FLOW_ENTRY_VERSION:
+        selected_accounts = entry.options.get(
+            CONF_SELECTED_ACCOUNTS, entry.data.get(CONF_SELECTED_ACCOUNTS)
+        )
+        data = dict(entry.data)
+        if selected_accounts is not None:
+            data[CONF_SELECTED_ACCOUNTS] = sorted(
+                str(value) for value in selected_accounts
+            )
+        data.setdefault(CONF_AUTO_ADD_ACCOUNTS, False)
         hass.config_entries.async_update_entry(
-            entry, version=CONFIG_ENTRY_VERSION, minor_version=0
+            entry,
+            data=data,
+            options={},
+            title=NAME,
+            version=CONFIG_ENTRY_VERSION,
+            minor_version=0,
         )
         return True
     return entry.version == CONFIG_ENTRY_VERSION
+
+
+async def async_remove_config_entry_device(
+    hass: HomeAssistant,
+    entry: MeridianConfigEntry,
+    device_entry: DeviceEntry,
+) -> bool:
+    """Allow manual removal only for devices no longer supplied by Meridian."""
+    del hass
+    current_keys = {
+        account_key(account.number)
+        for account in entry.runtime_data.coordinator.accounts
+    }
+    device_keys = {
+        identifier[1]
+        for identifier in device_entry.identifiers
+        if identifier[0] == DOMAIN
+    }
+    return bool(device_keys) and device_keys.isdisjoint(current_keys)
 
 
 async def _async_update_listener(

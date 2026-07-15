@@ -1,0 +1,21 @@
+{
+  "entity": {
+    "sensor": {
+      "estimated_readings": {
+        "default": "mdi:progress-clock"
+      },
+      "current_bill_usage": {
+        "default": "mdi:transmission-tower-import"
+      },
+      "current_bill_cost": {
+        "default": "mdi:cash-clock"
+      },
+      "current_bill_export": {
+        "default": "mdi:transmission-tower-export"
+      },
+      "current_bill_credit": {
+        "default": "mdi:cash-plus"
+      }
+    }
+  }
+}

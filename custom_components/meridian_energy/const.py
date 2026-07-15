@@ -8,6 +8,7 @@ NAME = "Meridian Energy"
 CONF_REFRESH_TOKEN = "refresh_token"
 CONF_FIREBASE_USER_ID = "firebase_user_id"
 CONF_SELECTED_ACCOUNTS = "selected_accounts"
+CONF_AUTO_ADD_ACCOUNTS = "auto_add_accounts"
 
 AUTH_EMAIL_URL = "https://auth.meridianenergy.nz/cf/email-connector"
 AUTH_OTP_URL = "https://auth.meridianenergy.nz/cf/email-otp-authenticator"
