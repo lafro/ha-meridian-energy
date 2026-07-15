@@ -10,12 +10,16 @@ from zoneinfo import ZoneInfo
 import pytest
 from homeassistant.core import CoreState
 from homeassistant.helpers.update_coordinator import UpdateFailed
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.meridian_energy.api import (
     MeridianGraphQLError,
     MeridianRateLimitError,
 )
 from custom_components.meridian_energy.const import (
+    CONF_AUTO_ADD_ACCOUNTS,
+    CONF_SELECTED_ACCOUNTS,
+    DOMAIN,
     READING_CONSUMPTION,
     REVISION_OVERLAP,
 )
@@ -152,6 +156,13 @@ async def test_topology_is_cached_for_24_hours_and_can_be_forced(hass) -> None:
     )
     assert client.async_get_accounts.await_count == 3
     assert coordinator._topology_cache_age(NOW) == 0
+    assert coordinator._topology_cache_age(NOW + timedelta(days=2)) > 0
+
+
+def test_empty_topology_and_refresh_without_data_are_safe(hass) -> None:
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    assert coordinator.accounts == ()
+    assert coordinator._topology_cache_age(NOW) == 0
 
 
 @pytest.mark.asyncio
@@ -177,6 +188,37 @@ async def test_topology_filters_selected_accounts_and_rejects_stale_selection(
     )
     with pytest.raises(ValueError, match="selected"):
         await missing._async_get_topology(NOW)
+
+
+@pytest.mark.asyncio
+async def test_topology_auto_adds_new_accounts_when_all_were_selected(hass) -> None:
+    first = _account()
+    second = MeridianAccount(
+        number="new-account", status="ACTIVE", properties=first.properties
+    )
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_SELECTED_ACCOUNTS: [first.number],
+            CONF_AUTO_ADD_ACCOUNTS: True,
+        },
+    )
+    entry.add_to_hass(hass)
+    client = MagicMock()
+    client.async_get_accounts = AsyncMock(return_value=(first, second))
+    coordinator = MeridianDataCoordinator(
+        hass,
+        client,
+        config_entry=entry,
+        selected_accounts=frozenset({first.number}),
+        auto_add_accounts=True,
+    )
+
+    accounts, refreshed = await coordinator._async_get_topology(NOW)
+
+    assert refreshed is True
+    assert {account.number for account in accounts} == {first.number, second.number}
+    assert entry.data[CONF_SELECTED_ACCOUNTS] == ["new-account", first.number]
 
 
 @pytest.mark.asyncio
@@ -261,6 +303,32 @@ async def test_account_results_defer_recorder_totals_during_startup(hass) -> Non
 
 
 @pytest.mark.asyncio
+async def test_future_billing_period_does_not_query_recorder(hass) -> None:
+    hass.set_state(CoreState.running)
+    client = MagicMock()
+    client.async_get_billing_period = AsyncMock(
+        return_value=MeridianBillingPeriod(
+            period_length="MONTHLY",
+            period_length_multiplier=1,
+            is_fixed=True,
+            start=date(2026, 8, 1),
+            end=date(2026, 8, 31),
+            next_billing_date=date(2026, 9, 1),
+            period_start_day=1,
+        )
+    )
+    coordinator = MeridianDataCoordinator(hass, client)
+    with patch(
+        "custom_components.meridian_energy.coordinator.async_account_period_totals",
+        new=AsyncMock(),
+    ) as calculate:
+        result = await coordinator._async_account_results((_account(),), NOW)
+
+    calculate.assert_not_awaited()
+    assert result[0].current_bill_usage is None
+
+
+@pytest.mark.asyncio
 async def test_refresh_billing_totals_reuses_existing_sync_data(hass) -> None:
     hass.set_state(CoreState.running)
     coordinator = MeridianDataCoordinator(hass, MagicMock())
@@ -294,6 +362,11 @@ async def test_startup_distinguishes_install_restart_and_solar(hass) -> None:
         "custom_components.meridian_energy.coordinator.async_has_statistics",
         new=AsyncMock(side_effect=[True, True]),
     ) as checker:
+        assert (
+            await coordinator._async_startup_mode((_account(feed_in=True),))
+            is SyncMode.RESTART
+        )
+        assert checker.await_count == 2
         assert (
             await coordinator._async_startup_mode((_account(feed_in=True),))
             is SyncMode.RESTART
@@ -387,6 +460,32 @@ def test_merge_replays_from_change_and_protects_actual(hass) -> None:
         coordinator._measurement_cache[CACHE_KEY][(actual.start, actual.channel_id)]
         == actual
     )
+    assert coordinator._merge_measurements(CACHE_KEY, (actual,), NOW) == ()
+
+    coordinator._measurement_cache[CACHE_KEY][(expired.start, expired.channel_id)] = (
+        expired
+    )
+    coordinator._merge_measurements(CACHE_KEY, (), NOW)
+    assert expired not in coordinator._measurement_cache[CACHE_KEY].values()
+
+
+@pytest.mark.asyncio
+async def test_direction_mode_uses_cached_statistic_state(hass) -> None:
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    with patch(
+        "custom_components.meridian_energy.coordinator.async_has_statistics",
+        new=AsyncMock(return_value=True),
+    ) as checker:
+        assert (
+            await coordinator._direction_mode("meridian_energy:test", SyncMode.TIP)
+            is SyncMode.RESTART
+        )
+        coordinator._initial_refresh_complete = True
+        assert (
+            await coordinator._direction_mode("meridian_energy:test", SyncMode.TIP)
+            is SyncMode.TIP
+        )
+    checker.assert_awaited_once()
 
 
 def test_density_observation_is_smoothed_and_ignores_empty(hass) -> None:
@@ -450,6 +549,28 @@ async def test_topology_error_forces_one_refresh_and_retry(hass) -> None:
     assert result.topology_refreshed is True
     client.async_get_accounts.assert_awaited_once()
     assert coordinator._async_sync_accounts.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_topology_error_after_refresh_is_not_retried(hass) -> None:
+    client = MagicMock()
+    client.async_get_accounts = AsyncMock(return_value=(_account(),))
+    coordinator = MeridianDataCoordinator(hass, client)
+    coordinator._async_sync_accounts = AsyncMock(
+        side_effect=MeridianGraphQLError("measurements", ("PROPERTY_NOT_FOUND",))
+    )
+
+    with (
+        patch(
+            "custom_components.meridian_energy.coordinator.async_has_statistics",
+            new=AsyncMock(return_value=False),
+        ),
+        pytest.raises(UpdateFailed),
+    ):
+        await coordinator.async_fetch_and_import()
+
+    client.async_get_accounts.assert_awaited_once()
+    coordinator._async_sync_accounts.assert_awaited_once()
 
 
 @pytest.mark.asyncio

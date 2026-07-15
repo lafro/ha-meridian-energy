@@ -99,12 +99,8 @@ async def test_update_imports_consumption(hass) -> None:
     assert result.results[0].consumption_rows == 1
     assert result.results[0].generation_rows == 0
     importer.assert_awaited_once()
-    assert importer.await_args.kwargs["energy_name"] == (
-        "Meridian electricity consumption — 1 Synthetic Street"
-    )
-    assert importer.await_args.kwargs["cost_name"] == (
-        "Meridian electricity cost — 1 Synthetic Street"
-    )
+    assert importer.await_args.kwargs["energy_name"] == "Meridian grid import"
+    assert importer.await_args.kwargs["cost_name"] == "Meridian grid import cost"
 
 
 @pytest.mark.asyncio
@@ -135,11 +131,51 @@ async def test_update_imports_generation_for_feed_in(hass) -> None:
     assert result.results[0].generation_rows == 1
     assert importer.await_count == 2
     assert coordinator._async_fetch_since.await_count == 2
-    assert importer.await_args_list[1].kwargs["energy_name"] == (
-        "Meridian solar export — 1 Synthetic Street"
-    )
+    assert importer.await_args_list[1].kwargs["energy_name"] == ("Meridian grid export")
     assert importer.await_args_list[1].kwargs["cost_name"] == (
-        "Meridian solar export credit — 1 Synthetic Street"
+        "Meridian grid export credit"
+    )
+
+
+@pytest.mark.asyncio
+async def test_multiple_properties_get_disambiguated_one_line_names(hass) -> None:
+    account = _account()
+    second_property = MeridianProperty(
+        id="property-2",
+        address="  2 Synthetic\nStreet  ",
+        meter_points=account.properties[0].meter_points,
+    )
+    account = MeridianAccount(
+        number=account.number,
+        status=account.status,
+        properties=(account.properties[0], second_property),
+    )
+    client = MagicMock()
+    client.async_get_accounts = AsyncMock(return_value=(account,))
+    client.async_get_billing_period = AsyncMock(return_value=None)
+    coordinator = MeridianDataCoordinator(hass, client)
+    now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+    coordinator._async_fetch_since = AsyncMock(
+        side_effect=[_fetch(_measurement(now)), _fetch(_measurement(now))]
+    )
+
+    with (
+        patch(
+            "custom_components.meridian_energy.coordinator.async_has_statistics",
+            new=AsyncMock(return_value=False),
+        ),
+        patch(
+            "custom_components.meridian_energy.coordinator.async_import_measurements",
+            new=AsyncMock(return_value=(1, 1)),
+        ) as importer,
+    ):
+        await coordinator._async_update_data()
+
+    assert importer.await_args_list[0].kwargs["energy_name"] == (
+        "Meridian grid import — 1 Synthetic Street"
+    )
+    assert importer.await_args_list[1].kwargs["energy_name"] == (
+        "Meridian grid import — 2 Synthetic Street"
     )
 
 

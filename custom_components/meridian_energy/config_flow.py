@@ -13,10 +13,8 @@ from homeassistant.config_entries import (
     ConfigEntry,
     ConfigFlow,
     ConfigFlowResult,
-    OptionsFlow,
 )
 from homeassistant.const import CONF_EMAIL
-from homeassistant.core import callback
 from homeassistant.helpers import selector
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.selector import SelectOptionDict
@@ -28,13 +26,22 @@ from .api import (
     MeridianOtpError,
 )
 from .const import (
+    CONF_AUTO_ADD_ACCOUNTS,
     CONF_FIREBASE_USER_ID,
     CONF_REFRESH_TOKEN,
     CONF_SELECTED_ACCOUNTS,
     DOMAIN,
+    NAME,
 )
 from .coordinator import MeridianDataCoordinator
 from .models import MeridianAccount, MeridianTokenSet
+from .statistics import (
+    async_clear_statistics,
+    async_has_statistics,
+    consumption_ids,
+    generation_ids,
+    property_key,
+)
 
 OTP_LENGTH = 6
 _LOGGER = logging.getLogger(__name__)
@@ -43,7 +50,7 @@ _LOGGER = logging.getLogger(__name__)
 class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
     """Set up a Meridian Energy account."""
 
-    VERSION = 2
+    VERSION = 3
     MINOR_VERSION = 0
 
     def __init__(self) -> None:
@@ -55,6 +62,8 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
         self._accounts: tuple[MeridianAccount, ...] = ()
         self._selected_accounts: frozenset[str] = frozenset()
         self._initial_import_task: asyncio.Task[None] | None = None
+        self._initial_statistic_ids: set[str] = set()
+        self._existing_statistic_ids: set[str] = set()
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -139,6 +148,7 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
         if len(self._accounts) > 1:
             return await self.async_step_accounts()
         self._selected_accounts = frozenset({self._accounts[0].number})
+        await self._async_prepare_import_rollback()
         return await self._start_initial_import()
 
     async def async_step_accounts(
@@ -157,6 +167,7 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
                 errors["base"] = "select_account"
             else:
                 self._selected_accounts = selected
+                await self._async_prepare_import_rollback()
                 return await self._start_initial_import()
 
         options = [
@@ -187,8 +198,13 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
         if self._tokens is None or self._pending_data is None:
             return self.async_abort(reason="login_expired")
         self._pending_data[CONF_SELECTED_ACCOUNTS] = sorted(self._selected_accounts)
+        self._pending_data[CONF_AUTO_ADD_ACCOUNTS] = self._selected_accounts == {
+            account.number for account in self._accounts
+        }
         self._initial_import_task = self.hass.async_create_task(
-            self._async_initial_import(self._tokens, self._selected_accounts)
+            self._async_initial_import_with_rollback(
+                self._tokens, self._selected_accounts
+            )
         )
         return await self.async_step_initial_import()
 
@@ -219,7 +235,28 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
         del user_input
         if self._email is None or self._pending_data is None:
             return self.async_abort(reason="login_expired")
-        return self.async_create_entry(title=self._email, data=self._pending_data)
+        return self.async_create_entry(title=NAME, data=self._pending_data)
+
+    async def _async_prepare_import_rollback(self) -> None:
+        """Record pre-existing statistics so failed setup removes only new data."""
+        selected = {
+            account.number: account
+            for account in self._accounts
+            if account.number in self._selected_accounts
+        }
+        statistic_ids: set[str] = set()
+        for account in selected.values():
+            for property_data in account.properties:
+                key = property_key(account.number, property_data.id)
+                statistic_ids.update(consumption_ids(key))
+                if any(meter.has_feed_in for meter in property_data.meter_points):
+                    statistic_ids.update(generation_ids(key))
+        self._initial_statistic_ids = statistic_ids
+        self._existing_statistic_ids = {
+            statistic_id
+            for statistic_id in statistic_ids
+            if await async_has_statistics(self.hass, statistic_id)
+        }
 
     async def _async_initial_import(
         self, tokens: MeridianTokenSet, selected_accounts: frozenset[str]
@@ -230,6 +267,19 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
             self.hass, client, selected_accounts=selected_accounts
         )
         await coordinator.async_fetch_and_import()
+
+    async def _async_initial_import_with_rollback(
+        self, tokens: MeridianTokenSet, selected_accounts: frozenset[str]
+    ) -> None:
+        """Run setup import and remove only newly created statistics on failure."""
+        try:
+            await self._async_initial_import(tokens, selected_accounts)
+        except BaseException:
+            await async_clear_statistics(
+                self.hass,
+                self._initial_statistic_ids - self._existing_statistic_ids,
+            )
+            raise
 
     def _authenticated_client(self, tokens: MeridianTokenSet) -> MeridianApiClient:
         """Create a client using the session validated by this flow."""
@@ -291,31 +341,18 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
     def _client(self) -> MeridianApiClient:
         return MeridianApiClient(async_get_clientsession(self.hass))
 
-    @staticmethod
-    @callback
-    def async_get_options_flow(config_entry: ConfigEntry) -> MeridianOptionsFlow:
-        """Return an account-selection options flow."""
-        return MeridianOptionsFlow(config_entry)
-
-
-class MeridianOptionsFlow(OptionsFlow):
-    """Allow selected Meridian accounts to be changed safely."""
-
-    def __init__(self, config_entry: ConfigEntry) -> None:
-        self._entry = config_entry
-        self._accounts: tuple[MeridianAccount, ...] = ()
-
-    async def async_step_init(
+    async def async_step_reconfigure(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        """Refresh topology and save the selected account set."""
+        """Change the selected accounts without renewing credentials."""
+        entry = self._get_reconfigure_entry()
         errors: dict[str, str] = {}
         if not self._accounts:
             tokens = MeridianTokenSet(
                 id_token="",
-                refresh_token=str(self._entry.data[CONF_REFRESH_TOKEN]),
+                refresh_token=str(entry.data[CONF_REFRESH_TOKEN]),
                 expires_at=datetime.fromtimestamp(0, UTC),
-                user_id=str(self._entry.data[CONF_FIREBASE_USER_ID]),
+                user_id=str(entry.data[CONF_FIREBASE_USER_ID]),
             )
             client = MeridianApiClient(
                 async_get_clientsession(self.hass), tokens=tokens
@@ -335,16 +372,17 @@ class MeridianOptionsFlow(OptionsFlow):
             if not selected or not selected.issubset(available):
                 errors["base"] = "select_account"
             else:
-                return self.async_create_entry(
-                    data={CONF_SELECTED_ACCOUNTS: sorted(selected)}
+                return self.async_update_reload_and_abort(
+                    entry,
+                    data_updates={
+                        CONF_SELECTED_ACCOUNTS: sorted(selected),
+                        CONF_AUTO_ADD_ACCOUNTS: selected == available,
+                    },
                 )
 
-        current = self._entry.options.get(
-            CONF_SELECTED_ACCOUNTS,
-            self._entry.data.get(CONF_SELECTED_ACCOUNTS, sorted(available)),
-        )
+        current = entry.data.get(CONF_SELECTED_ACCOUNTS, sorted(available))
         return self.async_show_form(
-            step_id="init",
+            step_id="reconfigure",
             data_schema=vol.Schema(
                 {
                     vol.Required(
@@ -379,7 +417,9 @@ def _otp_error_key(code: str) -> str:
 
 def _account_label(account: MeridianAccount) -> str:
     """Return a recognisable local-only label without exposing meter IDs."""
-    address = (
-        account.properties[0].address if account.properties else "Meridian account"
+    address = " ".join(
+        (
+            account.properties[0].address if account.properties else "Meridian account"
+        ).split()
     )
     return f"{address} · account ending {account.number[-4:]}"

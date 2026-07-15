@@ -6,7 +6,7 @@ from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from pytest_homeassistant_custom_component.common import MockConfigEntry
@@ -30,7 +30,10 @@ from custom_components.meridian_energy.models import (
     PropertySyncResult,
     SyncMode,
 )
-from custom_components.meridian_energy.sensor import async_setup_entry
+from custom_components.meridian_energy.sensor import (
+    _remove_stale_devices,
+    async_setup_entry,
+)
 from custom_components.meridian_energy.statistics import account_key
 
 ACCOUNT_NUMBER = "synthetic-account"
@@ -152,6 +155,15 @@ async def test_sensor_values_and_device_identifier_are_redacted(hass) -> None:
         "next_billing_date": date(2026, 8, 1),
         "data_complete": True,
     }
+    assert entities[3].last_reset == datetime(2026, 6, 30, 12, tzinfo=UTC)
+    assert entities[0].last_reset is None
+    coordinator.data = replace(
+        coordinator.data,
+        account_results=(
+            replace(coordinator.data.account_results[0], billing_period=None),
+        ),
+    )
+    assert entities[3].last_reset is None
     assert entities[2].extra_state_attributes == {
         "oldest_provisional_interval": coordinator.data.results[0].oldest_estimated,
         "newest_provisional_interval": coordinator.data.results[0].newest_estimated,
@@ -170,6 +182,7 @@ async def test_sensor_values_and_device_identifier_are_redacted(hass) -> None:
         "estimated_readings",
     ]
     assert all(not hasattr(entity, "_attr_name") for entity in entities)
+    await entry._async_process_on_unload(hass)
 
 
 @pytest.mark.asyncio
@@ -200,13 +213,87 @@ async def test_solar_entities_and_multiple_account_device_name(hass) -> None:
         ),
     )
     entities = []
+    entry = _entry(coordinator)
 
-    await async_setup_entry(hass, _entry(coordinator), entities.extend)
+    await async_setup_entry(hass, entry, entities.extend)
 
     assert len(entities) == 18
     assert entities[5].native_value == Decimal(10)
     assert entities[6].native_value == Decimal(2)
     assert entities[0].device_info["name"] == "Meridian Energy — 1 Synthetic Street"
+    await entry._async_process_on_unload(hass)
+
+
+@pytest.mark.asyncio
+async def test_feed_in_entities_are_added_when_topology_changes(hass) -> None:
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    coordinator._topology = (_account(),)
+    coordinator.data = _data()
+    entry = _entry(coordinator)
+    entities = []
+
+    await async_setup_entry(hass, entry, entities.extend)
+    assert len(entities) == 8
+
+    coordinator.async_set_updated_data(
+        replace(
+            coordinator.data,
+            account_results=(
+                replace(
+                    coordinator.data.account_results[0],
+                    has_feed_in=True,
+                    current_bill_export=Decimal(2),
+                    current_bill_credit=Decimal("0.4"),
+                ),
+            ),
+        )
+    )
+
+    assert len(entities) == 10
+    assert entities[-2].native_value == Decimal(2)
+    assert entities[-1].native_value == Decimal("0.4")
+    coordinator._topology = ()
+    coordinator.async_set_updated_data(
+        replace(coordinator.data, results=(), account_results=())
+    )
+    assert len(entities) == 10
+    await entry._async_process_on_unload(hass)
+
+
+def test_stale_device_cleanup_removes_only_owned_stale_entities(hass) -> None:
+    entry = _entry(MagicMock())
+    unrelated = SimpleNamespace(id="unrelated", identifiers={("other", "id")})
+    active = SimpleNamespace(id="active", identifiers={(DOMAIN, ACCOUNT_KEY)})
+    stale = SimpleNamespace(id="stale", identifiers={(DOMAIN, "stale-key")})
+    owned = SimpleNamespace(entity_id="sensor.owned", config_entry_id=entry.entry_id)
+    shared = SimpleNamespace(entity_id="sensor.shared", config_entry_id="other")
+    device_registry = MagicMock()
+    entity_registry = MagicMock()
+
+    with (
+        patch(
+            "custom_components.meridian_energy.sensor.dr.async_get",
+            return_value=device_registry,
+        ),
+        patch(
+            "custom_components.meridian_energy.sensor.dr.async_entries_for_config_entry",
+            return_value=[unrelated, active, stale],
+        ),
+        patch(
+            "custom_components.meridian_energy.sensor.er.async_get",
+            return_value=entity_registry,
+        ),
+        patch(
+            "custom_components.meridian_energy.sensor.er.async_entries_for_device",
+            return_value=[owned, shared],
+        ),
+    ):
+        _remove_stale_devices(hass, entry, {ACCOUNT_KEY})
+
+    entity_registry.async_remove.assert_called_once_with("sensor.owned")
+    device_registry.async_update_device.assert_called_once_with(
+        "stale", remove_config_entry_id=entry.entry_id
+    )
 
 
 @pytest.mark.asyncio

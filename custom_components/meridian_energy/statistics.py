@@ -19,6 +19,7 @@ from homeassistant.components.recorder.models import (
 from homeassistant.components.recorder.statistics import (
     StatisticsRow,
     async_add_external_statistics,
+    clear_statistics,
     get_last_statistics,
     statistics_during_period,
 )
@@ -67,6 +68,16 @@ async def async_has_statistics(hass: HomeAssistant, stat_id: str) -> bool:
         {"sum"},
     )
     return bool(result.get(stat_id))
+
+
+async def async_clear_statistics(hass: HomeAssistant, statistic_ids: set[str]) -> None:
+    """Remove statistics created by an incomplete first-install import."""
+    if not statistic_ids:
+        return
+    instance = get_instance(hass)
+    await instance.async_add_executor_job(
+        clear_statistics, instance, sorted(statistic_ids)
+    )
 
 
 async def async_import_measurements(

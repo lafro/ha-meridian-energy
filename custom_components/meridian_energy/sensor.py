@@ -5,9 +5,10 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, date, datetime, time
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -16,7 +17,9 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.const import EntityCategory, UnitOfEnergy
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -26,6 +29,9 @@ from .const import DOMAIN, NAME
 from .coordinator import MeridianDataCoordinator
 from .models import AccountSyncResult, MeridianAccount, MeridianSyncData
 from .statistics import account_key
+
+PARALLEL_UPDATES = 0
+_NZ = ZoneInfo("Pacific/Auckland")
 
 NativeValue = date | datetime | Decimal | int | None
 ValueFn = Callable[[MeridianSyncData, str], NativeValue]
@@ -139,27 +145,85 @@ async def async_setup_entry(
     entry: MeridianConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up one device and a coherent entity set per selected account."""
-    del hass
+    """Set up and maintain one device per selected Meridian account."""
     coordinator = entry.runtime_data.coordinator
-    multiple = len(coordinator.accounts) > 1
-    entities: list[MeridianAccountSensor] = []
-    for account in coordinator.accounts:
-        key = account_key(account.number)
-        result = _account_result(coordinator.data, key)
-        for description in DESCRIPTIONS:
-            if description.conditional_feed_in and not result.has_feed_in:
-                continue
-            entities.append(
-                MeridianAccountSensor(
-                    coordinator,
-                    account,
-                    key,
-                    description,
-                    multiple_accounts=multiple,
+    created_sensors: set[tuple[str, str]] = set()
+
+    @callback
+    def _update_entities() -> None:
+        """Add newly discovered entities and remove stale account devices."""
+        new_entities: list[MeridianAccountSensor] = []
+        current_account_keys: set[str] = set()
+        multiple_properties = (
+            sum(len(account.properties) for account in coordinator.accounts) > 1
+        )
+
+        for account in coordinator.accounts:
+            key = account_key(account.number)
+            current_account_keys.add(key)
+            result = _account_result(coordinator.data, key)
+            for description in DESCRIPTIONS:
+                if description.conditional_feed_in and not result.has_feed_in:
+                    continue
+                sensor_key = (key, description.key)
+                if sensor_key in created_sensors:
+                    continue
+                created_sensors.add(sensor_key)
+                new_entities.append(
+                    MeridianAccountSensor(
+                        coordinator,
+                        account,
+                        key,
+                        description,
+                        disambiguate=multiple_properties,
+                    )
                 )
-            )
-    async_add_entities(entities)
+
+        if new_entities:
+            async_add_entities(new_entities)
+
+        _remove_stale_devices(hass, entry, current_account_keys)
+
+        stale_sensor_keys = {
+            sensor_key
+            for sensor_key in created_sensors
+            if sensor_key[0] not in current_account_keys
+        }
+        created_sensors.difference_update(stale_sensor_keys)
+
+    _update_entities()
+    entry.async_on_unload(coordinator.async_add_listener(_update_entities))
+
+
+@callback
+def _remove_stale_devices(
+    hass: HomeAssistant,
+    entry: MeridianConfigEntry,
+    current_account_keys: set[str],
+) -> None:
+    """Remove entities and detach devices for accounts no longer selected."""
+    device_registry = dr.async_get(hass)
+    entity_registry = er.async_get(hass)
+    for device_entry in dr.async_entries_for_config_entry(
+        device_registry, entry.entry_id
+    ):
+        domain_keys = {
+            identifier[1]
+            for identifier in device_entry.identifiers
+            if identifier[0] == DOMAIN
+        }
+        if not domain_keys or not domain_keys.isdisjoint(current_account_keys):
+            continue
+        for entity_entry in er.async_entries_for_device(
+            entity_registry,
+            device_entry.id,
+            include_disabled_entities=True,
+        ):
+            if entity_entry.config_entry_id == entry.entry_id:
+                entity_registry.async_remove(entity_entry.entity_id)
+        device_registry.async_update_device(
+            device_entry.id, remove_config_entry_id=entry.entry_id
+        )
 
 
 class MeridianAccountSensor(CoordinatorEntity[MeridianDataCoordinator], SensorEntity):
@@ -174,7 +238,7 @@ class MeridianAccountSensor(CoordinatorEntity[MeridianDataCoordinator], SensorEn
         key: str,
         description: MeridianSensorDescription,
         *,
-        multiple_accounts: bool,
+        disambiguate: bool,
     ) -> None:
         super().__init__(coordinator)
         self.entity_description = description
@@ -182,8 +246,10 @@ class MeridianAccountSensor(CoordinatorEntity[MeridianDataCoordinator], SensorEn
         self._account_key = key
         self._attr_unique_id = f"{key}_{description.key}"
         device_name = NAME
-        if multiple_accounts:
-            address = account.properties[0].address if account.properties else "Account"
+        if disambiguate:
+            address = _one_line_address(
+                account.properties[0].address if account.properties else "Account"
+            )
             device_name = f"{NAME} — {address}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, key)},
@@ -198,6 +264,23 @@ class MeridianAccountSensor(CoordinatorEntity[MeridianDataCoordinator], SensorEn
     def native_value(self) -> NativeValue:
         """Return this account's current value."""
         return self._description.value_fn(self.coordinator.data, self._account_key)
+
+    @property
+    def last_reset(self) -> datetime | None:
+        """Return the retailer billing-period boundary for bill-to-date totals."""
+        if self.entity_description.key not in {
+            "current_bill_usage",
+            "current_bill_cost",
+            "current_bill_export",
+            "current_bill_credit",
+        }:
+            return None
+        period = _account_result(
+            self.coordinator.data, self._account_key
+        ).billing_period
+        if period is None or period.start is None:
+            return None
+        return datetime.combine(period.start, time.min, tzinfo=_NZ).astimezone(UTC)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
@@ -263,3 +346,8 @@ def _billing_value(data: MeridianSyncData, key: str, field: str) -> date | None:
     """Return one date from an account's current billing metadata."""
     period = _account_result(data, key).billing_period
     return getattr(period, field) if period is not None else None
+
+
+def _one_line_address(value: str) -> str:
+    """Normalize an address for compact local-only display."""
+    return " ".join(value.split())

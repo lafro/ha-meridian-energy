@@ -23,6 +23,9 @@ from .api import (
 )
 from .const import (
     BILLING_CACHE_INTERVAL,
+    CONF_AUTO_ADD_ACCOUNTS,
+    CONF_SELECTED_ACCOUNTS,
+    DOMAIN,
     FULL_RECONCILIATION_INTERVAL,
     INITIAL_BACKFILL,
     MAX_MEASUREMENT_PAGES,
@@ -86,6 +89,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         *,
         config_entry: ConfigEntry | None = None,
         selected_accounts: frozenset[str] | None = None,
+        auto_add_accounts: bool = False,
     ) -> None:
         super().__init__(
             hass,
@@ -95,7 +99,9 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             update_interval=UPDATE_INTERVAL,
         )
         self.client = client
+        self._config_entry = config_entry
         self._selected_accounts = selected_accounts
+        self._auto_add_accounts = auto_add_accounts
         self._topology: tuple[MeridianAccount, ...] | None = None
         self._topology_cached_at: datetime | None = None
         self._billing_periods: dict[str, MeridianBillingPeriod] = {}
@@ -161,16 +167,26 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 topology_cache_age_seconds=self._topology_cache_age(now),
             )
         except MeridianAuthenticationError as err:
-            raise ConfigEntryAuthFailed from err
+            raise ConfigEntryAuthFailed(
+                translation_domain=DOMAIN,
+                translation_key="invalid_auth",
+            ) from err
         except MeridianRateLimitError as err:
             raise UpdateFailed(
-                "Meridian asked Home Assistant to retry later",
+                translation_domain=DOMAIN,
+                translation_key="rate_limited",
                 retry_after=err.retry_after,
             ) from err
         except MeridianConnectionError as err:
-            raise UpdateFailed("Unable to reach Meridian") from err
+            raise UpdateFailed(
+                translation_domain=DOMAIN,
+                translation_key="cannot_connect",
+            ) from err
         except (MeridianError, ValueError) as err:
-            raise UpdateFailed("Meridian returned invalid energy data") from err
+            raise UpdateFailed(
+                translation_domain=DOMAIN,
+                translation_key="invalid_data",
+            ) from err
 
     async def async_refresh_billing_totals(self) -> None:
         """Refresh Recorder-derived billing totals without polling Meridian usage."""
@@ -205,6 +221,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         if force or self._topology is None or expired:
             self._topology = await self.client.async_get_accounts()
             self._topology_cached_at = now
+            self._include_new_accounts()
             return self._filtered_topology(), True
         return self._filtered_topology(), False
 
@@ -222,6 +239,24 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         if not selected:
             raise ValueError("None of the selected Meridian accounts are available")
         return selected
+
+    def _include_new_accounts(self) -> None:
+        """Include newly discovered accounts when the user selected all accounts."""
+        if not self._auto_add_accounts or self._topology is None:
+            return
+        selected_accounts = frozenset(account.number for account in self._topology)
+        if selected_accounts == self._selected_accounts:
+            return
+        self._selected_accounts = selected_accounts
+        if self._config_entry is not None:
+            self.hass.config_entries.async_update_entry(
+                self._config_entry,
+                data={
+                    **self._config_entry.data,
+                    CONF_SELECTED_ACCOUNTS: sorted(selected_accounts),
+                    CONF_AUTO_ADD_ACCOUNTS: True,
+                },
+            )
 
     async def _async_startup_mode(
         self, accounts: tuple[MeridianAccount, ...]
@@ -254,11 +289,16 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         now: datetime,
     ) -> tuple[PropertySyncResult, ...]:
         results: list[PropertySyncResult] = []
+        disambiguate = sum(len(account.properties) for account in accounts) > 1
         for account in accounts:
             for property_data in account.properties:
                 results.append(
                     await self._async_sync_property(
-                        account.number, property_data, mode, now
+                        account.number,
+                        property_data,
+                        mode,
+                        now,
+                        disambiguate=disambiguate,
                     )
                 )
         return tuple(results)
@@ -343,6 +383,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         property_data: MeridianProperty,
         mode: SyncMode,
         now: datetime,
+        *,
+        disambiguate: bool = False,
     ) -> PropertySyncResult:
         key = property_key(account_number, property_data.id)
         consumption_energy_id, consumption_cost_id = consumption_ids(key)
@@ -368,14 +410,15 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         )
         consumption_rows = 0
         if consumption_import:
+            suffix = (
+                f" — {_one_line_address(property_data.address)}" if disambiguate else ""
+            )
             consumption_rows, _ = await async_import_measurements(
                 self.hass,
                 stat_energy_id=consumption_energy_id,
                 stat_cost_id=consumption_cost_id,
-                energy_name=(
-                    f"Meridian electricity consumption — {property_data.address}"
-                ),
-                cost_name=f"Meridian electricity cost — {property_data.address}",
+                energy_name=f"Meridian grid import{suffix}",
+                cost_name=f"Meridian grid import cost{suffix}",
                 measurements=consumption_import,
             )
             self._known_statistics[consumption_energy_id] = True
@@ -406,14 +449,17 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 initial_import=generation_mode is SyncMode.INITIAL,
             )
             if generation_import:
+                suffix = (
+                    f" — {_one_line_address(property_data.address)}"
+                    if disambiguate
+                    else ""
+                )
                 generation_rows, _ = await async_import_measurements(
                     self.hass,
                     stat_energy_id=generation_energy_id,
                     stat_cost_id=generation_credit_id,
-                    energy_name=f"Meridian solar export — {property_data.address}",
-                    cost_name=(
-                        f"Meridian solar export credit — {property_data.address}"
-                    ),
+                    energy_name=f"Meridian grid export{suffix}",
+                    cost_name=f"Meridian grid export credit{suffix}",
                     measurements=generation_import,
                 )
                 self._known_statistics[generation_energy_id] = True
@@ -634,3 +680,8 @@ def _is_topology_error(err: MeridianGraphQLError) -> bool:
 def _local_day_start(value: date) -> datetime:
     """Return a New Zealand local date boundary as UTC."""
     return datetime.combine(value, time.min, tzinfo=_NZ).astimezone(UTC)
+
+
+def _one_line_address(value: str) -> str:
+    """Normalize a local-only property label for display."""
+    return " ".join(value.split())

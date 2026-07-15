@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import pytest
-from homeassistant.config_entries import SOURCE_REAUTH, SOURCE_USER
+from homeassistant.config_entries import SOURCE_REAUTH, SOURCE_RECONFIGURE, SOURCE_USER
 from homeassistant.const import CONF_EMAIL
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import config_validation as cv
@@ -21,13 +21,15 @@ from custom_components.meridian_energy.api import (
 )
 from custom_components.meridian_energy.config_flow import (
     MeridianEnergyConfigFlow,
-    MeridianOptionsFlow,
+    _account_label,
 )
 from custom_components.meridian_energy.const import (
+    CONF_AUTO_ADD_ACCOUNTS,
     CONF_FIREBASE_USER_ID,
     CONF_REFRESH_TOKEN,
     CONF_SELECTED_ACCOUNTS,
     DOMAIN,
+    NAME,
 )
 from custom_components.meridian_energy.models import (
     MeridianAccount,
@@ -134,8 +136,9 @@ async def test_user_flow_success(hass) -> None:
         result = await hass.config_entries.flow.async_configure(result["flow_id"])
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert result["title"] == "person@example.com"
+    assert result["title"] == NAME
     assert result["data"][CONF_REFRESH_TOKEN] == "synthetic-refresh"
+    assert result["data"][CONF_AUTO_ADD_ACCOUNTS] is True
     assert "id_token" not in result["data"]
     assert "otp" not in result["data"]
 
@@ -147,17 +150,28 @@ async def test_initial_import_failure_aborts(hass) -> None:
     flow.context = {}
     flow._email = "person@example.com"
     flow._pending_data = {CONF_EMAIL: flow._email}
-    flow._initial_import_task = hass.async_create_task(_raise_initial_import_error())
-    await asyncio.sleep(0)
-
-    result = await flow.async_step_initial_import()
+    flow._initial_statistic_ids = {"new", "existing"}
+    flow._existing_statistic_ids = {"existing"}
+    with patch(
+        "custom_components.meridian_energy.config_flow.async_clear_statistics",
+        new=AsyncMock(),
+    ) as clear:
+        flow._initial_import_task = hass.async_create_task(
+            flow._async_initial_import_with_rollback(
+                _tokens(), frozenset({"synthetic-account"})
+            )
+        )
+        with patch.object(
+            flow,
+            "_async_initial_import",
+            new=AsyncMock(side_effect=MeridianConnectionError),
+        ):
+            await asyncio.sleep(0)
+        result = await flow.async_step_initial_import()
 
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "initial_import_failed"
-
-
-async def _raise_initial_import_error() -> None:
-    raise MeridianConnectionError
+    clear.assert_awaited_once_with(hass, {"new"})
 
 
 @pytest.mark.asyncio
@@ -168,9 +182,39 @@ async def test_initial_import_and_finish_expired_guards(hass) -> None:
 
     import_result = await flow.async_step_initial_import()
     finish_result = await flow.async_step_finish()
+    start_result = await flow._start_initial_import()
+    accounts_result = await flow.async_step_accounts()
 
     assert import_result["reason"] == "login_expired"
     assert finish_result["reason"] == "login_expired"
+    assert start_result["reason"] == "login_expired"
+    assert accounts_result["reason"] == "login_expired"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_initial_import_rolls_back_new_statistics(hass) -> None:
+    flow = MeridianEnergyConfigFlow()
+    flow.hass = hass
+    flow.context = {}
+    flow._initial_statistic_ids = {"new", "existing"}
+    flow._existing_statistic_ids = {"existing"}
+    with (
+        patch.object(
+            flow,
+            "_async_initial_import",
+            new=AsyncMock(side_effect=asyncio.CancelledError),
+        ),
+        patch(
+            "custom_components.meridian_energy.config_flow.async_clear_statistics",
+            new=AsyncMock(),
+        ) as clear,
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await flow._async_initial_import_with_rollback(
+            _tokens(), frozenset({"synthetic-account"})
+        )
+
+    clear.assert_awaited_once_with(hass, {"new"})
 
 
 @pytest.mark.asyncio
@@ -497,31 +541,120 @@ async def test_multiple_accounts_are_selected_before_import(hass) -> None:
 
 
 @pytest.mark.asyncio
-async def test_options_flow_refreshes_and_saves_account_selection(hass) -> None:
+async def test_prepare_accounts_routes_multiple_accounts_to_selection(hass) -> None:
+    flow = MeridianEnergyConfigFlow()
+    flow.hass = hass
+    flow.context = {}
+    client = MagicMock()
+    client.async_get_accounts = AsyncMock(
+        return_value=(_account("first"), _account("second"))
+    )
+    with patch.object(flow, "_authenticated_client", return_value=client):
+        result = await flow._async_prepare_accounts(_tokens(), {})
+
+    assert result["step_id"] == "accounts"
+
+
+@pytest.mark.asyncio
+async def test_import_rollback_tracks_consumption_generation_and_existing(hass) -> None:
+    feed_in = _account("feed-in")
+    feed_in = MeridianAccount(
+        feed_in.number,
+        feed_in.status,
+        (
+            MeridianProperty(
+                feed_in.properties[0].id,
+                "  1 Synthetic\nStreet  ",
+                (MeridianMeterPoint("meter", "market", has_feed_in=True),),
+            ),
+        ),
+    )
+    flow = MeridianEnergyConfigFlow()
+    flow.hass = hass
+    flow.context = {}
+    flow._accounts = (feed_in, _account("ignored"))
+    flow._selected_accounts = frozenset({"feed-in"})
+    flow._tokens = _tokens()
+    flow._pending_data = {}
+
+    with patch(
+        "custom_components.meridian_energy.config_flow.async_has_statistics",
+        new=AsyncMock(side_effect=[True, False, False, False]),
+    ):
+        await flow._async_prepare_import_rollback()
+
+    assert len(flow._initial_statistic_ids) == 4
+    assert len(flow._existing_statistic_ids) == 1
+    assert _account_label(feed_in).startswith("1 Synthetic Street ·")
+
+
+@pytest.mark.asyncio
+async def test_reconfigure_refreshes_and_saves_account_selection(hass) -> None:
     entry = MockConfigEntry(
         domain=DOMAIN,
+        title=NAME,
         data={
             CONF_REFRESH_TOKEN: "refresh",
             CONF_FIREBASE_USER_ID: "user",
             CONF_SELECTED_ACCOUNTS: ["first"],
         },
     )
+    entry.add_to_hass(hass)
     client = MagicMock()
     client.async_get_accounts = AsyncMock(
         return_value=(_account("first"), _account("second"))
     )
-    flow = MeridianOptionsFlow(entry)
+    flow = MeridianEnergyConfigFlow()
     flow.hass = hass
-    flow.context = {}
+    flow.context = {"source": SOURCE_RECONFIGURE, "entry_id": entry.entry_id}
+    with (
+        patch(
+            "custom_components.meridian_energy.config_flow.MeridianApiClient",
+            return_value=client,
+        ),
+        patch.object(hass.config_entries, "async_reload", AsyncMock()),
+    ):
+        form = await flow.async_step_reconfigure()
+        invalid = await flow.async_step_reconfigure({CONF_SELECTED_ACCOUNTS: []})
+        saved = await flow.async_step_reconfigure({CONF_SELECTED_ACCOUNTS: ["second"]})
+
+    assert form["step_id"] == "reconfigure"
+    assert invalid["errors"] == {"base": "select_account"}
+    assert saved["type"] is FlowResultType.ABORT
+    assert saved["reason"] == "reconfigure_successful"
+    assert entry.data[CONF_SELECTED_ACCOUNTS] == ["second"]
+    assert entry.data[CONF_AUTO_ADD_ACCOUNTS] is False
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (MeridianConnectionError(), "cannot_connect"),
+        (MeridianAuthenticationError(), "invalid_auth"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_reconfigure_discovery_errors(hass, error, expected: str) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title=NAME,
+        data={
+            CONF_REFRESH_TOKEN: "refresh",
+            CONF_FIREBASE_USER_ID: "user",
+            CONF_SELECTED_ACCOUNTS: ["first"],
+        },
+    )
+    entry.add_to_hass(hass)
+    client = MagicMock()
+    client.async_get_accounts = AsyncMock(side_effect=error)
+    flow = MeridianEnergyConfigFlow()
+    flow.hass = hass
+    flow.context = {"source": SOURCE_RECONFIGURE, "entry_id": entry.entry_id}
     with patch(
         "custom_components.meridian_energy.config_flow.MeridianApiClient",
         return_value=client,
     ):
-        form = await flow.async_step_init()
-        invalid = await flow.async_step_init({CONF_SELECTED_ACCOUNTS: []})
-        saved = await flow.async_step_init({CONF_SELECTED_ACCOUNTS: ["second"]})
+        result = await flow.async_step_reconfigure()
 
-    assert form["step_id"] == "init"
-    assert invalid["errors"] == {"base": "select_account"}
-    assert saved["type"] is FlowResultType.CREATE_ENTRY
-    assert saved["data"] == {CONF_SELECTED_ACCOUNTS: ["second"]}
+    assert result["step_id"] == "reconfigure"
+    assert result["errors"] == {"base": expected}

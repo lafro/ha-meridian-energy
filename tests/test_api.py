@@ -30,6 +30,7 @@ from custom_components.meridian_energy.models import (
     require_list,
     require_mapping,
 )
+from custom_components.meridian_energy.parsers import optional_date
 
 
 def _tokens() -> MeridianTokenSet:
@@ -603,6 +604,7 @@ async def test_json_request_preserves_rate_limit_header_on_non_json_error() -> N
         ("invalid", 3600),
         (None, 3600),
         ("Wed, 21 Oct 2015 07:28:00 GMT", 60),
+        ("Wed, 21 Oct 2015 07:28:00", 3600),
     ],
 )
 def test_retry_after_is_parsed_and_clamped(value, expected: float) -> None:
@@ -661,6 +663,18 @@ def test_parse_firebase_tokens_rejects_missing_user_id(id_token: str) -> None:
         )
 
 
+def test_parse_firebase_tokens_rejects_non_mapping_claims() -> None:
+    claims = base64.urlsafe_b64encode(json.dumps(["not", "claims"]).encode()).decode()
+    with pytest.raises(MeridianAuthenticationError, match="user identifier"):
+        _parse_firebase_tokens(
+            {
+                "idToken": f"header.{claims.rstrip('=')}.signature",
+                "refreshToken": "refresh",
+                "expiresIn": "3600",
+            }
+        )
+
+
 def test_parse_measurement_defensive_validation() -> None:
     base = {
         "value": "invalid",
@@ -709,6 +723,17 @@ def test_parse_measurement_defensive_validation() -> None:
     }
     assert _parse_measurement(missing_cost, "CONSUMPTION").cost_cents is None
 
+    non_mapping_cost = {
+        **wrong_direction,
+        "metaData": {
+            **wrong_direction["metaData"],
+            "statistics": [
+                {"type": "CONSUMPTION_COST", "costInclTax": "not-an-object"}
+            ],
+        },
+    }
+    assert _parse_measurement(non_mapping_cost, "CONSUMPTION").cost_cents is None
+
 
 def test_parsing_helpers_reject_invalid_values() -> None:
     with pytest.raises(ValueError, match="Missing"):
@@ -720,6 +745,11 @@ def test_parsing_helpers_reject_invalid_values() -> None:
     assert _optional_string("value") == "value"
     assert _optional_string(1) is None
     assert _graphql_error_code({}) == "UNKNOWN"
+    assert optional_date(None) is None
+    with pytest.raises(ValueError, match="billing date"):
+        optional_date(1)
+    with pytest.raises(ValueError, match="billing date"):
+        optional_date("not-a-date")
     with pytest.raises(ValueError, match="object"):
         require_mapping([], "test")
     with pytest.raises(ValueError, match="list"):
