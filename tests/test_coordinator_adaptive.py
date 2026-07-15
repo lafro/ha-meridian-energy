@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from zoneinfo import ZoneInfo
 
 import pytest
+from homeassistant.core import CoreState
 from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from custom_components.meridian_energy.api import (
@@ -27,6 +28,7 @@ from custom_components.meridian_energy.models import (
     MeridianMeasurement,
     MeridianMeterPoint,
     MeridianProperty,
+    MeridianSyncData,
     SyncMode,
 )
 
@@ -214,6 +216,7 @@ async def test_billing_failure_keeps_cached_metadata(hass) -> None:
 
 @pytest.mark.asyncio
 async def test_account_results_derive_current_period_totals(hass) -> None:
+    hass.set_state(CoreState.running)
     client = MagicMock()
     client.async_get_billing_period = AsyncMock(return_value=_billing_period())
     coordinator = MeridianDataCoordinator(hass, client)
@@ -237,6 +240,51 @@ async def test_account_results_derive_current_period_totals(hass) -> None:
     assert result[0].has_feed_in is True
     assert result[0].billing_data_complete is True
     assert calculate.await_args.kwargs["include_generation"] is True
+
+
+@pytest.mark.asyncio
+async def test_account_results_defer_recorder_totals_during_startup(hass) -> None:
+    hass.set_state(CoreState.starting)
+    client = MagicMock()
+    client.async_get_billing_period = AsyncMock(return_value=_billing_period())
+    coordinator = MeridianDataCoordinator(hass, client)
+    with patch(
+        "custom_components.meridian_energy.coordinator.async_account_period_totals",
+        new=AsyncMock(),
+    ) as calculate:
+        result = await coordinator._async_account_results((_account(),), NOW)
+
+    calculate.assert_not_awaited()
+    assert result[0].billing_period == _billing_period()
+    assert result[0].current_bill_usage is None
+    assert result[0].billing_data_complete is False
+
+
+@pytest.mark.asyncio
+async def test_refresh_billing_totals_reuses_existing_sync_data(hass) -> None:
+    hass.set_state(CoreState.running)
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    coordinator._topology = (_account(),)
+    original = MeridianSyncData(
+        account_count=1,
+        property_count=1,
+        results=(),
+        account_results=(),
+        synced_at=NOW,
+        sync_mode=SyncMode.RESTART,
+        topology_refreshed=True,
+        topology_cache_age_seconds=0,
+    )
+    coordinator.data = original
+    refreshed = (MagicMock(),)
+    coordinator._async_account_results = AsyncMock(return_value=refreshed)
+
+    await coordinator.async_refresh_billing_totals()
+
+    coordinator._async_account_results.assert_awaited_once()
+    assert coordinator.data.account_results == refreshed
+    assert coordinator.data.synced_at == NOW
+    assert coordinator.data.sync_mode is SyncMode.RESTART
 
 
 @pytest.mark.asyncio

@@ -6,6 +6,8 @@ from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from homeassistant.const import EVENT_HOMEASSISTANT_STARTED
+from homeassistant.core import CoreState
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.meridian_energy import (
@@ -74,6 +76,31 @@ async def test_setup_entry_and_rotating_token_persistence(hass) -> None:
     forward.assert_awaited_once()
     assert entry.data[CONF_REFRESH_TOKEN] == "rotated-refresh"
     assert "id_token" not in entry.data
+
+
+@pytest.mark.asyncio
+async def test_setup_defers_billing_totals_until_home_assistant_started(hass) -> None:
+    hass.set_state(CoreState.starting)
+    entry = _entry()
+    entry.add_to_hass(hass)
+    coordinator = MagicMock()
+    coordinator.async_config_entry_first_refresh = AsyncMock()
+    coordinator.async_refresh_billing_totals = AsyncMock()
+
+    with (
+        patch("custom_components.meridian_energy.MeridianApiClient"),
+        patch(
+            "custom_components.meridian_energy.MeridianDataCoordinator",
+            return_value=coordinator,
+        ),
+        patch.object(hass.config_entries, "async_forward_entry_setups", AsyncMock()),
+    ):
+        await async_setup_entry(hass, entry)
+        hass.set_state(CoreState.running)
+        hass.bus.async_fire(EVENT_HOMEASSISTANT_STARTED)
+        await hass.async_block_till_done()
+
+    coordinator.async_refresh_billing_totals.assert_awaited_once()
 
 
 @pytest.mark.asyncio
