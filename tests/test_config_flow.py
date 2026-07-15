@@ -19,13 +19,22 @@ from custom_components.meridian_energy.api import (
     MeridianConnectionError,
     MeridianOtpError,
 )
-from custom_components.meridian_energy.config_flow import MeridianEnergyConfigFlow
+from custom_components.meridian_energy.config_flow import (
+    MeridianEnergyConfigFlow,
+    MeridianOptionsFlow,
+)
 from custom_components.meridian_energy.const import (
     CONF_FIREBASE_USER_ID,
     CONF_REFRESH_TOKEN,
+    CONF_SELECTED_ACCOUNTS,
     DOMAIN,
 )
-from custom_components.meridian_energy.models import MeridianTokenSet
+from custom_components.meridian_energy.models import (
+    MeridianAccount,
+    MeridianMeterPoint,
+    MeridianProperty,
+    MeridianTokenSet,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -44,17 +53,41 @@ def _tokens() -> MeridianTokenSet:
     )
 
 
+def _account(number: str = "synthetic-account") -> MeridianAccount:
+    return MeridianAccount(
+        number=number,
+        status="ACTIVE",
+        properties=(
+            MeridianProperty(
+                id=f"property-{number}",
+                address="1 Synthetic Street",
+                meter_points=(
+                    MeridianMeterPoint(
+                        id=f"meter-{number}",
+                        market_identifier=f"icp-{number}",
+                        has_feed_in=False,
+                    ),
+                ),
+            ),
+        ),
+    )
+
+
 @pytest.mark.asyncio
 async def test_user_flow_success(hass) -> None:
     client = MagicMock()
     client.async_send_otp = AsyncMock()
     client.async_validate_otp = AsyncMock(return_value=_tokens())
+    client.async_get_accounts = AsyncMock(return_value=(_account(),))
 
     import_started = asyncio.Event()
     finish_import = asyncio.Event()
 
-    async def initial_import(tokens: MeridianTokenSet) -> None:
+    async def initial_import(
+        tokens: MeridianTokenSet, selected_accounts: frozenset[str]
+    ) -> None:
         assert tokens.refresh_token == "synthetic-refresh"
+        assert selected_accounts == {"synthetic-account"}
         import_started.set()
         await finish_import.wait()
 
@@ -69,6 +102,11 @@ async def test_user_flow_success(hass) -> None:
             MeridianEnergyConfigFlow,
             "_async_initial_import",
             side_effect=initial_import,
+        ),
+        patch.object(
+            MeridianEnergyConfigFlow,
+            "_authenticated_client",
+            return_value=client,
         ),
     ):
         result = await hass.config_entries.flow.async_init(
@@ -148,11 +186,14 @@ async def test_initial_import_uses_authenticated_coordinator(hass) -> None:
         flow = MeridianEnergyConfigFlow()
         flow.hass = hass
         flow.context = {}
-        await flow._async_initial_import(tokens)
+        await flow._async_initial_import(tokens, frozenset({"synthetic-account"}))
 
     client = coordinator_class.call_args.args[1]
     assert client.tokens == tokens
     coordinator.async_fetch_and_import.assert_awaited_once()
+    assert coordinator_class.call_args.kwargs["selected_accounts"] == {
+        "synthetic-account"
+    }
 
 
 @pytest.mark.asyncio
@@ -393,3 +434,94 @@ async def test_client_property_uses_home_assistant_session(hass) -> None:
     flow = MeridianEnergyConfigFlow()
     flow.hass = hass
     assert flow._client is not None
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (MeridianConnectionError(), "cannot_connect"),
+        (MeridianAuthenticationError(), "invalid_auth"),
+        (ValueError(), "invalid_auth"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_account_discovery_errors_return_to_otp(
+    hass, error: Exception, expected: str
+) -> None:
+    flow = MeridianEnergyConfigFlow()
+    flow.hass = hass
+    flow.context = {}
+    flow._email = "person@example.com"
+    flow._journey_id = "journey"
+    client = MagicMock()
+    client.async_get_accounts = AsyncMock(side_effect=error)
+    with patch.object(flow, "_authenticated_client", return_value=client):
+        result = await flow._async_prepare_accounts(_tokens(), {})
+    assert result["step_id"] == "otp"
+    assert result["errors"] == {"base": expected}
+
+
+@pytest.mark.asyncio
+async def test_account_discovery_aborts_when_none_are_available(hass) -> None:
+    flow = MeridianEnergyConfigFlow()
+    flow.hass = hass
+    flow.context = {}
+    client = MagicMock()
+    client.async_get_accounts = AsyncMock(return_value=())
+    with patch.object(flow, "_authenticated_client", return_value=client):
+        result = await flow._async_prepare_accounts(_tokens(), {})
+    assert result["reason"] == "no_accounts"
+
+
+@pytest.mark.asyncio
+async def test_multiple_accounts_are_selected_before_import(hass) -> None:
+    flow = MeridianEnergyConfigFlow()
+    flow.hass = hass
+    flow.context = {}
+    flow._tokens = _tokens()
+    flow._pending_data = {}
+    flow._accounts = (_account("first"), _account("second"))
+
+    form = await flow.async_step_accounts()
+    invalid = await flow.async_step_accounts({CONF_SELECTED_ACCOUNTS: []})
+    with patch.object(
+        flow, "_start_initial_import", new=AsyncMock(return_value={"started": True})
+    ) as start:
+        result = await flow.async_step_accounts({CONF_SELECTED_ACCOUNTS: ["second"]})
+
+    assert form["step_id"] == "accounts"
+    assert invalid["errors"] == {"base": "select_account"}
+    assert result == {"started": True}
+    assert flow._selected_accounts == {"second"}
+    start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_options_flow_refreshes_and_saves_account_selection(hass) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            CONF_REFRESH_TOKEN: "refresh",
+            CONF_FIREBASE_USER_ID: "user",
+            CONF_SELECTED_ACCOUNTS: ["first"],
+        },
+    )
+    client = MagicMock()
+    client.async_get_accounts = AsyncMock(
+        return_value=(_account("first"), _account("second"))
+    )
+    flow = MeridianOptionsFlow(entry)
+    flow.hass = hass
+    flow.context = {}
+    with patch(
+        "custom_components.meridian_energy.config_flow.MeridianApiClient",
+        return_value=client,
+    ):
+        form = await flow.async_step_init()
+        invalid = await flow.async_step_init({CONF_SELECTED_ACCOUNTS: []})
+        saved = await flow.async_step_init({CONF_SELECTED_ACCOUNTS: ["second"]})
+
+    assert form["step_id"] == "init"
+    assert invalid["errors"] == {"base": "select_account"}
+    assert saved["type"] is FlowResultType.CREATE_ENTRY
+    assert saved["data"] == {CONF_SELECTED_ACCOUNTS: ["second"]}

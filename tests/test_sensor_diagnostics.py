@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, timedelta
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -19,11 +21,40 @@ from custom_components.meridian_energy.diagnostics import (
     async_get_config_entry_diagnostics,
 )
 from custom_components.meridian_energy.models import (
+    AccountSyncResult,
+    MeridianAccount,
+    MeridianBillingPeriod,
+    MeridianMeterPoint,
+    MeridianProperty,
     MeridianSyncData,
     PropertySyncResult,
     SyncMode,
 )
 from custom_components.meridian_energy.sensor import async_setup_entry
+from custom_components.meridian_energy.statistics import account_key
+
+ACCOUNT_NUMBER = "synthetic-account"
+ACCOUNT_KEY = account_key(ACCOUNT_NUMBER)
+
+
+def _account() -> MeridianAccount:
+    return MeridianAccount(
+        number=ACCOUNT_NUMBER,
+        status="ACTIVE",
+        properties=(
+            MeridianProperty(
+                id="synthetic-property",
+                address="1 Synthetic Street",
+                meter_points=(
+                    MeridianMeterPoint(
+                        id="synthetic-meter",
+                        market_identifier="synthetic-icp",
+                        has_feed_in=False,
+                    ),
+                ),
+            ),
+        ),
+    )
 
 
 def _data() -> MeridianSyncData:
@@ -34,6 +65,7 @@ def _data() -> MeridianSyncData:
         results=(
             PropertySyncResult(
                 property_key="hashed-key",
+                account_key=ACCOUNT_KEY,
                 consumption_rows=24,
                 generation_rows=0,
                 latest_reading=reading,
@@ -50,6 +82,26 @@ def _data() -> MeridianSyncData:
                 newest_estimated=reading,
                 quality_counts=(("ACTUAL", 22), ("ESTIMATE", 2)),
                 observed_rows_per_hour=1.0,
+            ),
+        ),
+        account_results=(
+            AccountSyncResult(
+                account_key=ACCOUNT_KEY,
+                billing_period=MeridianBillingPeriod(
+                    period_length="MONTHLY",
+                    period_length_multiplier=1,
+                    is_fixed=True,
+                    start=date(2026, 7, 1),
+                    end=date(2026, 7, 31),
+                    next_billing_date=date(2026, 8, 1),
+                    period_start_day=1,
+                ),
+                current_bill_usage=Decimal("123.4"),
+                current_bill_cost=Decimal("45.67"),
+                current_bill_export=None,
+                current_bill_credit=None,
+                has_feed_in=False,
+                billing_data_complete=True,
             ),
         ),
         synced_at=datetime.now(UTC),
@@ -78,16 +130,28 @@ def _entry(coordinator) -> MockConfigEntry:
 @pytest.mark.asyncio
 async def test_sensor_values_and_device_identifier_are_redacted(hass) -> None:
     coordinator = MeridianDataCoordinator(hass, MagicMock())
+    coordinator._topology = (_account(),)
     coordinator.data = _data()
     entry = _entry(coordinator)
     entities = []
 
     await async_setup_entry(hass, entry, entities.extend)
 
-    assert len(entities) == 3
+    assert len(entities) == 8
     assert entities[0].native_value == coordinator.data.synced_at
     assert entities[1].native_value == coordinator.data.results[0].latest_reading
     assert entities[2].native_value == 2
+    assert entities[3].native_value == Decimal("123.4")
+    assert entities[4].native_value == Decimal("45.67")
+    assert entities[5].native_value == date(2026, 7, 1)
+    assert entities[6].native_value == date(2026, 7, 31)
+    assert entities[7].native_value == date(2026, 8, 1)
+    assert entities[3].extra_state_attributes == {
+        "billing_period_start": date(2026, 7, 1),
+        "billing_period_end": date(2026, 7, 31),
+        "next_billing_date": date(2026, 8, 1),
+        "data_complete": True,
+    }
     assert entities[2].extra_state_attributes == {
         "oldest_provisional_interval": coordinator.data.results[0].oldest_estimated,
         "newest_provisional_interval": coordinator.data.results[0].newest_estimated,
@@ -98,14 +162,51 @@ async def test_sensor_values_and_device_identifier_are_redacted(hass) -> None:
     assert entities[0].extra_state_attributes is None
     identifiers = entities[0].device_info["identifiers"]
     assert "private-user" not in str(identifiers)
-    assert entities[0].device_info["name"] == "Meridian Energy account"
-    assert entities[0].device_info["model"] == "MyMeridian account"
-    assert [entity.entity_description.translation_key for entity in entities] == [
+    assert entities[0].device_info["name"] == "Meridian Energy"
+    assert entities[0].device_info["model"] == "Electricity account"
+    assert [entity.entity_description.translation_key for entity in entities[:3]] == [
         "last_sync",
         "latest_meter_data",
         "estimated_readings",
     ]
     assert all(not hasattr(entity, "_attr_name") for entity in entities)
+
+
+@pytest.mark.asyncio
+async def test_solar_entities_and_multiple_account_device_name(hass) -> None:
+    account = _account()
+    solar_meter = replace(account.properties[0].meter_points[0], has_feed_in=True)
+    account = replace(
+        account,
+        properties=(replace(account.properties[0], meter_points=(solar_meter,)),),
+    )
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    second = replace(_account(), number="second-account")
+    coordinator._topology = (account, second)
+    data = _data()
+    coordinator.data = replace(
+        data,
+        account_results=(
+            replace(
+                data.account_results[0],
+                has_feed_in=True,
+                current_bill_export=Decimal(10),
+                current_bill_credit=Decimal(2),
+            ),
+            replace(
+                data.account_results[0],
+                account_key=account_key("second-account"),
+            ),
+        ),
+    )
+    entities = []
+
+    await async_setup_entry(hass, _entry(coordinator), entities.extend)
+
+    assert len(entities) == 18
+    assert entities[5].native_value == Decimal(10)
+    assert entities[6].native_value == Decimal(2)
+    assert entities[0].device_info["name"] == "Meridian Energy — 1 Synthetic Street"
 
 
 @pytest.mark.asyncio

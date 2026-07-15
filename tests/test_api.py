@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -304,6 +304,73 @@ async def test_get_account_skips_null_meter_point() -> None:
     )
     account = await client._async_get_account("A-TEST")
     assert account.properties[0].meter_points == ()
+
+
+@pytest.mark.asyncio
+async def test_get_billing_period_parses_supported_metadata() -> None:
+    client = MeridianApiClient(MagicMock(), tokens=_tokens())
+    client._async_graphql = AsyncMock(
+        return_value={
+            "account": {
+                "billingOptions": {
+                    "periodLength": "MONTHLY",
+                    "periodLengthMultiplier": 1,
+                    "isFixed": True,
+                    "currentBillingPeriodStartDate": "2026-07-20",
+                    "currentBillingPeriodEndDate": "2026-08-19",
+                    "nextBillingDate": "2026-08-20",
+                    "periodStartDay": 20,
+                }
+            }
+        }
+    )
+
+    result = await client.async_get_billing_period("A-TEST")
+
+    assert result.start == date(2026, 7, 20)
+    assert result.end == date(2026, 8, 19)
+    assert result.next_billing_date == date(2026, 8, 20)
+    assert result.period_length == "MONTHLY"
+    assert result.period_length_multiplier == 1
+    assert result.is_fixed is True
+    assert result.period_start_day == 20
+    assert client._async_graphql.await_args.args[0] == "billingPeriods"
+    assert client._async_graphql.await_args.args[2] == {"accountNumber": "A-TEST"}
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("periodLength", "WEEKLY", "period length"),
+        ("periodLengthMultiplier", 0, "multiplier"),
+        ("periodLengthMultiplier", True, "multiplier"),
+        ("periodStartDay", 0, "start day"),
+        ("periodStartDay", True, "start day"),
+        ("isFixed", "yes", "fixed"),
+        ("currentBillingPeriodStartDate", "not-a-date", "date"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_get_billing_period_rejects_invalid_metadata(
+    field: str, value: object, message: str
+) -> None:
+    options = {
+        "periodLength": "MONTHLY",
+        "periodLengthMultiplier": 1,
+        "isFixed": True,
+        "currentBillingPeriodStartDate": "2026-07-20",
+        "currentBillingPeriodEndDate": "2026-08-19",
+        "nextBillingDate": None,
+        "periodStartDay": 20,
+    }
+    options[field] = value
+    client = MeridianApiClient(MagicMock(), tokens=_tokens())
+    client._async_graphql = AsyncMock(
+        return_value={"account": {"billingOptions": options}}
+    )
+
+    with pytest.raises(ValueError, match=message):
+        await client.async_get_billing_period("A-TEST")
 
 
 @pytest.mark.asyncio
@@ -640,7 +707,7 @@ def test_parse_measurement_defensive_validation() -> None:
             ],
         },
     }
-    assert _parse_measurement(missing_cost, "CONSUMPTION").cost_cents == 0
+    assert _parse_measurement(missing_cost, "CONSUMPTION").cost_cents is None
 
 
 def test_parsing_helpers_reject_invalid_values() -> None:

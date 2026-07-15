@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import math
 from collections import Counter
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from homeassistant.config_entries import ConfigEntry, ConfigEntryAuthFailed
@@ -21,6 +21,7 @@ from .api import (
     MeridianRateLimitError,
 )
 from .const import (
+    BILLING_CACHE_INTERVAL,
     FULL_RECONCILIATION_INTERVAL,
     INITIAL_BACKFILL,
     MAX_MEASUREMENT_PAGES,
@@ -38,8 +39,10 @@ from .const import (
     UPDATE_INTERVAL,
 )
 from .models import (
+    AccountSyncResult,
     MeasurementFetchResult,
     MeridianAccount,
+    MeridianBillingPeriod,
     MeridianMeasurement,
     MeridianProperty,
     MeridianSyncData,
@@ -47,6 +50,8 @@ from .models import (
     SyncMode,
 )
 from .statistics import (
+    account_key,
+    async_account_period_totals,
     async_has_statistics,
     async_import_measurements,
     consumption_ids,
@@ -79,6 +84,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         client: MeridianApiClient,
         *,
         config_entry: ConfigEntry | None = None,
+        selected_accounts: frozenset[str] | None = None,
     ) -> None:
         super().__init__(
             hass,
@@ -88,8 +94,11 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             update_interval=UPDATE_INTERVAL,
         )
         self.client = client
+        self._selected_accounts = selected_accounts
         self._topology: tuple[MeridianAccount, ...] | None = None
         self._topology_cached_at: datetime | None = None
+        self._billing_periods: dict[str, MeridianBillingPeriod] = {}
+        self._billing_cached_at: dict[str, datetime] = {}
         self._measurement_cache: dict[
             CacheKey, dict[MeasurementKey, MeridianMeasurement]
         ] = {}
@@ -98,6 +107,11 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         self._initial_refresh_complete = False
         self._last_targeted_reconciliation: datetime | None = None
         self._last_full_reconciliation: datetime | None = None
+
+    @property
+    def accounts(self) -> tuple[MeridianAccount, ...]:
+        """Return the selected, cached account topology."""
+        return self._filtered_topology()
 
     async def _async_update_data(self) -> MeridianSyncData:
         return await self.async_fetch_and_import()
@@ -123,6 +137,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 )
                 results = await self._async_sync_accounts(accounts, mode, now)
 
+            account_results = await self._async_account_results(accounts, now)
+
             self._initial_refresh_complete = True
             if mode in {SyncMode.INITIAL, SyncMode.RESTART}:
                 self._last_targeted_reconciliation = now
@@ -137,6 +153,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 account_count=len(accounts),
                 property_count=sum(len(account.properties) for account in accounts),
                 results=results,
+                account_results=account_results,
                 synced_at=now,
                 sync_mode=mode,
                 topology_refreshed=topology_refreshed,
@@ -180,8 +197,23 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         if force or self._topology is None or expired:
             self._topology = await self.client.async_get_accounts()
             self._topology_cached_at = now
-            return self._topology, True
-        return self._topology, False
+            return self._filtered_topology(), True
+        return self._filtered_topology(), False
+
+    def _filtered_topology(self) -> tuple[MeridianAccount, ...]:
+        """Return only accounts explicitly selected for this config entry."""
+        if self._topology is None:
+            return ()
+        if self._selected_accounts is None:
+            return self._topology
+        selected = tuple(
+            account
+            for account in self._topology
+            if account.number in self._selected_accounts
+        )
+        if not selected:
+            raise ValueError("None of the selected Meridian accounts are available")
+        return selected
 
     async def _async_startup_mode(
         self, accounts: tuple[MeridianAccount, ...]
@@ -222,6 +254,79 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                     )
                 )
         return tuple(results)
+
+    async def _async_account_results(
+        self, accounts: tuple[MeridianAccount, ...], now: datetime
+    ) -> tuple[AccountSyncResult, ...]:
+        """Build account-scoped billing totals from imported HA statistics."""
+        results: list[AccountSyncResult] = []
+        for account in accounts:
+            billing_period = await self._async_billing_period(account.number, now)
+            has_feed_in = any(
+                meter.has_feed_in
+                for property_data in account.properties
+                for meter in property_data.meter_points
+            )
+            usage = cost = exported = credit = None
+            complete = False
+            if (
+                billing_period is not None
+                and billing_period.start is not None
+                and billing_period.end is not None
+            ):
+                start = _local_day_start(billing_period.start)
+                end = min(_local_day_start(billing_period.end + timedelta(days=1)), now)
+                if start < end:
+                    totals = await async_account_period_totals(
+                        self.hass,
+                        property_keys=tuple(
+                            property_key(account.number, item.id)
+                            for item in account.properties
+                        ),
+                        start=start,
+                        end=end,
+                        include_generation=has_feed_in,
+                    )
+                    usage = totals.usage
+                    cost = totals.cost
+                    exported = totals.export
+                    credit = totals.credit
+                    complete = totals.complete
+            results.append(
+                AccountSyncResult(
+                    account_key=account_key(account.number),
+                    billing_period=billing_period,
+                    current_bill_usage=usage,
+                    current_bill_cost=cost,
+                    current_bill_export=exported,
+                    current_bill_credit=credit,
+                    has_feed_in=has_feed_in,
+                    billing_data_complete=complete,
+                )
+            )
+        return tuple(results)
+
+    async def _async_billing_period(
+        self, account_number: str, now: datetime
+    ) -> MeridianBillingPeriod | None:
+        """Return cached current billing metadata without blocking energy syncs."""
+        cached_at = self._billing_cached_at.get(account_number)
+        cached = self._billing_periods.get(account_number)
+        local_today = now.astimezone(_NZ).date()
+        expired = cached_at is None or now - cached_at >= BILLING_CACHE_INTERVAL
+        period_ended = (
+            cached is not None and cached.end is not None and (local_today > cached.end)
+        )
+        if cached is not None and not expired and not period_ended:
+            return cached
+        try:
+            billing = await self.client.async_get_billing_period(account_number)
+        except (MeridianConnectionError, MeridianGraphQLError, ValueError) as err:
+            _LOGGER.warning("Unable to refresh Meridian billing metadata: %s", err)
+            return cached
+        self._billing_periods[account_number] = billing
+        self._billing_cached_at[account_number] = now
+        return billing
 
     async def _async_sync_property(
         self,
@@ -317,10 +422,12 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         )
         return PropertySyncResult(
             property_key=key,
+            account_key=account_key(account_number),
             consumption_rows=consumption_rows,
             generation_rows=generation_rows,
             latest_reading=max(
-                (item.start for item in consumption_cache.values()), default=None
+                ((item.end or item.start) for item in consumption_cache.values()),
+                default=None,
             ),
             estimated_rows=len(provisional),
             sync_mode=mode,
@@ -513,3 +620,8 @@ def _empty_fetch() -> MeasurementFetchResult:
 
 def _is_topology_error(err: MeridianGraphQLError) -> bool:
     return bool(_TOPOLOGY_ERROR_CODES.intersection(err.codes))
+
+
+def _local_day_start(value: date) -> datetime:
+    """Return a New Zealand local date boundary as UTC."""
+    return datetime.combine(value, time.min, tzinfo=_NZ).astimezone(UTC)

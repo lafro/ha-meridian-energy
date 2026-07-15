@@ -7,6 +7,7 @@ NAME = "Meridian Energy"
 
 CONF_REFRESH_TOKEN = "refresh_token"
 CONF_FIREBASE_USER_ID = "firebase_user_id"
+CONF_SELECTED_ACCOUNTS = "selected_accounts"
 
 AUTH_EMAIL_URL = "https://auth.meridianenergy.nz/cf/email-connector"
 AUTH_OTP_URL = "https://auth.meridianenergy.nz/cf/email-otp-authenticator"
@@ -23,13 +24,14 @@ CLIENT_PLATFORM = "web"
 REQUEST_TIMEOUT_SECONDS = 30
 
 UPDATE_INTERVAL = timedelta(hours=1)
-INITIAL_BACKFILL = timedelta(days=365)
+INITIAL_BACKFILL = timedelta(days=90)
 REVISION_OVERLAP = timedelta(days=14)
 TIP_WINDOW = timedelta(hours=24)
 TARGETED_RECONCILIATION_MINIMUM = timedelta(hours=48)
 TARGETED_RECONCILIATION_INTERVAL = timedelta(days=1)
 FULL_RECONCILIATION_INTERVAL = timedelta(days=7)
 TOPOLOGY_CACHE_INTERVAL = timedelta(days=1)
+BILLING_CACHE_INTERVAL = timedelta(days=1)
 RECONCILIATION_SAFETY_MARGIN = timedelta(hours=6)
 PAGE_SIZE = 744
 MIN_PAGE_SIZE = 24

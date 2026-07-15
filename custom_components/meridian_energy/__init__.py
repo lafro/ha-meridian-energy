@@ -11,11 +11,16 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
 from .api import MeridianApiClient
-from .const import CONF_FIREBASE_USER_ID, CONF_REFRESH_TOKEN
+from .const import (
+    CONF_FIREBASE_USER_ID,
+    CONF_REFRESH_TOKEN,
+    CONF_SELECTED_ACCOUNTS,
+)
 from .coordinator import MeridianDataCoordinator
 from .models import MeridianTokenSet
 
 PLATFORMS = [Platform.SENSOR]
+CONFIG_ENTRY_VERSION = 2
 
 
 @dataclass(slots=True)
@@ -58,9 +63,33 @@ async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> 
         tokens=tokens,
         token_update_callback=async_store_tokens,
     )
-    coordinator = MeridianDataCoordinator(hass, client, config_entry=entry)
+    configured_accounts = entry.options.get(
+        CONF_SELECTED_ACCOUNTS, entry.data.get(CONF_SELECTED_ACCOUNTS)
+    )
+    selected_accounts = (
+        frozenset(str(value) for value in configured_accounts)
+        if configured_accounts is not None
+        else None
+    )
+    coordinator = MeridianDataCoordinator(
+        hass,
+        client,
+        config_entry=entry,
+        selected_accounts=selected_accounts,
+    )
     await coordinator.async_config_entry_first_refresh()
+    if configured_accounts is None:
+        hass.config_entries.async_update_entry(
+            entry,
+            data={
+                **entry.data,
+                CONF_SELECTED_ACCOUNTS: sorted(
+                    account.number for account in coordinator.accounts
+                ),
+            },
+        )
     entry.runtime_data = MeridianRuntimeData(client, coordinator)
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True
 
@@ -71,6 +100,17 @@ async def async_unload_entry(hass: HomeAssistant, entry: MeridianConfigEntry) ->
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Migrate future config-entry formats without unsafe implicit conversion."""
-    del hass
-    return entry.version == 1
+    """Migrate legacy entries; account selection is populated at next setup."""
+    if entry.version == 1:
+        hass.config_entries.async_update_entry(
+            entry, version=CONFIG_ENTRY_VERSION, minor_version=0
+        )
+        return True
+    return entry.version == CONFIG_ENTRY_VERSION
+
+
+async def _async_update_listener(
+    hass: HomeAssistant, entry: MeridianConfigEntry
+) -> None:
+    """Reload the integration when selected accounts change."""
+    await hass.config_entries.async_reload(entry.entry_id)

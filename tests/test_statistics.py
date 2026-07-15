@@ -13,6 +13,7 @@ from custom_components.meridian_energy.statistics import (
     _aggregate_measurements,
     _async_baseline_sum,
     _timestamp,
+    async_account_period_totals,
     async_has_statistics,
     async_import_measurements,
     consumption_ids,
@@ -186,3 +187,98 @@ def test_statistic_identifier_helpers() -> None:
     now = datetime.now(UTC)
     assert _timestamp(now) == now.timestamp()
     assert _timestamp(1.5) == 1.5
+
+
+@pytest.mark.asyncio
+async def test_account_period_totals_combines_properties_and_generation() -> None:
+    start = datetime(2026, 7, 1, tzinfo=UTC)
+    end = start + timedelta(hours=2)
+    first_consumption, first_cost = consumption_ids("first")
+    second_consumption, second_cost = consumption_ids("second")
+    first_generation, first_credit = generation_ids("first")
+    instance = MagicMock()
+    instance.async_block_till_done = AsyncMock()
+    instance.async_add_executor_job = AsyncMock(
+        return_value={
+            first_consumption: [
+                {"start": start.timestamp(), "change": 1.0},
+                {"start": (start + timedelta(hours=1)).timestamp(), "change": 2.0},
+            ],
+            first_cost: [
+                {"start": start.timestamp(), "change": 0.3},
+                {"start": (start + timedelta(hours=1)).timestamp(), "change": 0.6},
+            ],
+            second_consumption: [{"start": start.timestamp(), "change": 4.0}],
+            second_cost: [{"start": start.timestamp(), "change": 1.2}],
+            first_generation: [{"start": start.timestamp(), "change": 0.5}],
+            first_credit: [{"start": start.timestamp(), "change": 0.1}],
+        }
+    )
+    with patch(
+        "custom_components.meridian_energy.statistics.get_instance",
+        return_value=instance,
+    ):
+        result = await async_account_period_totals(
+            AsyncMock(),
+            property_keys=("first", "second"),
+            start=start,
+            end=end,
+            include_generation=True,
+        )
+
+    assert result.usage == Decimal("7.0")
+    assert result.cost == Decimal("2.1")
+    assert result.export == Decimal("0.5")
+    assert result.credit == Decimal("0.1")
+    assert result.complete is True
+    instance.async_block_till_done.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_account_period_totals_withholds_incomplete_cost_and_history() -> None:
+    start = datetime(2026, 7, 1, tzinfo=UTC)
+    end = start + timedelta(hours=2)
+    energy_id, cost_id = consumption_ids("first")
+    instance = MagicMock()
+    instance.async_block_till_done = AsyncMock()
+    instance.async_add_executor_job = AsyncMock(
+        return_value={
+            energy_id: [
+                {
+                    "start": (start + timedelta(hours=1)).timestamp(),
+                    "change": 2.0,
+                }
+            ],
+            cost_id: [],
+        }
+    )
+    with patch(
+        "custom_components.meridian_energy.statistics.get_instance",
+        return_value=instance,
+    ):
+        result = await async_account_period_totals(
+            AsyncMock(),
+            property_keys=("first",),
+            start=start,
+            end=end,
+            include_generation=False,
+        )
+
+    assert result.usage is None
+    assert result.cost is None
+    assert result.complete is False
+
+
+def test_aggregate_marks_hourly_cost_incomplete() -> None:
+    start = datetime(2026, 7, 1, tzinfo=UTC)
+    missing = _measurement(start, "1", "1")
+    missing = MeridianMeasurement(
+        start=missing.start,
+        end=missing.end,
+        value_kwh=missing.value_kwh,
+        quality=missing.quality,
+        direction=missing.direction,
+        channel_id=missing.channel_id,
+        cost_cents=None,
+    )
+    assert _aggregate_measurements([missing])[start] == (Decimal(1), None)

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
 from typing import Any
@@ -57,6 +57,19 @@ class MeridianAccount:
 
 
 @dataclass(frozen=True, slots=True)
+class MeridianBillingPeriod:
+    """Billing-cycle metadata for one Meridian account."""
+
+    period_length: str | None
+    period_length_multiplier: int | None
+    is_fixed: bool
+    start: date | None
+    end: date | None
+    next_billing_date: date | None
+    period_start_day: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class MeridianMeasurement:
     """One interval measurement returned by Meridian."""
 
@@ -66,7 +79,7 @@ class MeridianMeasurement:
     quality: str
     direction: str
     channel_id: str
-    cost_cents: Decimal
+    cost_cents: Decimal | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +106,7 @@ class PropertySyncResult:
     """Non-sensitive summary of a property sync."""
 
     property_key: str
+    account_key: str
     consumption_rows: int
     generation_rows: int
     latest_reading: datetime | None
@@ -112,12 +126,38 @@ class PropertySyncResult:
 
 
 @dataclass(frozen=True, slots=True)
+class AccountSyncResult:
+    """Non-sensitive billing and sync summary for one selected account."""
+
+    account_key: str
+    billing_period: MeridianBillingPeriod | None
+    current_bill_usage: Decimal | None
+    current_bill_cost: Decimal | None
+    current_bill_export: Decimal | None
+    current_bill_credit: Decimal | None
+    has_feed_in: bool
+    billing_data_complete: bool
+
+
+@dataclass(frozen=True, slots=True)
+class BillingPeriodTotals:
+    """Account totals derived from timestamped Home Assistant statistics."""
+
+    usage: Decimal | None
+    cost: Decimal | None
+    export: Decimal | None
+    credit: Decimal | None
+    complete: bool
+
+
+@dataclass(frozen=True, slots=True)
 class MeridianSyncData:
     """Non-sensitive coordinator result."""
 
     account_count: int
     property_count: int
     results: tuple[PropertySyncResult, ...]
+    account_results: tuple[AccountSyncResult, ...]
     synced_at: datetime
     sync_mode: SyncMode
     topology_refreshed: bool
