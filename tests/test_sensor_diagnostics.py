@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from homeassistant.components.sensor import SensorDeviceClass, SensorStateClass
+from homeassistant.const import EntityCategory, UnitOfEnergy
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
@@ -32,6 +34,7 @@ from custom_components.meridian_energy.models import (
     SyncMode,
 )
 from custom_components.meridian_energy.sensor import (
+    DESCRIPTIONS,
     _remove_stale_devices,
     async_setup_entry,
 )
@@ -39,6 +42,66 @@ from custom_components.meridian_energy.statistics import account_key
 
 ACCOUNT_NUMBER = "synthetic-account"
 ACCOUNT_KEY = account_key(ACCOUNT_NUMBER)
+
+
+def test_sensor_descriptions_follow_home_assistant_semantics() -> None:
+    """Lock the audited entity contract to Home Assistant sensor semantics."""
+    descriptions = {description.key: description for description in DESCRIPTIONS}
+
+    assert set(descriptions) == {
+        "last_sync",
+        "latest_meter_data",
+        "estimated_readings",
+        "current_bill_usage",
+        "current_bill_cost",
+        "current_bill_export",
+        "current_bill_credit",
+        "billing_period_start",
+        "billing_period_end",
+        "next_billing_date",
+    }
+
+    for key in ("last_sync", "latest_meter_data"):
+        description = descriptions[key]
+        assert description.device_class is SensorDeviceClass.TIMESTAMP
+        assert description.entity_category is EntityCategory.DIAGNOSTIC
+        assert description.state_class is None
+
+    provisional = descriptions["estimated_readings"]
+    assert provisional.device_class is None
+    assert provisional.native_unit_of_measurement is None
+    assert provisional.state_class is SensorStateClass.MEASUREMENT
+    assert provisional.suggested_display_precision == 0
+    assert provisional.entity_category is EntityCategory.DIAGNOSTIC
+
+    for key in ("current_bill_usage", "current_bill_export"):
+        description = descriptions[key]
+        assert description.device_class is SensorDeviceClass.ENERGY
+        assert description.native_unit_of_measurement is UnitOfEnergy.KILO_WATT_HOUR
+        assert description.state_class is SensorStateClass.TOTAL
+        assert description.suggested_display_precision == 1
+
+    for key in ("current_bill_cost", "current_bill_credit"):
+        description = descriptions[key]
+        assert description.device_class is SensorDeviceClass.MONETARY
+        assert description.native_unit_of_measurement == "NZD"
+        assert description.state_class is SensorStateClass.TOTAL
+        assert description.suggested_display_precision == 2
+
+    for key in ("billing_period_start", "billing_period_end", "next_billing_date"):
+        description = descriptions[key]
+        assert description.device_class is SensorDeviceClass.DATE
+        assert description.entity_category is EntityCategory.DIAGNOSTIC
+        assert description.entity_registry_enabled_default is False
+        assert description.state_class is None
+
+    assert descriptions["current_bill_export"].conditional_feed_in is True
+    assert descriptions["current_bill_credit"].conditional_feed_in is True
+    assert all(
+        not description.conditional_feed_in
+        for key, description in descriptions.items()
+        if key not in {"current_bill_export", "current_bill_credit"}
+    )
 
 
 def _account() -> MeridianAccount:
