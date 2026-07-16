@@ -378,9 +378,18 @@ class TestPublicConfigEntryLifecycle:
             assert len(first_coordinator._listeners) == 8
 
             registry = er.async_get(hass)
-            assert (
-                len(er.async_entries_for_config_entry(registry, entry.entry_id)) == 10
+            entry_entities = er.async_entries_for_config_entry(registry, entry.entry_id)
+            assert len(entry_entities) == 10
+            provisional_entry = next(
+                item
+                for item in entry_entities
+                if item.unique_id.endswith("_estimated_readings")
             )
+            provisional_state = hass.states.get(provisional_entry.entity_id)
+            assert provisional_state is not None
+            assert provisional_state.state == "0"
+            assert provisional_state.attributes["state_class"] == "measurement"
+            assert "unit_of_measurement" not in provisional_state.attributes
 
             topology["feed_in"] = False
             assert await hass.config_entries.async_reload(entry.entry_id)

@@ -71,6 +71,8 @@ DESCRIPTIONS = (
         key="estimated_readings",
         translation_key="estimated_readings",
         entity_category=EntityCategory.DIAGNOSTIC,
+        state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=0,
         value_fn=lambda data, key: sum(
             item.estimated_rows for item in data.results if item.account_key == key
         ),
