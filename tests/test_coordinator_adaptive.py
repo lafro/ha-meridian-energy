@@ -670,6 +670,29 @@ def test_merge_replays_from_change_and_protects_actual(hass) -> None:
     assert expired not in coordinator._measurement_cache[CACHE_KEY].values()
 
 
+@pytest.mark.parametrize(
+    ("cached_channel", "incoming_channel"),
+    [
+        ("aggregate", "identified-channel"),
+        ("identified-channel", "different-identified-channel"),
+    ],
+)
+def test_merge_rejects_channel_identity_drift(
+    hass, cached_channel: str, incoming_channel: str
+) -> None:
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    start = NOW - timedelta(hours=1)
+    cached = _measurement(start, channel=cached_channel)
+    coordinator._merge_measurements(CACHE_KEY, (cached,), NOW, initial_import=True)
+
+    with pytest.raises(ValueError, match="identity changed"):
+        coordinator._merge_measurements(
+            CACHE_KEY,
+            (_measurement(start, channel=incoming_channel),),
+            NOW,
+        )
+
+
 @pytest.mark.asyncio
 async def test_direction_mode_uses_cached_statistic_state(hass) -> None:
     coordinator = MeridianDataCoordinator(hass, MagicMock())

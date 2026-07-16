@@ -24,6 +24,7 @@ from .api import (
     MeridianRateLimitError,
 )
 from .const import (
+    AGGREGATE_CHANNEL_ID,
     BILLING_CACHE_INTERVAL,
     CONF_AUTO_ADD_ACCOUNTS,
     CONF_SELECTED_ACCOUNTS,
@@ -74,6 +75,25 @@ _TOPOLOGY_ERROR_CODES = frozenset(
 
 MeasurementKey = tuple[datetime, str]
 CacheKey = tuple[str, str]
+
+
+def _validate_channel_identity_continuity(
+    cache: dict[MeasurementKey, MeridianMeasurement],
+    incoming: tuple[MeridianMeasurement, ...],
+    cutoff: datetime,
+) -> None:
+    """Reject channel-set drift that could corrupt cumulative statistics."""
+    incoming_channels: dict[datetime, set[str]] = {}
+    for measurement in incoming:
+        start = measurement.start.astimezone(UTC)
+        if start >= cutoff:
+            incoming_channels.setdefault(start, set()).add(measurement.channel_id)
+    for start, channels in incoming_channels.items():
+        existing_channels = {
+            channel for cached_start, channel in cache if cached_start == start
+        }
+        if existing_channels and existing_channels != channels:
+            raise ValueError("Meridian measurement channel identity changed")
 
 
 def _utcnow() -> datetime:
@@ -776,6 +796,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 del cache[key]
 
         earliest_changed: datetime | None = None
+        _validate_channel_identity_continuity(cache, incoming, cutoff)
+
         for measurement in incoming:
             start = measurement.start.astimezone(UTC)
             if start < cutoff:
@@ -847,7 +869,29 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 interval_end = (measurement.end or measurement.start).astimezone(UTC)
                 if start >= since and interval_end <= now:
                     key = (start, measurement.channel_id)
+                    channels = {
+                        channel
+                        for existing_start, channel in measurements
+                        if existing_start == start
+                    }
+                    if (
+                        measurement.channel_id == AGGREGATE_CHANNEL_ID
+                        and channels - {AGGREGATE_CHANNEL_ID}
+                    ) or (
+                        measurement.channel_id != AGGREGATE_CHANNEL_ID
+                        and AGGREGATE_CHANNEL_ID in channels
+                    ):
+                        raise ValueError("Meridian measurement channels are ambiguous")
                     existing = measurements.get(key)
+                    if (
+                        existing is not None
+                        and existing.quality == measurement.quality
+                        and (
+                            measurement.channel_id == AGGREGATE_CHANNEL_ID
+                            or existing.value_kwh != measurement.value_kwh
+                        )
+                    ):
+                        raise ValueError("Meridian measurement channels are ambiguous")
                     if existing is None or (
                         existing.quality != _ACTUAL and measurement.quality == _ACTUAL
                     ):

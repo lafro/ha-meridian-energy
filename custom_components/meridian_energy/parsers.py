@@ -10,6 +10,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 
 from .const import (
+    AGGREGATE_CHANNEL_ID,
     COST_STATISTIC_TYPES,
     GENERATION_CREDIT_TYPES,
     READING_FREQUENCY_HOUR,
@@ -77,7 +78,7 @@ def parse_measurement(
     end = parse_datetime(node.get("endAt"), "measurement end")
     if end.astimezone(UTC) - start.astimezone(UTC) != timedelta(hours=1):
         raise ValueError("Measurement interval is not exactly one hour")
-    if required_string(node, "unit") != "kWh":
+    if required_string(node, "unit").casefold() != "kwh":
         raise ValueError("Unexpected measurement unit")
     value = _finite_decimal(node.get("value"), "measurement value")
     if value < 0:
@@ -106,11 +107,23 @@ def parse_measurement(
 
 def _measurement_channel_id(filters: dict[str, Any]) -> str:
     """Return a stable, privacy-safe identity for one physical meter channel."""
-    parts = [
-        required_string(filters, key)
-        for key in ("marketSupplyPointId", "deviceId", "registerId")
-    ]
-    canonical = json.dumps(parts, ensure_ascii=True, separators=(",", ":"))
+    identifiers: dict[str, str] = {}
+    for key in ("marketSupplyPointId", "deviceId", "registerId"):
+        value = filters.get(key)
+        if value is None or value == "":
+            continue
+        if not isinstance(value, str):
+            raise ValueError(f"Invalid {key}")
+        identifiers[key] = value
+
+    if register_id := identifiers.get("registerId"):
+        identity = ("registerId", register_id)
+    elif device_id := identifiers.get("deviceId"):
+        identity = ("deviceId", device_id)
+    else:
+        return AGGREGATE_CHANNEL_ID
+
+    canonical = json.dumps(identity, ensure_ascii=True, separators=(",", ":"))
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
