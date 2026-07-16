@@ -17,6 +17,7 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.meridian_energy import (
     MeridianDataCoordinator,
     MeridianRuntimeData,
+    _async_repair_statistics,
     async_migrate_entry,
     async_remove_config_entry_device,
     async_setup_entry,
@@ -208,6 +209,20 @@ async def test_setup_repairs_external_statistic_states_once(hass) -> None:
         hass, statistic_ids={*consumption_ids(key), *generation_ids(key)}
     )
     assert entry.data[CONF_STATISTICS_STATE_VERSION] == STATISTICS_STATE_VERSION
+
+
+@pytest.mark.asyncio
+async def test_background_repair_rechecks_completed_marker(hass) -> None:
+    entry = _entry()
+    entry.add_to_hass(hass)
+
+    with patch(
+        "custom_components.meridian_energy.async_repair_external_statistics_states",
+        new=AsyncMock(return_value=True),
+    ) as repair:
+        await _async_repair_statistics(hass, entry, {"meridian_energy:test"})
+
+    repair.assert_not_awaited()
 
 
 @pytest.mark.asyncio
