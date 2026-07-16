@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -35,7 +36,10 @@ from custom_components.meridian_energy.models import (
 )
 from custom_components.meridian_energy.sensor import (
     DESCRIPTIONS,
+    _billing_data_complete,
+    _billing_total,
     _remove_stale_devices,
+    _remove_stale_entities,
     async_setup_entry,
 )
 from custom_components.meridian_energy.statistics import account_key
@@ -168,7 +172,10 @@ def _data() -> MeridianSyncData:
                 current_bill_export=None,
                 current_bill_credit=None,
                 has_feed_in=False,
-                billing_data_complete=True,
+                usage_complete=True,
+                cost_complete=True,
+                export_complete=False,
+                credit_complete=False,
             ),
         ),
         synced_at=datetime.now(UTC),
@@ -269,6 +276,9 @@ async def test_solar_entities_and_multiple_account_device_name(hass) -> None:
                 has_feed_in=True,
                 current_bill_export=Decimal(10),
                 current_bill_credit=Decimal(2),
+                cost_complete=False,
+                export_complete=True,
+                credit_complete=False,
             ),
             replace(
                 data.account_results[0],
@@ -284,8 +294,108 @@ async def test_solar_entities_and_multiple_account_device_name(hass) -> None:
     assert len(entities) == 18
     assert entities[5].native_value == Decimal(10)
     assert entities[6].native_value == Decimal(2)
+    assert entities[3].extra_state_attributes["data_complete"] is True
+    assert entities[4].extra_state_attributes["data_complete"] is False
+    assert entities[5].extra_state_attributes["data_complete"] is True
+    assert entities[6].extra_state_attributes["data_complete"] is False
     assert entities[0].device_info["name"] == "Meridian Energy — 1 Synthetic Street"
     await entry._async_process_on_unload(hass)
+
+
+@pytest.mark.asyncio
+async def test_multiple_property_account_uses_count_in_device_name(hass) -> None:
+    account = _account()
+    account = replace(
+        account,
+        properties=(
+            *account.properties,
+            replace(
+                account.properties[0],
+                id="second-property",
+                address="2 Synthetic Street",
+            ),
+        ),
+    )
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    coordinator._topology = (account,)
+    coordinator.data = _data()
+    entities = []
+    entry = _entry(coordinator)
+
+    await async_setup_entry(hass, entry, entities.extend)
+
+    assert entities[0].device_info["name"] == "Meridian Energy — 2 properties"
+    await entry._async_process_on_unload(hass)
+
+
+@pytest.mark.asyncio
+async def test_account_without_properties_uses_generic_device_suffix(hass) -> None:
+    """Keep a stable, non-sensitive device name for incomplete topology."""
+    account = replace(_account(), properties=())
+    second_account = replace(
+        _account(),
+        number="second-account",
+        properties=(
+            *_account().properties,
+            replace(_account().properties[0], id="second-property"),
+        ),
+    )
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    coordinator._topology = (account, second_account)
+    data = _data()
+    coordinator.data = replace(
+        data,
+        account_results=(
+            data.account_results[0],
+            replace(
+                data.account_results[0],
+                account_key=account_key(second_account.number),
+            ),
+        ),
+    )
+    entities = []
+    entry = _entry(coordinator)
+
+    await async_setup_entry(hass, entry, entities.extend)
+
+    assert entities[0].device_info["name"] == "Meridian Energy — Account"
+    await entry._async_process_on_unload(hass)
+
+
+def test_stale_entity_cleanup_skips_entities_owned_by_another_entry(hass) -> None:
+    """Never remove a registry entity belonging to a different config entry."""
+    entry = _entry(MagicMock())
+    entity_registry = MagicMock()
+    entity_registry.async_get_entity_id.side_effect = [
+        "sensor.shared",
+        "sensor.owned",
+    ]
+    entity_registry.async_get.side_effect = [
+        SimpleNamespace(config_entry_id="other-entry"),
+        SimpleNamespace(config_entry_id=entry.entry_id),
+    ]
+
+    with patch(
+        "custom_components.meridian_energy.sensor.er.async_get",
+        return_value=entity_registry,
+    ):
+        _remove_stale_entities(
+            hass,
+            entry,
+            {(ACCOUNT_KEY, "shared"), (ACCOUNT_KEY, "owned")},
+        )
+
+    entity_registry.async_remove.assert_called_once_with("sensor.owned")
+
+
+def test_billing_helpers_reject_unsupported_internal_keys() -> None:
+    """Fail loudly if a future entity bypasses the audited billing contract."""
+    result = _data().account_results[0]
+
+    with pytest.raises(ValueError, match="Unsupported billing metric"):
+        _billing_total(_data(), ACCOUNT_KEY, "unsupported")
+    with pytest.raises(ValueError, match="Unsupported billing sensor"):
+        _billing_data_complete(result, "unsupported")
 
 
 @pytest.mark.asyncio
@@ -350,6 +460,34 @@ async def test_feed_in_entities_are_added_when_topology_changes(hass) -> None:
     coordinator.async_set_updated_data(
         replace(coordinator.data, results=(), account_results=())
     )
+    await entry._async_process_on_unload(hass)
+
+
+@pytest.mark.asyncio
+async def test_entities_tolerate_transient_missing_account_result(hass, caplog) -> None:
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    coordinator._topology = (_account(),)
+    original_data = _data()
+    coordinator.data = original_data
+    coordinator.last_update_success = True
+    entry = _entry(coordinator)
+    entities = []
+
+    await async_setup_entry(hass, entry, entities.extend)
+    caplog.set_level(logging.ERROR)
+
+    coordinator.async_set_updated_data(replace(original_data, account_results=()))
+
+    assert "Unexpected error updating listener" not in caplog.text
+    assert entities[3].available is False
+    assert entities[3].native_value is None
+    assert entities[3].last_reset is None
+    assert entities[3].extra_state_attributes is None
+    assert entities[5].native_value is None
+
+    coordinator.async_set_updated_data(original_data)
+    assert entities[3].available is True
+    assert entities[3].native_value == Decimal("123.4")
     await entry._async_process_on_unload(hass)
 
 
@@ -437,6 +575,9 @@ async def test_diagnostics_exclude_all_sensitive_fields(hass) -> None:
     assert diagnostics["coordinator"]["sync_duration_seconds"] == 0
     assert diagnostics["coordinator"]["billing_metadata_unavailable_count"] == 1
     assert diagnostics["coordinator"]["billing_metadata_cache_age_seconds"] == 3600.125
+    assert diagnostics["coordinator"]["account_results"][0][
+        "billing_data_complete"
+    ] == {"usage": True, "cost": True, "export": False, "credit": False}
     assert diagnostics["coordinator"]["property_results"][0]["api_pages"] == {
         "consumption": 1,
         "generation": 0,

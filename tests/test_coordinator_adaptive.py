@@ -296,6 +296,31 @@ async def test_billing_failure_keeps_cached_metadata(hass) -> None:
 
 
 @pytest.mark.asyncio
+async def test_billing_failure_withholds_ended_cached_period(hass) -> None:
+    hass.set_state(CoreState.running)
+    client = MagicMock()
+    client.async_get_billing_period = AsyncMock(
+        side_effect=MeridianGraphQLError("billingPeriods", ("TEMPORARY",))
+    )
+    coordinator = MeridianDataCoordinator(hass, client)
+    account = _account()
+    coordinator._billing_periods[account.number] = _billing_period(
+        end=date(2026, 7, 13)
+    )
+    coordinator._billing_cached_at[account.number] = NOW
+    with patch(
+        "custom_components.meridian_energy.coordinator.async_account_period_totals",
+        new=AsyncMock(),
+    ) as calculate:
+        results = await coordinator._async_account_results((account,), NOW)
+
+    calculate.assert_not_awaited()
+    assert results[0].billing_period is None
+    assert results[0].current_bill_usage is None
+    assert results[0].current_bill_cost is None
+
+
+@pytest.mark.asyncio
 async def test_billing_failure_logs_once_and_recovery_without_identifiers(
     hass, caplog
 ) -> None:
@@ -398,7 +423,10 @@ async def test_account_results_derive_current_period_totals(hass) -> None:
         cost=Decimal("4.56"),
         export=Decimal("1.2"),
         credit=Decimal("0.3"),
-        complete=True,
+        usage_complete=True,
+        cost_complete=True,
+        export_complete=True,
+        credit_complete=True,
     )
     with patch(
         "custom_components.meridian_energy.coordinator.async_account_period_totals",
@@ -411,7 +439,10 @@ async def test_account_results_derive_current_period_totals(hass) -> None:
     assert result[0].current_bill_usage == Decimal("12.3")
     assert result[0].current_bill_cost == Decimal("4.56")
     assert result[0].has_feed_in is True
-    assert result[0].billing_data_complete is True
+    assert result[0].usage_complete is True
+    assert result[0].cost_complete is True
+    assert result[0].export_complete is True
+    assert result[0].credit_complete is True
     assert calculate.await_args.kwargs["include_generation"] is True
 
 
@@ -430,7 +461,10 @@ async def test_account_results_defer_recorder_totals_during_startup(hass) -> Non
     calculate.assert_not_awaited()
     assert result[0].billing_period == _billing_period()
     assert result[0].current_bill_usage is None
-    assert result[0].billing_data_complete is False
+    assert result[0].usage_complete is False
+    assert result[0].cost_complete is False
+    assert result[0].export_complete is False
+    assert result[0].credit_complete is False
 
 
 @pytest.mark.asyncio
@@ -527,18 +561,18 @@ async def test_startup_distinguishes_install_restart_and_solar(hass) -> None:
     coordinator = MeridianDataCoordinator(hass, MagicMock())
     with patch(
         "custom_components.meridian_energy.coordinator.async_latest_numeric_statistic_start",
-        new=AsyncMock(side_effect=[NOW, NOW, NOW, NOW]),
+        new=AsyncMock(side_effect=[NOW, NOW]),
     ) as checker:
         assert (
             await coordinator._async_startup_mode((_account(feed_in=True),))
             is SyncMode.RESTART
         )
-        assert checker.await_count == 4
+        assert checker.await_count == 2
         assert (
             await coordinator._async_startup_mode((_account(feed_in=True),))
             is SyncMode.RESTART
         )
-        assert checker.await_count == 4
+        assert checker.await_count == 2
 
     coordinator = MeridianDataCoordinator(hass, MagicMock())
     with patch(
@@ -727,7 +761,7 @@ async def test_direction_reappearance_forces_one_recovery_backfill(hass) -> None
 
 
 @pytest.mark.asyncio
-async def test_direction_mode_backfills_when_money_statistic_is_missing(hass) -> None:
+async def test_direction_mode_does_not_backfill_only_for_missing_money(hass) -> None:
     coordinator = MeridianDataCoordinator(hass, MagicMock())
     coordinator._initial_refresh_complete = True
     with patch(
@@ -740,7 +774,27 @@ async def test_direction_mode_backfills_when_money_statistic_is_missing(hass) ->
             SyncMode.TIP,
         )
 
-    assert mode is SyncMode.INITIAL
+    assert mode is SyncMode.TIP
+
+
+@pytest.mark.asyncio
+async def test_restart_with_missing_money_uses_revision_window(hass) -> None:
+    for _ in range(2):
+        coordinator = MeridianDataCoordinator(hass, MagicMock())
+        with patch(
+            "custom_components.meridian_energy.coordinator.async_latest_numeric_statistic_start",
+            new=AsyncMock(side_effect=[NOW, None]),
+        ):
+            mode = await coordinator._direction_mode(
+                CACHE_KEY,
+                ("meridian_energy:energy", "meridian_energy:cost"),
+                SyncMode.TIP,
+            )
+
+        assert mode is SyncMode.RESTART
+        assert coordinator._requested_since(CACHE_KEY, mode, NOW) == (
+            NOW - REVISION_OVERLAP
+        )
 
 
 @pytest.mark.asyncio

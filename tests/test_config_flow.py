@@ -11,6 +11,7 @@ from homeassistant.config_entries import SOURCE_REAUTH, SOURCE_RECONFIGURE, SOUR
 from homeassistant.const import CONF_EMAIL
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import selector
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 from voluptuous_serialize import convert
 
@@ -118,6 +119,10 @@ async def test_user_flow_success(hass) -> None:
         )
         assert result["type"] is FlowResultType.FORM
         assert result["step_id"] == "user"
+        email_field = next(iter(result["data_schema"].schema.values()))
+        assert isinstance(email_field, selector.TextSelector)
+        assert email_field.config["type"] == selector.TextSelectorType.EMAIL
+        assert email_field.config["autocomplete"] == "email"
 
         result = await hass.config_entries.flow.async_configure(
             result["flow_id"], {CONF_EMAIL: " PERSON@Example.com "}
@@ -681,6 +686,15 @@ async def test_import_rollback_tracks_consumption_generation_and_existing(hass) 
     assert len(flow._initial_statistic_ids) == 4
     assert len(flow._existing_statistic_ids) == 1
     assert _account_label(feed_in).startswith("1 Synthetic Street ·")
+    multi_property = MeridianAccount(
+        feed_in.number,
+        feed_in.status,
+        (
+            *feed_in.properties,
+            MeridianProperty("second", "2 Synthetic Street", ()),
+        ),
+    )
+    assert _account_label(multi_property).startswith("2 properties ·")
 
 
 @pytest.mark.asyncio

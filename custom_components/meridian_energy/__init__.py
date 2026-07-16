@@ -18,12 +18,20 @@ from .const import (
     CONF_FIREBASE_USER_ID,
     CONF_REFRESH_TOKEN,
     CONF_SELECTED_ACCOUNTS,
+    CONF_STATISTICS_STATE_VERSION,
     DOMAIN,
     NAME,
+    STATISTICS_STATE_VERSION,
 )
 from .coordinator import MeridianDataCoordinator
 from .models import MeridianTokenSet
-from .statistics import account_key
+from .statistics import (
+    account_key,
+    async_repair_external_statistics_states,
+    consumption_ids,
+    generation_ids,
+    property_key,
+)
 
 PLATFORMS = [Platform.SENSOR]
 CONFIG_ENTRY_VERSION = 3
@@ -43,6 +51,7 @@ type MeridianConfigEntry = ConfigEntry[MeridianRuntimeData]
 
 async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> bool:
     """Set up Meridian Energy from a config entry."""
+    needs_startup_billing_refresh = hass.state is not CoreState.running
 
     async def async_store_tokens(tokens: MeridianTokenSet) -> None:
         if (
@@ -84,6 +93,33 @@ async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> 
         auto_add_accounts=bool(entry.data.get(CONF_AUTO_ADD_ACCOUNTS, False)),
     )
     await coordinator.async_config_entry_first_refresh()
+    raw_statistics_state_version = entry.data.get(CONF_STATISTICS_STATE_VERSION, 0)
+    try:
+        statistics_state_version = int(raw_statistics_state_version)
+    except TypeError, ValueError:
+        statistics_state_version = 0
+    owned_statistic_ids = {
+        statistic_id
+        for account in coordinator.accounts
+        for property_data in account.properties
+        for statistic_id in (
+            *consumption_ids(property_key(account.number, property_data.id)),
+            *generation_ids(property_key(account.number, property_data.id)),
+        )
+    }
+    if (
+        statistics_state_version < STATISTICS_STATE_VERSION
+        and await async_repair_external_statistics_states(
+            hass, statistic_ids=owned_statistic_ids
+        )
+    ):
+        hass.config_entries.async_update_entry(
+            entry,
+            data={
+                **entry.data,
+                CONF_STATISTICS_STATE_VERSION: STATISTICS_STATE_VERSION,
+            },
+        )
     if configured_accounts is None:
         hass.config_entries.async_update_entry(
             entry,
@@ -95,7 +131,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> 
             },
         )
     entry.runtime_data = MeridianRuntimeData(client, coordinator)
-    if hass.state is not CoreState.running:
+
+    if needs_startup_billing_refresh:
 
         async def async_refresh_billing_after_start(_hass: HomeAssistant) -> None:
             """Populate Recorder-derived billing totals once startup is complete."""

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from collections.abc import Iterable
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from functools import partial
 from hashlib import sha256
 from itertools import pairwise
@@ -22,6 +23,7 @@ from homeassistant.components.recorder.statistics import (
     async_add_external_statistics,
     clear_statistics,
     get_last_statistics,
+    get_metadata,
     statistics_during_period,
 )
 from homeassistant.const import UnitOfEnergy
@@ -40,6 +42,8 @@ from .models import BillingPeriodTotals, MeridianMeasurement
 
 _CENTS_PER_DOLLAR = Decimal(100)
 _SECONDS_PER_HOUR = 3600
+_REPAIR_HISTORY_HEADROOM = 72
+_LOGGER = logging.getLogger(__name__)
 
 
 def property_key(account_number: str, property_id: str) -> str:
@@ -51,6 +55,91 @@ def property_key(account_number: str, property_id: str) -> str:
 def account_key(account_number: str) -> str:
     """Return a stable non-sensitive key for a Meridian account."""
     return sha256(account_number.encode()).hexdigest()[:12]
+
+
+def _repair_state_rows(
+    rows: list[StatisticsRow], cutoff: datetime
+) -> list[StatisticData]:
+    """Reconstruct interval states from preserved cumulative sums."""
+    repaired: list[StatisticData] = []
+    previous_sum: Decimal | None = None
+    for row in sorted(rows, key=lambda item: _timestamp(item["start"])):
+        raw_sum = row.get("sum")
+        if raw_sum is None:
+            continue
+        try:
+            cumulative_sum = Decimal(str(raw_sum))
+        except (InvalidOperation, TypeError) as err:
+            raise ValueError("Invalid cumulative statistic sum") from err
+        if not cumulative_sum.is_finite():
+            raise ValueError("Cumulative statistic sum is not finite")
+        interval_state = (
+            cumulative_sum if previous_sum is None else cumulative_sum - previous_sum
+        )
+        if interval_state < 0:
+            raise ValueError("Cumulative statistic sum decreased")
+        start = datetime.fromtimestamp(_timestamp(row["start"]), tz=UTC)
+        if start >= cutoff:
+            repaired.append(
+                {
+                    "start": start,
+                    "state": float(interval_state),
+                    "sum": float(cumulative_sum),
+                }
+            )
+        previous_sum = cumulative_sum
+    return repaired
+
+
+async def async_repair_external_statistics_states(
+    hass: HomeAssistant,
+    *,
+    statistic_ids: set[str],
+    now: datetime | None = None,
+) -> bool:
+    """Repair the supported history locally without requesting Meridian data."""
+    instance = get_instance(hass)
+    await instance.async_block_till_done()
+    metadata = await instance.async_add_executor_job(
+        partial(
+            get_metadata,
+            hass,
+            statistic_ids=statistic_ids,
+        )
+    )
+    metadata = {
+        stat_id: value
+        for stat_id, value in metadata.items()
+        if value[1]["source"] == DOMAIN and value[1]["has_sum"]
+    }
+    cutoff = (now or datetime.now(UTC)) - INITIAL_BACKFILL
+    number_of_rows = (
+        int(INITIAL_BACKFILL.total_seconds() // _SECONDS_PER_HOUR)
+        + _REPAIR_HISTORY_HEADROOM
+    )
+    complete = True
+    for stat_id, (_metadata_id, statistic_metadata) in sorted(metadata.items()):
+        result = await instance.async_add_executor_job(
+            get_last_statistics,
+            hass,
+            number_of_rows,
+            stat_id,
+            False,
+            {"state", "sum"},
+        )
+        try:
+            repaired_rows = _repair_state_rows(result.get(stat_id, []), cutoff)
+        except ValueError as err:
+            complete = False
+            _LOGGER.warning(
+                "Unable to repair one Meridian statistic state series (%s)",
+                type(err).__name__,
+            )
+            continue
+        if repaired_rows:
+            async_add_external_statistics(hass, statistic_metadata, repaired_rows)
+    await instance.async_block_till_done()
+    return complete
 
 
 def statistic_id(kind: str, key: str) -> str:
@@ -136,12 +225,19 @@ async def async_import_measurements(
     for start in sorted(aggregated):
         energy, cost = aggregated[start]
         energy_total += energy
-        energy_value = float(energy_total)
-        energy_rows.append({"start": start, "state": energy_value, "sum": energy_value})
+        energy_rows.append(
+            {"start": start, "state": float(energy), "sum": float(energy_total)}
+        )
         if cost is not None and cost_baseline is not None:
-            cost_total += cost / _CENTS_PER_DOLLAR
-            cost_value = float(cost_total)
-            cost_rows.append({"start": start, "state": cost_value, "sum": cost_value})
+            interval_cost = cost / _CENTS_PER_DOLLAR
+            cost_total += interval_cost
+            cost_rows.append(
+                {
+                    "start": start,
+                    "state": float(interval_cost),
+                    "sum": float(cost_total),
+                }
+            )
 
     async_add_external_statistics(
         hass,
@@ -312,17 +408,19 @@ async def async_account_period_totals(
             usage += sum((row[1] for row in energy_rows), Decimal(0))
             cost += sum((row[1] for row in money_rows), Decimal(0))
 
-    complete = saw_consumption and consumption_complete
+    usage_complete = saw_consumption and consumption_complete
+    cost_data_complete = usage_complete and cost_complete
+    export_complete = saw_generation and generation_complete
+    credit_data_complete = export_complete and credit_complete
     return BillingPeriodTotals(
-        usage=usage if complete else None,
-        cost=cost if complete and cost_complete else None,
-        export=(exported if saw_generation and generation_complete else None),
-        credit=(
-            credit
-            if saw_generation and generation_complete and credit_complete
-            else None
-        ),
-        complete=complete,
+        usage=usage if usage_complete else None,
+        cost=cost if cost_data_complete else None,
+        export=exported if export_complete else None,
+        credit=credit if credit_data_complete else None,
+        usage_complete=usage_complete,
+        cost_complete=cost_data_complete,
+        export_complete=export_complete,
+        credit_complete=credit_data_complete,
     )
 
 

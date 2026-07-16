@@ -5,15 +5,27 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
+from homeassistant.components.recorder import get_instance
+from homeassistant.components.recorder.statistics import (
+    async_add_external_statistics as ha_async_add_external_statistics,
+)
+from homeassistant.components.recorder.statistics import (
+    get_last_statistics as ha_get_last_statistics,
+)
+from pytest_homeassistant_custom_component.components.recorder.common import (
+    async_recorder_block_till_done,
+)
 
 from custom_components.meridian_energy.models import MeridianMeasurement
 from custom_components.meridian_energy.statistics import (
     _aggregate_measurements,
     _async_baseline_sum,
     _change_rows,
+    _energy_metadata,
+    _repair_state_rows,
     _timestamp,
     async_account_period_totals,
     async_clear_statistics,
@@ -21,6 +33,7 @@ from custom_components.meridian_energy.statistics import (
     async_has_statistics,
     async_import_measurements,
     async_latest_numeric_statistic_start,
+    async_repair_external_statistics_states,
     consumption_ids,
     generation_ids,
     property_key,
@@ -52,6 +65,207 @@ def test_property_key_is_stable_and_redacted() -> None:
     assert result == property_key("A-SECRET", "property-secret")
     assert len(result) == 12
     assert "SECRET" not in result
+
+
+def test_repair_state_rows_preserves_sum_and_uses_predecessor() -> None:
+    cutoff = datetime(2026, 7, 1, tzinfo=UTC)
+    rows = [
+        {
+            "start": (cutoff - timedelta(hours=1)).timestamp(),
+            "state": 100.0,
+            "sum": 100.0,
+        },
+        {"start": cutoff.timestamp(), "state": 101.25, "sum": 101.25},
+        {
+            "start": (cutoff + timedelta(hours=1)).timestamp(),
+            "state": 102.0,
+            "sum": 102.0,
+        },
+    ]
+
+    repaired = _repair_state_rows(rows, cutoff)
+
+    assert repaired == [
+        {"start": cutoff, "state": 1.25, "sum": 101.25},
+        {
+            "start": cutoff + timedelta(hours=1),
+            "state": 0.75,
+            "sum": 102.0,
+        },
+    ]
+
+
+def test_repair_state_rows_skips_null_sum() -> None:
+    cutoff = datetime(2026, 7, 1, tzinfo=UTC)
+    assert _repair_state_rows(
+        [
+            {"start": cutoff.timestamp(), "state": None, "sum": None},
+            {
+                "start": (cutoff + timedelta(hours=1)).timestamp(),
+                "state": 1.0,
+                "sum": 1.0,
+            },
+        ],
+        cutoff,
+    ) == [
+        {
+            "start": cutoff + timedelta(hours=1),
+            "state": 1.0,
+            "sum": 1.0,
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    ("sums", "message"),
+    [
+        (["invalid"], "Invalid"),
+        (["NaN"], "finite"),
+        ([2, 1], "decreased"),
+    ],
+)
+def test_repair_state_rows_rejects_unsafe_sums(
+    sums: list[object], message: str
+) -> None:
+    cutoff = datetime(2026, 7, 1, tzinfo=UTC)
+    rows = [
+        {
+            "start": (cutoff + timedelta(hours=index)).timestamp(),
+            "state": value,
+            "sum": value,
+        }
+        for index, value in enumerate(sums)
+    ]
+    with pytest.raises(ValueError, match=message):
+        _repair_state_rows(rows, cutoff)
+
+
+@pytest.mark.asyncio
+async def test_repair_external_statistics_states_uses_existing_recorder_data() -> None:
+    now = datetime(2026, 7, 16, tzinfo=UTC)
+    cutoff = now - timedelta(days=90)
+    stat_id = "meridian_energy:consumption_test"
+    metadata = _energy_metadata(stat_id, "Existing name")
+    rows = {
+        stat_id: [
+            {
+                "start": (cutoff - timedelta(hours=1)).timestamp(),
+                "state": 10.0,
+                "sum": 10.0,
+            },
+            {"start": cutoff.timestamp(), "state": 11.0, "sum": 11.0},
+        ]
+    }
+    instance = MagicMock()
+    instance.async_block_till_done = AsyncMock()
+    instance.async_add_executor_job = AsyncMock(
+        side_effect=[{stat_id: (1, metadata)}, rows]
+    )
+
+    with (
+        patch(
+            "custom_components.meridian_energy.statistics.get_instance",
+            return_value=instance,
+        ),
+        patch(
+            "custom_components.meridian_energy.statistics.async_add_external_statistics"
+        ) as add_statistics,
+    ):
+        repaired = await async_repair_external_statistics_states(
+            AsyncMock(), statistic_ids={stat_id}, now=now
+        )
+
+    assert repaired is True
+    add_statistics.assert_called_once_with(
+        ANY,
+        metadata,
+        [{"start": cutoff, "state": 1.0, "sum": 11.0}],
+    )
+    assert instance.async_block_till_done.await_count == 2
+    assert instance.async_add_executor_job.await_args_list[0].args[0].keywords[
+        "statistic_ids"
+    ] == {stat_id}
+
+
+class TestExternalStatisticsRecorderMigration:
+    """Exercise the one-time repair against a real Recorder database."""
+
+    @pytest.fixture
+    def mock_recorder_before_hass(self, recorder_db_url: str) -> None:
+        """Prepare Recorder storage before the Home Assistant fixture starts."""
+        del recorder_db_url
+
+    @pytest.mark.asyncio
+    async def test_round_trip(self, recorder_mock, hass) -> None:
+        """Overwrite interval state while preserving cumulative sum."""
+        del recorder_mock
+        now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
+        cutoff = now - timedelta(days=90)
+        stat_id = "meridian_energy:consumption_recorder_round_trip"
+        metadata = _energy_metadata(stat_id, "Recorder round trip")
+        ha_async_add_external_statistics(
+            hass,
+            metadata,
+            [
+                {
+                    "start": cutoff - timedelta(hours=1),
+                    "state": 10.0,
+                    "sum": 10.0,
+                },
+                {"start": cutoff, "state": 11.25, "sum": 11.25},
+            ],
+        )
+        instance = get_instance(hass)
+        await async_recorder_block_till_done(hass)
+
+        assert await async_repair_external_statistics_states(
+            hass, statistic_ids={stat_id}, now=now
+        )
+        await async_recorder_block_till_done(hass)
+
+        result = await instance.async_add_executor_job(
+            ha_get_last_statistics,
+            hass,
+            2,
+            stat_id,
+            False,
+            {"state", "sum"},
+        )
+        repaired = max(result[stat_id], key=lambda row: _timestamp(row["start"]))
+        assert repaired["state"] == 1.25
+        assert repaired["sum"] == 11.25
+
+
+@pytest.mark.asyncio
+async def test_repair_external_statistics_states_retries_unsafe_series(caplog) -> None:
+    now = datetime(2026, 7, 16, tzinfo=UTC)
+    stat_id = "meridian_energy:consumption_test"
+    metadata = _energy_metadata(stat_id, "Existing name")
+    instance = MagicMock()
+    instance.async_block_till_done = AsyncMock()
+    instance.async_add_executor_job = AsyncMock(
+        side_effect=[
+            {stat_id: (1, metadata)},
+            {stat_id: [{"start": now.timestamp(), "state": "NaN", "sum": "NaN"}]},
+        ]
+    )
+
+    with (
+        patch(
+            "custom_components.meridian_energy.statistics.get_instance",
+            return_value=instance,
+        ),
+        patch(
+            "custom_components.meridian_energy.statistics.async_add_external_statistics"
+        ) as add_statistics,
+    ):
+        repaired = await async_repair_external_statistics_states(
+            AsyncMock(), statistic_ids={stat_id}, now=now
+        )
+
+    assert repaired is False
+    add_statistics.assert_not_called()
+    assert "Unable to repair one Meridian statistic state series" in caplog.text
 
 
 def test_aggregate_multiple_registers_at_same_utc_hour() -> None:
@@ -117,7 +331,9 @@ async def test_import_builds_monotonic_energy_and_dollar_sums() -> None:
     assert result == (2, 2)
     energy_rows = add_statistics.call_args_list[0].args[2]
     cost_rows = add_statistics.call_args_list[1].args[2]
+    assert [row["state"] for row in energy_rows] == [1.25, 0.75]
     assert [row["sum"] for row in energy_rows] == [101.25, 102.0]
+    assert [row["state"] for row in cost_rows] == [0.5, 0.25]
     assert [row["sum"] for row in cost_rows] == [20.5, 20.75]
     assert add_statistics.call_args_list[0].args[1]["unit_class"] == "energy"
     assert add_statistics.call_args_list[1].args[1]["unit_class"] is None
@@ -383,7 +599,10 @@ async def test_account_period_totals_combines_properties_and_generation() -> Non
     assert result.cost == Decimal("3.6")
     assert result.export == Decimal("0.5")
     assert result.credit == Decimal("0.1")
-    assert result.complete is True
+    assert result.usage_complete is True
+    assert result.cost_complete is True
+    assert result.export_complete is True
+    assert result.credit_complete is True
     instance.async_block_till_done.assert_awaited_once()
 
 
@@ -419,7 +638,8 @@ async def test_account_period_totals_withholds_incomplete_cost_and_history() -> 
 
     assert result.usage is None
     assert result.cost is None
-    assert result.complete is False
+    assert result.usage_complete is False
+    assert result.cost_complete is False
 
 
 @pytest.mark.parametrize(
@@ -458,7 +678,44 @@ async def test_account_period_totals_withholds_matched_internal_hourly_gap(
 
     assert result.usage is None
     assert result.cost is None
-    assert result.complete is False
+    assert result.usage_complete is False
+    assert result.cost_complete is False
+
+
+@pytest.mark.asyncio
+async def test_account_period_totals_reports_per_metric_completeness() -> None:
+    start = datetime(2026, 7, 1, tzinfo=UTC)
+    end = start + timedelta(hours=2)
+    energy_id, cost_id = consumption_ids("first")
+    instance = MagicMock()
+    instance.async_block_till_done = AsyncMock()
+    instance.async_add_executor_job = AsyncMock(
+        return_value={
+            energy_id: [
+                {"start": start.timestamp(), "change": 1.0},
+                {"start": (start + timedelta(hours=1)).timestamp(), "change": 1.0},
+            ],
+            cost_id: [{"start": start.timestamp(), "change": 0.3}],
+        }
+    )
+    with patch(
+        "custom_components.meridian_energy.statistics.get_instance",
+        return_value=instance,
+    ):
+        result = await async_account_period_totals(
+            AsyncMock(),
+            property_keys=("first",),
+            start=start,
+            end=end,
+            include_generation=False,
+        )
+
+    assert result.usage == Decimal("2.0")
+    assert result.cost is None
+    assert result.usage_complete is True
+    assert result.cost_complete is False
+    assert result.export_complete is False
+    assert result.credit_complete is False
 
 
 def test_aggregate_marks_hourly_cost_incomplete() -> None:
@@ -598,7 +855,8 @@ async def test_multi_property_totals_share_latest_published_horizon() -> None:
 
     assert result.usage is None
     assert result.cost is None
-    assert result.complete is False
+    assert result.usage_complete is False
+    assert result.cost_complete is False
 
 
 def test_change_rows_filters_boundaries_and_missing_values() -> None:

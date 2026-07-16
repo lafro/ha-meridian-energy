@@ -35,5 +35,6 @@ Pull requests must pass Python, Hassfest, HACS, dependency-review and CodeQL che
 1. Confirm `manifest.json`, `pyproject.toml` and the proposed `v…` tag contain the same version.
 2. Run the full local commands above and review the branch-coverage report.
 3. Merge only through a protected pull request with all conversations resolved.
-4. Publish beta versions as GitHub prereleases; never replace a beta release with the stable release.
-5. Install the prerelease through HACS and complete the documented canary before promoting it.
+4. Run the protected **Release** workflow from `main`; do not create or move release tags manually.
+5. Install the published release through HACS and complete the documented canary on that exact release.
+6. If the canary finds a material defect, fix it through a new protected pull request and publish a new patch version; never replace an existing release in place.

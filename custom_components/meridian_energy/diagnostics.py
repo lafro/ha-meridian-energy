@@ -83,7 +83,12 @@ async def async_get_config_entry_diagnostics(
                         if result.billing_period is not None
                         else None
                     ),
-                    "billing_data_complete": result.billing_data_complete,
+                    "billing_data_complete": {
+                        "usage": result.usage_complete,
+                        "cost": result.cost_complete,
+                        "export": result.export_complete,
+                        "credit": result.credit_complete,
+                    },
                     "has_feed_in": result.has_feed_in,
                     "usage_available": result.current_bill_usage is not None,
                     "cost_available": result.current_bill_cost is not None,

@@ -240,10 +240,7 @@ class MeridianApiClient:
             if err.status == _HTTP_REQUEST_TIMEOUT or err.status >= _HTTP_SERVER_ERROR:
                 raise _connection_error(err) from err
             code = str(err.payload.get("code") or "OTP_INVALID")
-            message = str(
-                err.payload.get("error") or "Meridian rejected the login code"
-            )
-            raise MeridianOtpError(code, message) from err
+            raise MeridianOtpError(code, "Meridian rejected the login code") from err
 
         custom_token = response.get("customToken")
         if not isinstance(custom_token, str) or not custom_token:
