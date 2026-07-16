@@ -957,7 +957,7 @@ wheels = [
 
 [[package]]
 name = "ha-meridian-energy"
-version = "0.2.2"
+version = "0.2.3"
 source = { virtual = "." }
 
 [package.dev-dependencies]

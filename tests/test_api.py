@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -722,6 +723,17 @@ def test_parse_measurement_rejects_non_hourly_contract(
         _parse_measurement(node, "CONSUMPTION")
 
 
+@pytest.mark.parametrize("unit", ["kwh", "kWh", "KWH"])
+def test_parse_measurement_accepts_kilowatt_hour_unit_case_variants(
+    unit: str,
+) -> None:
+    """Kraken emits lower-case kwh while HA uses the canonical kWh symbol."""
+    node = _measurement_node()
+    node["unit"] = unit
+
+    assert _parse_measurement(node, "CONSUMPTION").value_kwh == Decimal(1)
+
+
 def test_parse_measurement_rejects_non_hourly_frequency() -> None:
     node = _measurement_node()
     metadata = node["metaData"]
@@ -754,24 +766,46 @@ def test_parse_measurement_accepts_nz_dst_hour(start: str, end: str) -> None:
     ) == timedelta(hours=1)
 
 
-def test_parse_measurement_requires_register_identity() -> None:
+def test_parse_measurement_classifies_supply_point_only_as_aggregate() -> None:
     node = _measurement_node()
     metadata = node["metaData"]
     assert isinstance(metadata, dict)
     filters = metadata["utilityFilters"]
     assert isinstance(filters, dict)
+    filters["deviceId"] = None
     filters["registerId"] = None
-    with pytest.raises(ValueError, match="registerId"):
-        _parse_measurement(node, "CONSUMPTION")
+
+    measurement = _parse_measurement(node, "CONSUMPTION")
+
+    assert measurement.channel_id == "aggregate"
 
 
-def test_parse_measurement_channel_identity_distinguishes_devices() -> None:
+def test_parse_measurement_accepts_register_identity_without_device() -> None:
+    node = _measurement_node()
+    metadata = node["metaData"]
+    assert isinstance(metadata, dict)
+    filters = metadata["utilityFilters"]
+    assert isinstance(filters, dict)
+    filters["deviceId"] = None
+
+    measurement = _parse_measurement(node, "CONSUMPTION")
+
+    assert len(measurement.channel_id) == 64
+
+
+def test_parse_measurement_distinguishes_devices_without_registers() -> None:
     first = _measurement_node()
     second = _measurement_node()
+    first_metadata = first["metaData"]
+    assert isinstance(first_metadata, dict)
+    first_filters = first_metadata["utilityFilters"]
+    assert isinstance(first_filters, dict)
+    first_filters["registerId"] = None
     metadata = second["metaData"]
     assert isinstance(metadata, dict)
     filters = metadata["utilityFilters"]
     assert isinstance(filters, dict)
+    filters["registerId"] = None
     filters["deviceId"] = "other-synthetic-device"
 
     first_channel = _parse_measurement(first, "CONSUMPTION").channel_id
@@ -782,14 +816,77 @@ def test_parse_measurement_channel_identity_distinguishes_devices() -> None:
     assert "synthetic" not in second_channel
 
 
-@pytest.mark.parametrize("field", ["marketSupplyPointId", "deviceId", "registerId"])
-def test_parse_measurement_requires_complete_channel_identity(field: str) -> None:
+def test_parse_measurement_register_identity_ignores_optional_parent_fields() -> None:
+    first = _measurement_node()
+    second = _measurement_node()
+    metadata = second["metaData"]
+    assert isinstance(metadata, dict)
+    filters = metadata["utilityFilters"]
+    assert isinstance(filters, dict)
+    filters["marketSupplyPointId"] = None
+    filters["deviceId"] = None
+
+    first_measurement = _parse_measurement(first, "CONSUMPTION")
+    second_measurement = _parse_measurement(second, "CONSUMPTION")
+
+    assert first_measurement.channel_id == second_measurement.channel_id
+    assert (
+        len(
+            {
+                (measurement.start, measurement.channel_id)
+                for measurement in (first_measurement, second_measurement)
+            }
+        )
+        == 1
+    )
+
+
+def test_parse_measurement_device_identity_ignores_optional_supply_point() -> None:
+    first = _measurement_node()
+    second = _measurement_node()
+    for node in (first, second):
+        metadata = node["metaData"]
+        assert isinstance(metadata, dict)
+        filters = metadata["utilityFilters"]
+        assert isinstance(filters, dict)
+        filters["registerId"] = None
+    second_metadata = second["metaData"]
+    assert isinstance(second_metadata, dict)
+    second_filters = second_metadata["utilityFilters"]
+    assert isinstance(second_filters, dict)
+    second_filters["marketSupplyPointId"] = None
+
+    assert (
+        _parse_measurement(first, "CONSUMPTION").channel_id
+        == _parse_measurement(second, "CONSUMPTION").channel_id
+    )
+
+
+def test_parse_measurement_accepts_aggregate_channel_identity() -> None:
     node = _measurement_node()
     metadata = node["metaData"]
     assert isinstance(metadata, dict)
     filters = metadata["utilityFilters"]
     assert isinstance(filters, dict)
-    filters[field] = None
+    for field in ("marketSupplyPointId", "deviceId", "registerId"):
+        filters[field] = None
+
+    measurement = _parse_measurement(node, "CONSUMPTION")
+
+    assert measurement.channel_id == "aggregate"
+
+
+@pytest.mark.parametrize("field", ["marketSupplyPointId", "deviceId", "registerId"])
+@pytest.mark.parametrize("value", [123, []])
+def test_parse_measurement_rejects_malformed_channel_identity(
+    field: str, value: object
+) -> None:
+    node = _measurement_node()
+    metadata = node["metaData"]
+    assert isinstance(metadata, dict)
+    filters = metadata["utilityFilters"]
+    assert isinstance(filters, dict)
+    filters[field] = value
     with pytest.raises(ValueError, match=field):
         _parse_measurement(node, "CONSUMPTION")
 

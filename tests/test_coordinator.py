@@ -25,6 +25,8 @@ from custom_components.meridian_energy.models import (
     MeridianProperty,
 )
 
+TEST_HOUR = datetime(2026, 7, 16, 0, 0, tzinfo=UTC)
+
 
 def _measurement(
     start: datetime,
@@ -32,15 +34,17 @@ def _measurement(
     quality: str = "ACTUAL",
     channel: str = "meter:register",
     direction: str = "CONSUMPTION",
+    value: str = "1.0",
+    cost: str = "30",
 ) -> MeridianMeasurement:
     return MeridianMeasurement(
         start=start,
         end=start + timedelta(hours=1),
-        value_kwh=Decimal("1.0"),
+        value_kwh=Decimal(value),
         quality=quality,
         direction=direction,
         channel_id=channel,
-        cost_cents=Decimal(30),
+        cost_cents=Decimal(cost),
     )
 
 
@@ -227,6 +231,97 @@ async def test_fetch_since_prefers_actual_for_same_channel(hass) -> None:
 
     assert len(result.measurements) == 2
     assert {item.quality for item in result.measurements} == {"ACTUAL"}
+
+
+@pytest.mark.asyncio
+async def test_fetch_since_rejects_conflicting_anonymous_rows(hass) -> None:
+    client = MagicMock()
+    start = datetime.now(UTC).replace(minute=0, second=0, microsecond=0) - timedelta(
+        hours=2
+    )
+    client.async_get_measurements = AsyncMock(
+        return_value=MeasurementPage(
+            measurements=(
+                _measurement(start, value="1", channel="aggregate"),
+                _measurement(start, value="2", channel="aggregate"),
+            ),
+            has_previous_page=False,
+            start_cursor=None,
+        )
+    )
+    coordinator = MeridianDataCoordinator(hass, client)
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        await coordinator._async_fetch_since(
+            account_number="A-SYNTHETIC",
+            property_id="property",
+            direction="CONSUMPTION",
+            since=start - timedelta(hours=1),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "measurements",
+    [
+        (
+            _measurement(TEST_HOUR, value="1", cost="30", channel="aggregate"),
+            _measurement(TEST_HOUR, value="1", cost="40", channel="aggregate"),
+        ),
+        (
+            _measurement(TEST_HOUR, value="1", cost="30", channel="aggregate"),
+            _measurement(TEST_HOUR, value="1", cost="30", channel="aggregate"),
+        ),
+    ],
+    ids=("equal-energy-different-cost", "fully-identical"),
+)
+async def test_fetch_since_rejects_indistinguishable_anonymous_rows(
+    hass, measurements: tuple[MeridianMeasurement, MeridianMeasurement]
+) -> None:
+    client = MagicMock()
+    client.async_get_measurements = AsyncMock(
+        return_value=MeasurementPage(
+            measurements=measurements,
+            has_previous_page=False,
+            start_cursor=None,
+        )
+    )
+    coordinator = MeridianDataCoordinator(hass, client)
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        await coordinator._async_fetch_since(
+            account_number="A-SYNTHETIC",
+            property_id="property",
+            direction="CONSUMPTION",
+            since=TEST_HOUR - timedelta(hours=1),
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_since_rejects_mixed_anonymous_and_identified_rows(hass) -> None:
+    client = MagicMock()
+    start = datetime.now(UTC).replace(minute=0, second=0, microsecond=0) - timedelta(
+        hours=2
+    )
+    client.async_get_measurements = AsyncMock(
+        return_value=MeasurementPage(
+            measurements=(
+                _measurement(start, channel="aggregate"),
+                _measurement(start, channel="identified-channel"),
+            ),
+            has_previous_page=False,
+            start_cursor=None,
+        )
+    )
+    coordinator = MeridianDataCoordinator(hass, client)
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        await coordinator._async_fetch_since(
+            account_number="A-SYNTHETIC",
+            property_id="property",
+            direction="CONSUMPTION",
+            since=start - timedelta(hours=1),
+        )
 
 
 @pytest.mark.asyncio
