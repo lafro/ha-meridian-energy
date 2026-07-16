@@ -136,7 +136,10 @@ class AccountSyncResult:
     current_bill_export: Decimal | None
     current_bill_credit: Decimal | None
     has_feed_in: bool
-    billing_data_complete: bool
+    usage_complete: bool
+    cost_complete: bool
+    export_complete: bool
+    credit_complete: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -147,7 +150,10 @@ class BillingPeriodTotals:
     cost: Decimal | None
     export: Decimal | None
     credit: Decimal | None
-    complete: bool
+    usage_complete: bool
+    cost_complete: bool
+    export_complete: bool
+    credit_complete: bool
 
 
 @dataclass(frozen=True, slots=True)

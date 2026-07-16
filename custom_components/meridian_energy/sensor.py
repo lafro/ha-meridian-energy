@@ -84,7 +84,7 @@ DESCRIPTIONS = (
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
         state_class=SensorStateClass.TOTAL,
         suggested_display_precision=1,
-        value_fn=lambda data, key: _account_result(data, key).current_bill_usage,
+        value_fn=lambda data, key: _billing_total(data, key, "usage"),
     ),
     MeridianSensorDescription(
         key="current_bill_cost",
@@ -93,7 +93,7 @@ DESCRIPTIONS = (
         native_unit_of_measurement="NZD",
         state_class=SensorStateClass.TOTAL,
         suggested_display_precision=2,
-        value_fn=lambda data, key: _account_result(data, key).current_bill_cost,
+        value_fn=lambda data, key: _billing_total(data, key, "cost"),
     ),
     MeridianSensorDescription(
         key="current_bill_export",
@@ -103,7 +103,7 @@ DESCRIPTIONS = (
         state_class=SensorStateClass.TOTAL,
         suggested_display_precision=1,
         conditional_feed_in=True,
-        value_fn=lambda data, key: _account_result(data, key).current_bill_export,
+        value_fn=lambda data, key: _billing_total(data, key, "export"),
     ),
     MeridianSensorDescription(
         key="current_bill_credit",
@@ -113,7 +113,7 @@ DESCRIPTIONS = (
         state_class=SensorStateClass.TOTAL,
         suggested_display_precision=2,
         conditional_feed_in=True,
-        value_fn=lambda data, key: _account_result(data, key).current_bill_credit,
+        value_fn=lambda data, key: _billing_total(data, key, "credit"),
     ),
     MeridianSensorDescription(
         key="billing_period_start",
@@ -158,6 +158,7 @@ async def async_setup_entry(
         current_account_keys: set[str] = set()
         desired_sensor_keys: set[tuple[str, str]] = set()
         conditional_sensor_keys: set[tuple[str, str]] = set()
+        incoherent_account_keys: set[str] = set()
         multiple_properties = (
             sum(len(account.properties) for account in coordinator.accounts) > 1
         )
@@ -166,6 +167,9 @@ async def async_setup_entry(
             key = account_key(account.number)
             current_account_keys.add(key)
             result = _account_result(coordinator.data, key)
+            if result is None:
+                incoherent_account_keys.add(key)
+                continue
             for description in DESCRIPTIONS:
                 sensor_key = (key, description.key)
                 if description.conditional_feed_in:
@@ -197,6 +201,11 @@ async def async_setup_entry(
         stale_sensor_keys = (created_sensors | conditional_sensor_keys) - (
             desired_sensor_keys
         )
+        stale_sensor_keys = {
+            sensor_key
+            for sensor_key in stale_sensor_keys
+            if sensor_key[0] not in incoherent_account_keys
+        }
         _remove_stale_entities(hass, entry, stale_sensor_keys)
         created_sensors.difference_update(stale_sensor_keys)
 
@@ -294,6 +303,14 @@ class MeridianAccountSensor(CoordinatorEntity[MeridianDataCoordinator], SensorEn
         return self._description.value_fn(self.coordinator.data, self._account_key)
 
     @property
+    def available(self) -> bool:
+        """Return whether this account has a coherent coordinator result."""
+        return (
+            super().available
+            and _account_result(self.coordinator.data, self._account_key) is not None
+        )
+
+    @property
     def last_reset(self) -> datetime | None:
         """Return the retailer billing-period boundary for bill-to-date totals."""
         if self.entity_description.key not in {
@@ -303,9 +320,10 @@ class MeridianAccountSensor(CoordinatorEntity[MeridianDataCoordinator], SensorEn
             "current_bill_credit",
         }:
             return None
-        period = _account_result(
-            self.coordinator.data, self._account_key
-        ).billing_period
+        result = _account_result(self.coordinator.data, self._account_key)
+        if result is None:
+            return None
+        period = result.billing_period
         if period is None or period.start is None:
             return None
         return datetime.combine(period.start, time.min, tzinfo=_NZ).astimezone(UTC)
@@ -323,12 +341,14 @@ class MeridianAccountSensor(CoordinatorEntity[MeridianDataCoordinator], SensorEn
             "current_bill_credit",
         }:
             result = _account_result(self.coordinator.data, self._account_key)
+            if result is None:
+                return None
             period = result.billing_period
             return {
                 "billing_period_start": period.start if period else None,
                 "billing_period_end": period.end if period else None,
                 "next_billing_date": period.next_billing_date if period else None,
-                "data_complete": result.billing_data_complete,
+                "data_complete": _billing_data_complete(result, key),
             }
         return None
 
@@ -365,15 +385,49 @@ class MeridianAccountSensor(CoordinatorEntity[MeridianDataCoordinator], SensorEn
         }
 
 
-def _account_result(data: MeridianSyncData, key: str) -> AccountSyncResult:
+def _account_result(data: MeridianSyncData, key: str) -> AccountSyncResult | None:
     """Find a coordinator account result by its non-sensitive key."""
-    return next(item for item in data.account_results if item.account_key == key)
+    return next(
+        (item for item in data.account_results if item.account_key == key), None
+    )
+
+
+def _billing_total(data: MeridianSyncData, key: str, metric: str) -> Decimal | None:
+    """Return one current-bill metric when the account result is coherent."""
+    result = _account_result(data, key)
+    if result is None:
+        return None
+    if metric == "usage":
+        return result.current_bill_usage
+    if metric == "cost":
+        return result.current_bill_cost
+    if metric == "export":
+        return result.current_bill_export
+    if metric == "credit":
+        return result.current_bill_credit
+    raise ValueError("Unsupported billing metric")
 
 
 def _billing_value(data: MeridianSyncData, key: str, field: str) -> date | None:
     """Return one date from an account's current billing metadata."""
-    period = _account_result(data, key).billing_period
+    result = _account_result(data, key)
+    if result is None:
+        return None
+    period = result.billing_period
     return getattr(period, field) if period is not None else None
+
+
+def _billing_data_complete(result: AccountSyncResult, sensor_key: str) -> bool:
+    """Return the completeness flag belonging to one bill-to-date sensor."""
+    if sensor_key == "current_bill_usage":
+        return result.usage_complete
+    if sensor_key == "current_bill_cost":
+        return result.cost_complete
+    if sensor_key == "current_bill_export":
+        return result.export_complete
+    if sensor_key == "current_bill_credit":
+        return result.credit_complete
+    raise ValueError("Unsupported billing sensor")
 
 
 def _one_line_address(value: str) -> str:

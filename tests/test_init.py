@@ -26,8 +26,10 @@ from custom_components.meridian_energy.const import (
     CONF_FIREBASE_USER_ID,
     CONF_REFRESH_TOKEN,
     CONF_SELECTED_ACCOUNTS,
+    CONF_STATISTICS_STATE_VERSION,
     DOMAIN,
     NAME,
+    STATISTICS_STATE_VERSION,
 )
 from custom_components.meridian_energy.models import (
     AccountSyncResult,
@@ -39,18 +41,28 @@ from custom_components.meridian_energy.models import (
     PropertySyncResult,
     SyncMode,
 )
-from custom_components.meridian_energy.statistics import account_key
+from custom_components.meridian_energy.statistics import (
+    account_key,
+    consumption_ids,
+    generation_ids,
+    property_key,
+)
 
 
-def _entry(*, version: int = 1) -> MockConfigEntry:
+def _entry(
+    *, version: int = 1, statistics_state_version: int | None = STATISTICS_STATE_VERSION
+) -> MockConfigEntry:
+    data = {
+        "email": "person@example.com",
+        CONF_REFRESH_TOKEN: "old-refresh",
+        CONF_FIREBASE_USER_ID: "old-user",
+        CONF_SELECTED_ACCOUNTS: ["synthetic-account"],
+    }
+    if statistics_state_version is not None:
+        data[CONF_STATISTICS_STATE_VERSION] = statistics_state_version
     return MockConfigEntry(
         domain=DOMAIN,
-        data={
-            "email": "person@example.com",
-            CONF_REFRESH_TOKEN: "old-refresh",
-            CONF_FIREBASE_USER_ID: "old-user",
-            CONF_SELECTED_ACCOUNTS: ["synthetic-account"],
-        },
+        data=data,
         version=version,
         minor_version=1,
     )
@@ -113,7 +125,10 @@ def _sync_data(*, feed_in: bool = False) -> MeridianSyncData:
                 current_bill_export=None,
                 current_bill_credit=None,
                 has_feed_in=feed_in,
-                billing_data_complete=False,
+                usage_complete=False,
+                cost_complete=False,
+                export_complete=False,
+                credit_complete=False,
             ),
         ),
         synced_at=now,
@@ -163,6 +178,129 @@ async def test_setup_entry_and_rotating_token_persistence(hass) -> None:
     assert entry.data[CONF_REFRESH_TOKEN] == "rotated-refresh"
     assert "id_token" not in entry.data
     reload_entry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_setup_repairs_external_statistic_states_once(hass) -> None:
+    entry = _entry(statistics_state_version=None)
+    entry.add_to_hass(hass)
+    coordinator = MagicMock()
+    coordinator.accounts = (_account(),)
+    coordinator.async_config_entry_first_refresh = AsyncMock()
+    with (
+        patch("custom_components.meridian_energy.MeridianApiClient"),
+        patch(
+            "custom_components.meridian_energy.MeridianDataCoordinator",
+            return_value=coordinator,
+        ),
+        patch(
+            "custom_components.meridian_energy.async_repair_external_statistics_states",
+            new=AsyncMock(return_value=True),
+        ) as repair,
+        patch.object(hass.config_entries, "async_forward_entry_setups", AsyncMock()),
+    ):
+        assert await async_setup_entry(hass, entry) is True
+        assert await async_setup_entry(hass, entry) is True
+
+    key = property_key("synthetic-account", "synthetic-property")
+    repair.assert_awaited_once_with(
+        hass, statistic_ids={*consumption_ids(key), *generation_ids(key)}
+    )
+    assert entry.data[CONF_STATISTICS_STATE_VERSION] == STATISTICS_STATE_VERSION
+
+
+@pytest.mark.asyncio
+async def test_setup_leaves_repair_marker_unset_when_repair_is_incomplete(hass) -> None:
+    entry = _entry(statistics_state_version=None)
+    entry.add_to_hass(hass)
+    coordinator = MagicMock()
+    coordinator.accounts = (_account(),)
+    coordinator.async_config_entry_first_refresh = AsyncMock()
+
+    with (
+        patch("custom_components.meridian_energy.MeridianApiClient"),
+        patch(
+            "custom_components.meridian_energy.MeridianDataCoordinator",
+            return_value=coordinator,
+        ),
+        patch(
+            "custom_components.meridian_energy.async_repair_external_statistics_states",
+            new=AsyncMock(return_value=False),
+        ) as repair,
+        patch.object(hass.config_entries, "async_forward_entry_setups", AsyncMock()),
+    ):
+        assert await async_setup_entry(hass, entry) is True
+
+    repair.assert_awaited_once()
+    assert CONF_STATISTICS_STATE_VERSION not in entry.data
+
+
+@pytest.mark.asyncio
+async def test_setup_retries_repair_for_malformed_state_version(hass) -> None:
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={
+            "email": "person@example.com",
+            CONF_REFRESH_TOKEN: "old-refresh",
+            CONF_FIREBASE_USER_ID: "old-user",
+            CONF_SELECTED_ACCOUNTS: ["synthetic-account"],
+            CONF_STATISTICS_STATE_VERSION: None,
+        },
+        version=3,
+    )
+    entry.add_to_hass(hass)
+    coordinator = MagicMock()
+    coordinator.accounts = (_account(),)
+    coordinator.async_config_entry_first_refresh = AsyncMock()
+
+    with (
+        patch("custom_components.meridian_energy.MeridianApiClient"),
+        patch(
+            "custom_components.meridian_energy.MeridianDataCoordinator",
+            return_value=coordinator,
+        ),
+        patch(
+            "custom_components.meridian_energy.async_repair_external_statistics_states",
+            new=AsyncMock(return_value=True),
+        ) as repair,
+        patch.object(hass.config_entries, "async_forward_entry_setups", AsyncMock()),
+    ):
+        assert await async_setup_entry(hass, entry) is True
+
+    repair.assert_awaited_once()
+    assert entry.data[CONF_STATISTICS_STATE_VERSION] == STATISTICS_STATE_VERSION
+
+
+@pytest.mark.asyncio
+async def test_setup_refreshes_billing_if_startup_finishes_during_repair(hass) -> None:
+    hass.set_state(CoreState.starting)
+    entry = _entry(statistics_state_version=None)
+    entry.add_to_hass(hass)
+    coordinator = MagicMock()
+    coordinator.accounts = (_account(),)
+    coordinator.async_config_entry_first_refresh = AsyncMock()
+    coordinator.async_refresh_billing_totals = AsyncMock()
+
+    async def finish_startup_during_repair(*_args, **_kwargs) -> bool:
+        hass.set_state(CoreState.running)
+        return True
+
+    with (
+        patch("custom_components.meridian_energy.MeridianApiClient"),
+        patch(
+            "custom_components.meridian_energy.MeridianDataCoordinator",
+            return_value=coordinator,
+        ),
+        patch(
+            "custom_components.meridian_energy.async_repair_external_statistics_states",
+            new=AsyncMock(side_effect=finish_startup_during_repair),
+        ),
+        patch.object(hass.config_entries, "async_forward_entry_setups", AsyncMock()),
+    ):
+        assert await async_setup_entry(hass, entry) is True
+        await hass.async_block_till_done()
+
+    coordinator.async_refresh_billing_totals.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -261,6 +399,7 @@ async def test_setup_populates_missing_account_selection(hass) -> None:
             "email": "person@example.com",
             CONF_REFRESH_TOKEN: "old-refresh",
             CONF_FIREBASE_USER_ID: "old-user",
+            CONF_STATISTICS_STATE_VERSION: STATISTICS_STATE_VERSION,
         },
         version=3,
     )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -168,7 +169,10 @@ def _data() -> MeridianSyncData:
                 current_bill_export=None,
                 current_bill_credit=None,
                 has_feed_in=False,
-                billing_data_complete=True,
+                usage_complete=True,
+                cost_complete=True,
+                export_complete=False,
+                credit_complete=False,
             ),
         ),
         synced_at=datetime.now(UTC),
@@ -269,6 +273,9 @@ async def test_solar_entities_and_multiple_account_device_name(hass) -> None:
                 has_feed_in=True,
                 current_bill_export=Decimal(10),
                 current_bill_credit=Decimal(2),
+                cost_complete=False,
+                export_complete=True,
+                credit_complete=False,
             ),
             replace(
                 data.account_results[0],
@@ -284,6 +291,10 @@ async def test_solar_entities_and_multiple_account_device_name(hass) -> None:
     assert len(entities) == 18
     assert entities[5].native_value == Decimal(10)
     assert entities[6].native_value == Decimal(2)
+    assert entities[3].extra_state_attributes["data_complete"] is True
+    assert entities[4].extra_state_attributes["data_complete"] is False
+    assert entities[5].extra_state_attributes["data_complete"] is True
+    assert entities[6].extra_state_attributes["data_complete"] is False
     assert entities[0].device_info["name"] == "Meridian Energy — 1 Synthetic Street"
     await entry._async_process_on_unload(hass)
 
@@ -350,6 +361,34 @@ async def test_feed_in_entities_are_added_when_topology_changes(hass) -> None:
     coordinator.async_set_updated_data(
         replace(coordinator.data, results=(), account_results=())
     )
+    await entry._async_process_on_unload(hass)
+
+
+@pytest.mark.asyncio
+async def test_entities_tolerate_transient_missing_account_result(hass, caplog) -> None:
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    coordinator._topology = (_account(),)
+    original_data = _data()
+    coordinator.data = original_data
+    coordinator.last_update_success = True
+    entry = _entry(coordinator)
+    entities = []
+
+    await async_setup_entry(hass, entry, entities.extend)
+    caplog.set_level(logging.ERROR)
+
+    coordinator.async_set_updated_data(replace(original_data, account_results=()))
+
+    assert "Unexpected error updating listener" not in caplog.text
+    assert entities[3].available is False
+    assert entities[3].native_value is None
+    assert entities[3].last_reset is None
+    assert entities[3].extra_state_attributes is None
+    assert entities[5].native_value is None
+
+    coordinator.async_set_updated_data(original_data)
+    assert entities[3].available is True
+    assert entities[3].native_value == Decimal("123.4")
     await entry._async_process_on_unload(hass)
 
 
@@ -437,6 +476,9 @@ async def test_diagnostics_exclude_all_sensitive_fields(hass) -> None:
     assert diagnostics["coordinator"]["sync_duration_seconds"] == 0
     assert diagnostics["coordinator"]["billing_metadata_unavailable_count"] == 1
     assert diagnostics["coordinator"]["billing_metadata_cache_age_seconds"] == 3600.125
+    assert diagnostics["coordinator"]["account_results"][0][
+        "billing_data_complete"
+    ] == {"usage": True, "cost": True, "export": False, "credit": False}
     assert diagnostics["coordinator"]["property_results"][0]["api_pages"] == {
         "consumption": 1,
         "generation": 0,

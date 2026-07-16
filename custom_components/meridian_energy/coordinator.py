@@ -387,9 +387,11 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         for account in accounts:
             for property_data in account.properties:
                 key = property_key(account.number, property_data.id)
-                required_ids = list(consumption_ids(key))
+                consumption_energy_id, _ = consumption_ids(key)
+                required_ids = [consumption_energy_id]
                 if any(meter.has_feed_in for meter in property_data.meter_points):
-                    required_ids.extend(generation_ids(key))
+                    generation_energy_id, _ = generation_ids(key)
+                    required_ids.append(generation_energy_id)
                 for statistic_id in required_ids:
                     await self._async_cache_statistic(statistic_id)
                     has_all_statistics &= self._known_statistics[statistic_id]
@@ -434,7 +436,10 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 for meter in property_data.meter_points
             )
             usage = cost = exported = credit = None
-            complete = False
+            usage_complete = False
+            cost_complete = False
+            export_complete = False
+            credit_complete = False
             if (
                 self.hass.state is CoreState.running
                 and billing_period is not None
@@ -458,7 +463,10 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                     cost = totals.cost
                     exported = totals.export
                     credit = totals.credit
-                    complete = totals.complete
+                    usage_complete = totals.usage_complete
+                    cost_complete = totals.cost_complete
+                    export_complete = totals.export_complete
+                    credit_complete = totals.credit_complete
             results.append(
                 AccountSyncResult(
                     account_key=account_key(account.number),
@@ -468,7 +476,10 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                     current_bill_export=exported,
                     current_bill_credit=credit,
                     has_feed_in=has_feed_in,
-                    billing_data_complete=complete,
+                    usage_complete=usage_complete,
+                    cost_complete=cost_complete,
+                    export_complete=export_complete,
+                    credit_complete=credit_complete,
                 )
             )
         return tuple(results)
@@ -495,11 +506,15 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             self._billing_unavailable.add(account_number)
             if was_available:
                 _LOGGER.info(
-                    "Meridian billing metadata is unavailable; retaining the last "
-                    "known data (%s)",
+                    "Meridian billing metadata is unavailable; %s (%s)",
+                    (
+                        "withholding expired cached data"
+                        if period_ended
+                        else "retaining current cached data"
+                    ),
                     type(err).__name__,
                 )
-            return cached
+            return None if period_ended else cached
         if account_number in self._billing_unavailable:
             self._billing_unavailable.discard(account_number)
             if not self._billing_unavailable:
@@ -656,20 +671,17 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
     ) -> SyncMode:
         for statistic_id in statistic_ids:
             await self._async_cache_statistic(statistic_id)
+        energy_statistic_id = statistic_ids[0]
         if cache_key in self._pending_backfill:
             return SyncMode.INITIAL
         if (
-            not all(
-                self._known_statistics[statistic_id] for statistic_id in statistic_ids
-            )
+            not self._known_statistics[energy_statistic_id]
             and cache_key not in self._backfill_attempted
         ):
             return SyncMode.INITIAL
-        if not self._initial_refresh_complete and any(
-            latest is None or latest < _utcnow() - REVISION_OVERLAP
-            for latest in (
-                self._latest_statistics[statistic_id] for statistic_id in statistic_ids
-            )
+        energy_latest = self._latest_statistics[energy_statistic_id]
+        if not self._initial_refresh_complete and (
+            energy_latest is None or energy_latest < _utcnow() - REVISION_OVERLAP
         ):
             return SyncMode.INITIAL
         if not self._initial_refresh_complete:
