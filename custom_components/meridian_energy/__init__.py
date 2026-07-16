@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import CoreState, HomeAssistant
+from homeassistant.core import CoreState, HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceEntry
 from homeassistant.helpers.start import async_at_started
@@ -47,6 +47,55 @@ class MeridianRuntimeData:
 
 
 type MeridianConfigEntry = ConfigEntry[MeridianRuntimeData]
+
+
+def _statistics_state_version(entry: MeridianConfigEntry) -> int:
+    """Return the stored external-statistics state contract version."""
+    raw_state_version = entry.data.get(CONF_STATISTICS_STATE_VERSION, 0)
+    try:
+        return int(raw_state_version)
+    except TypeError, ValueError:
+        return 0
+
+
+async def _async_repair_statistics(
+    hass: HomeAssistant,
+    entry: MeridianConfigEntry,
+    statistic_ids: set[str],
+) -> None:
+    """Repair statistics and mark the completed contract version."""
+    if _statistics_state_version(entry) >= STATISTICS_STATE_VERSION:
+        return
+    if not await async_repair_external_statistics_states(
+        hass, statistic_ids=statistic_ids
+    ):
+        return
+    hass.config_entries.async_update_entry(
+        entry,
+        data={
+            **entry.data,
+            CONF_STATISTICS_STATE_VERSION: STATISTICS_STATE_VERSION,
+        },
+    )
+
+
+@callback
+def _schedule_statistics_repair(
+    hass: HomeAssistant,
+    entry: MeridianConfigEntry,
+    statistic_ids: set[str],
+) -> None:
+    """Schedule config-entry-owned repair after Home Assistant starts."""
+
+    @callback
+    def schedule(_hass: HomeAssistant) -> None:
+        entry.async_create_background_task(
+            hass,
+            _async_repair_statistics(hass, entry, statistic_ids),
+            f"{DOMAIN} statistics state repair",
+        )
+
+    entry.async_on_unload(async_at_started(hass, schedule))
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> bool:
@@ -93,11 +142,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> 
         auto_add_accounts=bool(entry.data.get(CONF_AUTO_ADD_ACCOUNTS, False)),
     )
     await coordinator.async_config_entry_first_refresh()
-    raw_statistics_state_version = entry.data.get(CONF_STATISTICS_STATE_VERSION, 0)
-    try:
-        statistics_state_version = int(raw_statistics_state_version)
-    except TypeError, ValueError:
-        statistics_state_version = 0
+    statistics_state_version = _statistics_state_version(entry)
     owned_statistic_ids = {
         statistic_id
         for account in coordinator.accounts
@@ -107,19 +152,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> 
             *generation_ids(property_key(account.number, property_data.id)),
         )
     }
-    if (
-        statistics_state_version < STATISTICS_STATE_VERSION
-        and await async_repair_external_statistics_states(
-            hass, statistic_ids=owned_statistic_ids
-        )
-    ):
-        hass.config_entries.async_update_entry(
-            entry,
-            data={
-                **entry.data,
-                CONF_STATISTICS_STATE_VERSION: STATISTICS_STATE_VERSION,
-            },
-        )
     if configured_accounts is None:
         hass.config_entries.async_update_entry(
             entry,
@@ -131,6 +163,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> 
             },
         )
     entry.runtime_data = MeridianRuntimeData(client, coordinator)
+
+    if statistics_state_version < STATISTICS_STATE_VERSION:
+        _schedule_statistics_repair(hass, entry, owned_statistic_ids)
 
     if needs_startup_billing_refresh:
 
