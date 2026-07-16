@@ -74,6 +74,22 @@ def test_aggregate_rejects_non_hour_timestamp() -> None:
         )
 
 
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
+def test_aggregate_rejects_non_finite_energy(value: str) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        _aggregate_measurements(
+            [_measurement(datetime(2026, 7, 13, 1, tzinfo=UTC), value, "1")]
+        )
+
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
+def test_aggregate_rejects_non_finite_cost(value: str) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        _aggregate_measurements(
+            [_measurement(datetime(2026, 7, 13, 1, tzinfo=UTC), "1", value)]
+        )
+
+
 @pytest.mark.asyncio
 async def test_import_builds_monotonic_energy_and_dollar_sums() -> None:
     measurements = [

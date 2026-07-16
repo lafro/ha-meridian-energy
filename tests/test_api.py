@@ -18,6 +18,7 @@ from custom_components.meridian_energy.api import (
     MeridianOtpError,
     MeridianRateLimitError,
     _graphql_error_code,
+    _is_active_feed_in_register,
     _MeridianHttpError,
     _optional_string,
     _parse_datetime,
@@ -41,6 +42,34 @@ def _tokens() -> MeridianTokenSet:
         expires_at=datetime.now(UTC) + timedelta(hours=1),
         user_id="user-id",
     )
+
+
+def _measurement_node(
+    *,
+    value: str = "1",
+    direction: str = "CONSUMPTION",
+    quality: str = "ACTUAL",
+    statistics: list[object] | None = None,
+) -> dict[str, object]:
+    """Return one complete synthetic hourly measurement payload."""
+    return {
+        "value": value,
+        "unit": "kWh",
+        "startAt": "2026-07-13T01:00:00+12:00",
+        "endAt": "2026-07-13T02:00:00+12:00",
+        "readAt": "2026-07-13T01:00:00+12:00",
+        "metaData": {
+            "utilityFilters": {
+                "readingFrequencyType": "HOUR_INTERVAL",
+                "readingDirection": direction,
+                "readingQuality": quality,
+                "marketSupplyPointId": "synthetic-market-point",
+                "deviceId": "synthetic-device",
+                "registerId": "synthetic-register",
+            },
+            "statistics": statistics or [],
+        },
+    }
 
 
 class _FakeResponse:
@@ -409,6 +438,90 @@ async def test_get_accounts_parses_feed_in_register() -> None:
 
 
 @pytest.mark.asyncio
+async def test_get_accounts_ignores_inactive_feed_in_registers() -> None:
+    client = MeridianApiClient(MagicMock(), tokens=_tokens())
+    client._async_graphql = AsyncMock(
+        side_effect=[
+            {
+                "viewer": {
+                    "accounts": [
+                        {"number": "A-TEST", "status": "ACTIVE", "id": "account"}
+                    ]
+                }
+            },
+            {
+                "account": {
+                    "number": "A-TEST",
+                    "status": "ACTIVE",
+                    "properties": [
+                        {
+                            "id": "property",
+                            "address": "Synthetic address",
+                            "meterPoints": [
+                                {
+                                    "id": "meter",
+                                    "marketIdentifier": "synthetic-market-point",
+                                    "registers": [
+                                        {
+                                            "identifier": "EXPIRED",
+                                            "activeFrom": "2020-01-01",
+                                            "activeTo": "2020-12-31",
+                                            "isFeedIn": True,
+                                        },
+                                        {
+                                            "identifier": "FUTURE",
+                                            "activeFrom": "2999-01-01",
+                                            "activeTo": None,
+                                            "isFeedIn": True,
+                                        },
+                                    ],
+                                }
+                            ],
+                        }
+                    ],
+                }
+            },
+        ]
+    )
+
+    accounts = await client.async_get_accounts()
+
+    assert accounts[0].properties[0].meter_points[0].has_feed_in is False
+
+
+@pytest.mark.parametrize(
+    ("register", "today", "expected"),
+    [
+        ({"isFeedIn": False}, date(2026, 7, 16), False),
+        ({"isFeedIn": True}, date(2026, 7, 16), True),
+        (
+            {
+                "isFeedIn": True,
+                "activeFrom": "2026-07-16",
+                "activeTo": "2026-07-16",
+            },
+            date(2026, 7, 16),
+            True,
+        ),
+        (
+            {"isFeedIn": True, "activeFrom": None, "activeTo": "2026-07-15"},
+            date(2026, 7, 16),
+            False,
+        ),
+    ],
+)
+def test_active_feed_in_register_contract(
+    register: dict[str, object], today: date, expected: bool
+) -> None:
+    assert _is_active_feed_in_register(register, today) is expected
+
+
+def test_active_feed_in_register_rejects_invalid_flag() -> None:
+    with pytest.raises(ValueError, match="flag"):
+        _is_active_feed_in_register({"isFeedIn": "yes"}, date(2026, 7, 16))
+
+
+@pytest.mark.asyncio
 async def test_get_account_skips_null_meter_point() -> None:
     client = MeridianApiClient(MagicMock(), tokens=_tokens())
     client._async_graphql = AsyncMock(
@@ -499,19 +612,7 @@ async def test_get_billing_period_rejects_invalid_metadata(
 
 @pytest.mark.asyncio
 async def test_get_measurements_builds_first_and_cursor_queries() -> None:
-    node = {
-        "value": "1",
-        "startAt": "2026-07-13T01:00:00+12:00",
-        "readAt": "2026-07-13T01:00:00+12:00",
-        "metaData": {
-            "utilityFilters": {
-                "readingDirection": "CONSUMPTION",
-                "readingQuality": "ACTUAL",
-                "marketSupplyPointId": "synthetic",
-            },
-            "statistics": [],
-        },
-    }
+    node = _measurement_node()
     response = {
         "account": {
             "property": {
@@ -542,7 +643,8 @@ async def test_get_measurements_builds_first_and_cursor_queries() -> None:
         before="cursor",
     )
 
-    assert first.measurements[0].channel_id == "synthetic"
+    assert len(first.measurements[0].channel_id) == 64
+    assert "synthetic" not in first.measurements[0].channel_id
     assert first.has_previous_page is True
     assert first.start_cursor == "cursor"
     assert client._async_graphql.await_args_list[0].args[2]["endOn"] == "2026-07-13"
@@ -552,32 +654,23 @@ async def test_get_measurements_builds_first_and_cursor_queries() -> None:
 
 def test_parse_consumption_measurement_filters_cost_types() -> None:
     measurement = _parse_measurement(
-        {
-            "value": "1.25",
-            "startAt": "2026-07-13T01:00:00+12:00",
-            "endAt": "2026-07-13T02:00:00+12:00",
-            "readAt": "2026-07-13T01:00:00+12:00",
-            "metaData": {
-                "utilityFilters": {
-                    "readingDirection": "CONSUMPTION",
-                    "readingQuality": "ACTUAL",
+        _measurement_node(
+            value="1.25",
+            statistics=[
+                {
+                    "type": "CONSUMPTION_COST",
+                    "costInclTax": {"estimatedAmount": "37.5"},
                 },
-                "statistics": [
-                    {
-                        "type": "CONSUMPTION_COST",
-                        "costInclTax": {"estimatedAmount": "37.5"},
-                    },
-                    {
-                        "type": "STANDING_CHARGE_COST",
-                        "costInclTax": {"estimatedAmount": "8.0"},
-                    },
-                    {
-                        "type": "UNRELATED",
-                        "costInclTax": {"estimatedAmount": "999"},
-                    },
-                ],
-            },
-        },
+                {
+                    "type": "STANDING_CHARGE_COST",
+                    "costInclTax": {"estimatedAmount": "8.0"},
+                },
+                {
+                    "type": "UNRELATED",
+                    "costInclTax": {"estimatedAmount": "999"},
+                },
+            ],
+        ),
         "CONSUMPTION",
     )
 
@@ -588,21 +681,116 @@ def test_parse_consumption_measurement_filters_cost_types() -> None:
 
 def test_parse_measurement_rejects_negative_energy() -> None:
     with pytest.raises(ValueError, match="Negative"):
-        _parse_measurement(
+        _parse_measurement(_measurement_node(value="-1"), "CONSUMPTION")
+
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
+def test_parse_measurement_rejects_non_finite_energy(value: str) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        _parse_measurement(_measurement_node(value=value), "CONSUMPTION")
+
+
+@pytest.mark.parametrize("value", ["NaN", "Infinity", "-Infinity"])
+def test_parse_measurement_rejects_non_finite_cost(value: str) -> None:
+    node = _measurement_node(
+        statistics=[
             {
-                "value": "-1",
-                "startAt": "2026-07-13T01:00:00+12:00",
-                "readAt": "2026-07-13T01:00:00+12:00",
-                "metaData": {
-                    "utilityFilters": {
-                        "readingDirection": "CONSUMPTION",
-                        "readingQuality": "ACTUAL",
-                    },
-                    "statistics": [],
-                },
-            },
-            "CONSUMPTION",
-        )
+                "type": "CONSUMPTION_COST",
+                "costInclTax": {"estimatedAmount": value},
+            }
+        ]
+    )
+    with pytest.raises(ValueError, match="finite"):
+        _parse_measurement(node, "CONSUMPTION")
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("unit", "Wh", "unit"),
+        ("endAt", None, "end"),
+        ("endAt", "2026-07-13T02:30:00+12:00", "one hour"),
+    ],
+)
+def test_parse_measurement_rejects_non_hourly_contract(
+    field: str, value: object, message: str
+) -> None:
+    node = _measurement_node()
+    node[field] = value
+    with pytest.raises(ValueError, match=message):
+        _parse_measurement(node, "CONSUMPTION")
+
+
+def test_parse_measurement_rejects_non_hourly_frequency() -> None:
+    node = _measurement_node()
+    metadata = node["metaData"]
+    assert isinstance(metadata, dict)
+    filters = metadata["utilityFilters"]
+    assert isinstance(filters, dict)
+    filters["readingFrequencyType"] = "DAY_INTERVAL"
+    with pytest.raises(ValueError, match="frequency"):
+        _parse_measurement(node, "CONSUMPTION")
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        ("2026-09-27T01:00:00+12:00", "2026-09-27T03:00:00+13:00"),
+        ("2026-04-05T02:00:00+13:00", "2026-04-05T02:00:00+12:00"),
+    ],
+)
+def test_parse_measurement_accepts_nz_dst_hour(start: str, end: str) -> None:
+    node = _measurement_node()
+    node["startAt"] = start
+    node["readAt"] = start
+    node["endAt"] = end
+
+    measurement = _parse_measurement(node, "CONSUMPTION")
+
+    assert measurement.end is not None
+    assert measurement.end.astimezone(UTC) - measurement.start.astimezone(
+        UTC
+    ) == timedelta(hours=1)
+
+
+def test_parse_measurement_requires_register_identity() -> None:
+    node = _measurement_node()
+    metadata = node["metaData"]
+    assert isinstance(metadata, dict)
+    filters = metadata["utilityFilters"]
+    assert isinstance(filters, dict)
+    filters["registerId"] = None
+    with pytest.raises(ValueError, match="registerId"):
+        _parse_measurement(node, "CONSUMPTION")
+
+
+def test_parse_measurement_channel_identity_distinguishes_devices() -> None:
+    first = _measurement_node()
+    second = _measurement_node()
+    metadata = second["metaData"]
+    assert isinstance(metadata, dict)
+    filters = metadata["utilityFilters"]
+    assert isinstance(filters, dict)
+    filters["deviceId"] = "other-synthetic-device"
+
+    first_channel = _parse_measurement(first, "CONSUMPTION").channel_id
+    second_channel = _parse_measurement(second, "CONSUMPTION").channel_id
+
+    assert first_channel != second_channel
+    assert "synthetic" not in first_channel
+    assert "synthetic" not in second_channel
+
+
+@pytest.mark.parametrize("field", ["marketSupplyPointId", "deviceId", "registerId"])
+def test_parse_measurement_requires_complete_channel_identity(field: str) -> None:
+    node = _measurement_node()
+    metadata = node["metaData"]
+    assert isinstance(metadata, dict)
+    filters = metadata["utilityFilters"]
+    assert isinstance(filters, dict)
+    filters[field] = None
+    with pytest.raises(ValueError, match=field):
+        _parse_measurement(node, "CONSUMPTION")
 
 
 @pytest.mark.asyncio
@@ -838,17 +1026,7 @@ def test_parse_firebase_tokens_rejects_non_mapping_claims() -> None:
 
 
 def test_parse_measurement_defensive_validation() -> None:
-    base = {
-        "value": "invalid",
-        "startAt": "2026-07-13T01:00:00+12:00",
-        "metaData": {
-            "utilityFilters": {
-                "readingDirection": "CONSUMPTION",
-                "readingQuality": "ACTUAL",
-            },
-            "statistics": [],
-        },
-    }
+    base = _measurement_node(value="invalid")
     with pytest.raises(ValueError, match="value"):
         _parse_measurement(base, "CONSUMPTION")
 

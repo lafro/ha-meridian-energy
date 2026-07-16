@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Awaitable, Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from aiohttp import ClientSession
 
@@ -105,8 +106,23 @@ _HTTP_REQUEST_TIMEOUT = 408
 _HTTP_TOO_MANY_REQUESTS = 429
 _HTTP_SERVER_ERROR = 500
 _LOGGER = logging.getLogger(__name__)
+_NZ = ZoneInfo("Pacific/Auckland")
 
 TokenUpdateCallback = Callable[[MeridianTokenSet], Awaitable[None]]
+
+
+def _is_active_feed_in_register(register: dict[str, Any], today: date) -> bool:
+    """Return whether a feed-in register is active on the supplied local date."""
+    is_feed_in = register.get("isFeedIn")
+    if not isinstance(is_feed_in, bool):
+        raise ValueError("Invalid feed-in register flag")
+    if not is_feed_in:
+        return False
+    active_from = _optional_date(register.get("activeFrom"))
+    active_to = _optional_date(register.get("activeTo"))
+    return (active_from is None or active_from <= today) and (
+        active_to is None or active_to >= today
+    )
 
 
 class MeridianError(Exception):
@@ -319,6 +335,7 @@ class MeridianApiClient:
             {"accountNumber": account_number, "activeFrom": "1970-01-01T00:00:00Z"},
         )
         account = require_mapping(data.get("account"), "account")
+        today = datetime.now(_NZ).date()
         properties: list[MeridianProperty] = []
         for raw_property_value in require_list(
             account.get("properties"), "account.properties"
@@ -341,7 +358,10 @@ class MeridianApiClient:
                             raw_meter, "marketIdentifier"
                         ),
                         has_feed_in=any(
-                            bool(require_mapping(register, "register").get("isFeedIn"))
+                            _is_active_feed_in_register(
+                                require_mapping(register, "register"),
+                                today,
+                            )
                             for register in registers
                         ),
                     )
