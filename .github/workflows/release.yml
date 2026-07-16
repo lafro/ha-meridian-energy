@@ -52,13 +52,38 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Create and verify immutable release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          existing_sha="$(
+            gh api "repos/$GH_REPO/git/matching-refs/tags/$RELEASE_TAG" \
+              --jq ".[] | select(.ref == \"refs/tags/$RELEASE_TAG\") | .object.sha"
+          )"
+          if [[ -n "$existing_sha" && "$existing_sha" != "$GITHUB_SHA" ]]; then
+            echo "Release tag already points to a different commit" >&2
+            exit 1
+          fi
+          if [[ -z "$existing_sha" ]]; then
+            gh api --method POST "repos/$GH_REPO/git/refs" \
+              -f ref="refs/tags/$RELEASE_TAG" \
+              -f sha="$GITHUB_SHA" >/dev/null
+          fi
+          verified_sha="$(
+            gh api "repos/$GH_REPO/git/ref/tags/$RELEASE_TAG" --jq '.object.sha'
+          )"
+          [[ "$verified_sha" == "$GITHUB_SHA" ]]
       - name: Publish stable release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag }}
         run: >-
           gh release create "$RELEASE_TAG"
-          --target "$GITHUB_SHA"
+          --verify-tag
           --title "$RELEASE_TAG"
           --generate-notes
           --fail-on-no-commits
