@@ -27,6 +27,8 @@ An unofficial Home Assistant integration for Meridian electricity usage, cost an
 
 Home Assistant renews the saved session automatically. Another code is needed only if Meridian invalidates it.
 
+Home Assistant 2026.7.2 or newer is required.
+
 ## Entities
 
 Each selected account is represented by one service device.
@@ -37,7 +39,7 @@ Each selected account is represented by one service device.
 | **Latest usage data** | End of the newest completed usage interval received. |
 | **Provisional data intervals** | Non-actual consumption intervals in the rolling 14-day correction window. |
 | **Current bill usage** | Grid import recorded in Meridian's current billing period. |
-| **Current bill cost** | Available tax-inclusive cost for that period. |
+| **Current bill cost** | Available tax-inclusive interval cost for that period, including any standing-charge components Meridian assigns to intervals. |
 | **Current bill export** | Grid export in the current period; feed-in accounts only. |
 | **Current bill export credit** | Retailer credit for that export; feed-in accounts only. |
 

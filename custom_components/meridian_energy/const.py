@@ -5,7 +5,7 @@ from datetime import timedelta
 DOMAIN = "meridian_energy"
 NAME = "Meridian Energy"
 
-CONF_REFRESH_TOKEN = "refresh_token"
+CONF_REFRESH_TOKEN = "refresh_token"  # noqa: S105 - config-entry field name
 CONF_FIREBASE_USER_ID = "firebase_user_id"
 CONF_SELECTED_ACCOUNTS = "selected_accounts"
 CONF_AUTO_ADD_ACCOUNTS = "auto_add_accounts"
@@ -16,7 +16,7 @@ AUTH_EMAIL_URL = "https://auth.meridianenergy.nz/cf/email-connector"
 AUTH_OTP_URL = "https://auth.meridianenergy.nz/cf/email-otp-authenticator"
 FIREBASE_API_KEY = "AIzaSyCYCKXQhGmo7haJxAAyO_7mIPrV7jtxsK8"
 FIREBASE_CUSTOM_TOKEN_URL = (
-    "https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken"
+    "https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken"  # noqa: S105 - public endpoint
 )
 FIREBASE_REFRESH_URL = "https://securetoken.googleapis.com/v1/token"
 GRAPHQL_URL = "https://api.meridianenergy.nz/v1/graphql/"

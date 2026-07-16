@@ -92,7 +92,16 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema({vol.Required(CONF_EMAIL): str}),
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_EMAIL): selector.TextSelector(
+                        selector.TextSelectorConfig(
+                            type=selector.TextSelectorType.EMAIL,
+                            autocomplete="email",
+                        )
+                    )
+                }
+            ),
             errors=errors,
         )
 
@@ -514,9 +523,10 @@ def _otp_error_key(code: str) -> str:
 
 def _account_label(account: MeridianAccount) -> str:
     """Return a recognisable local-only label without exposing meter IDs."""
-    address = " ".join(
-        (
-            account.properties[0].address if account.properties else "Meridian account"
-        ).split()
-    )
-    return f"{address} · account ending {account.number[-4:]}"
+    if len(account.properties) == 1:
+        label = " ".join(account.properties[0].address.split())
+    elif account.properties:
+        label = f"{len(account.properties)} properties"
+    else:
+        label = "Meridian account"
+    return f"{label} · account ending {account.number[-4:]}"

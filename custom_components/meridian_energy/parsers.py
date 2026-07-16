@@ -21,6 +21,9 @@ class TokenParseError(ValueError):
     """A Firebase token response could not be parsed safely."""
 
 
+_MAX_TOKEN_LIFETIME_SECONDS = 86400
+
+
 def parse_firebase_tokens(payload: dict[str, Any]) -> MeridianTokenSet:
     """Parse a renewable Firebase token response."""
     id_token = required_string(payload, "idToken")
@@ -33,7 +36,7 @@ def parse_firebase_tokens(payload: dict[str, Any]) -> MeridianTokenSet:
         expires_in = int(raw_expires)
     except (TypeError, ValueError) as err:
         raise TokenParseError("Firebase returned an invalid expiry") from err
-    if expires_in <= 0:
+    if expires_in <= 0 or expires_in > _MAX_TOKEN_LIFETIME_SECONDS:
         raise TokenParseError("Firebase returned an invalid expiry")
     return MeridianTokenSet(
         id_token=id_token,

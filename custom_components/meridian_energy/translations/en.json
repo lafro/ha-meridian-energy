@@ -65,7 +65,7 @@
           "selected_accounts": "Accounts"
         },
         "data_description": {
-          "selected_accounts": "New accounts and grid-export metering are discovered automatically during regular topology refreshes."
+          "selected_accounts": "Grid-export metering on selected accounts is discovered automatically. Newly available accounts appear here and are added automatically only when automatic account addition was enabled during setup."
         }
       },
       "reconfigure_discovery": {

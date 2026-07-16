@@ -284,10 +284,13 @@ class MeridianAccountSensor(CoordinatorEntity[MeridianDataCoordinator], SensorEn
         self._attr_unique_id = f"{key}_{description.key}"
         device_name = NAME
         if disambiguate:
-            address = _one_line_address(
-                account.properties[0].address if account.properties else "Account"
-            )
-            device_name = f"{NAME} — {address}"
+            if len(account.properties) == 1:
+                suffix = _one_line_address(account.properties[0].address)
+            elif account.properties:
+                suffix = f"{len(account.properties)} properties"
+            else:
+                suffix = "Account"
+            device_name = f"{NAME} — {suffix}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, key)},
             entry_type=DeviceEntryType.SERVICE,

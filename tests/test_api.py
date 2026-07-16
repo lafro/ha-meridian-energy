@@ -215,6 +215,7 @@ async def test_validate_otp_maps_error_without_leaking_payload() -> None:
         await client.async_validate_otp("person@example.com", "123456", "journey")
 
     assert raised.value.code == "OTP_NOT_FOUND"
+    assert str(raised.value) == "Meridian rejected the login code"
 
 
 @pytest.mark.asyncio
@@ -976,7 +977,9 @@ async def test_json_request_maps_network_error() -> None:
         await client._async_json_request("https://example.test", authenticated=False)
 
 
-@pytest.mark.parametrize("expires", [None, "not-a-number", "0", -1])
+@pytest.mark.parametrize(
+    "expires", [None, "not-a-number", "0", -1, "999999999999999999999999"]
+)
 def test_parse_firebase_tokens_rejects_invalid_expiry(expires) -> None:
     with pytest.raises(MeridianAuthenticationError):
         _parse_firebase_tokens(
@@ -1085,6 +1088,13 @@ def test_parsing_helpers_reject_invalid_values() -> None:
     assert _optional_string("value") == "value"
     assert _optional_string(1) is None
     assert _graphql_error_code({}) == "UNKNOWN"
+    assert (
+        _graphql_error_code({"extensions": {"errorCode": "KT-CT-1111"}}) == "KT-CT-1111"
+    )
+    assert (
+        _graphql_error_code({"extensions": {"errorCode": "secret\nvalue"}}) == "UNKNOWN"
+    )
+    assert _graphql_error_code({"extensions": {"errorCode": "A" * 65}}) == "UNKNOWN"
     assert optional_date(None) is None
     with pytest.raises(ValueError, match="billing date"):
         optional_date(1)

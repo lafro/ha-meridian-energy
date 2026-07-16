@@ -36,7 +36,10 @@ from custom_components.meridian_energy.models import (
 )
 from custom_components.meridian_energy.sensor import (
     DESCRIPTIONS,
+    _billing_data_complete,
+    _billing_total,
     _remove_stale_devices,
+    _remove_stale_entities,
     async_setup_entry,
 )
 from custom_components.meridian_energy.statistics import account_key
@@ -297,6 +300,102 @@ async def test_solar_entities_and_multiple_account_device_name(hass) -> None:
     assert entities[6].extra_state_attributes["data_complete"] is False
     assert entities[0].device_info["name"] == "Meridian Energy — 1 Synthetic Street"
     await entry._async_process_on_unload(hass)
+
+
+@pytest.mark.asyncio
+async def test_multiple_property_account_uses_count_in_device_name(hass) -> None:
+    account = _account()
+    account = replace(
+        account,
+        properties=(
+            *account.properties,
+            replace(
+                account.properties[0],
+                id="second-property",
+                address="2 Synthetic Street",
+            ),
+        ),
+    )
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    coordinator._topology = (account,)
+    coordinator.data = _data()
+    entities = []
+    entry = _entry(coordinator)
+
+    await async_setup_entry(hass, entry, entities.extend)
+
+    assert entities[0].device_info["name"] == "Meridian Energy — 2 properties"
+    await entry._async_process_on_unload(hass)
+
+
+@pytest.mark.asyncio
+async def test_account_without_properties_uses_generic_device_suffix(hass) -> None:
+    """Keep a stable, non-sensitive device name for incomplete topology."""
+    account = replace(_account(), properties=())
+    second_account = replace(
+        _account(),
+        number="second-account",
+        properties=(
+            *_account().properties,
+            replace(_account().properties[0], id="second-property"),
+        ),
+    )
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    coordinator._topology = (account, second_account)
+    data = _data()
+    coordinator.data = replace(
+        data,
+        account_results=(
+            data.account_results[0],
+            replace(
+                data.account_results[0],
+                account_key=account_key(second_account.number),
+            ),
+        ),
+    )
+    entities = []
+    entry = _entry(coordinator)
+
+    await async_setup_entry(hass, entry, entities.extend)
+
+    assert entities[0].device_info["name"] == "Meridian Energy — Account"
+    await entry._async_process_on_unload(hass)
+
+
+def test_stale_entity_cleanup_skips_entities_owned_by_another_entry(hass) -> None:
+    """Never remove a registry entity belonging to a different config entry."""
+    entry = _entry(MagicMock())
+    entity_registry = MagicMock()
+    entity_registry.async_get_entity_id.side_effect = [
+        "sensor.shared",
+        "sensor.owned",
+    ]
+    entity_registry.async_get.side_effect = [
+        SimpleNamespace(config_entry_id="other-entry"),
+        SimpleNamespace(config_entry_id=entry.entry_id),
+    ]
+
+    with patch(
+        "custom_components.meridian_energy.sensor.er.async_get",
+        return_value=entity_registry,
+    ):
+        _remove_stale_entities(
+            hass,
+            entry,
+            {(ACCOUNT_KEY, "shared"), (ACCOUNT_KEY, "owned")},
+        )
+
+    entity_registry.async_remove.assert_called_once_with("sensor.owned")
+
+
+def test_billing_helpers_reject_unsupported_internal_keys() -> None:
+    """Fail loudly if a future entity bypasses the audited billing contract."""
+    result = _data().account_results[0]
+
+    with pytest.raises(ValueError, match="Unsupported billing metric"):
+        _billing_total(_data(), ACCOUNT_KEY, "unsupported")
+    with pytest.raises(ValueError, match="Unsupported billing sensor"):
+        _billing_data_complete(result, "unsupported")
 
 
 @pytest.mark.asyncio
