@@ -201,10 +201,14 @@ def _aggregate_measurements(
         start = measurement.start.astimezone(UTC)
         if start.minute or start.second or start.microsecond:
             raise ValueError("Meridian measurement is not aligned to an hour")
+        if not measurement.value_kwh.is_finite():
+            raise ValueError("Meridian measurement value is not finite")
         energy[start] += measurement.value_kwh
         if measurement.cost_cents is None:
             cost_complete[start] = False
         else:
+            if not measurement.cost_cents.is_finite():
+                raise ValueError("Meridian measurement cost is not finite")
             cost[start] += measurement.cost_cents
     return {
         start: (energy[start], cost[start] if cost_complete[start] else None)

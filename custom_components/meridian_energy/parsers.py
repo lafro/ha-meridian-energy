@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from .const import COST_STATISTIC_TYPES, GENERATION_CREDIT_TYPES
+from .const import (
+    COST_STATISTIC_TYPES,
+    GENERATION_CREDIT_TYPES,
+    READING_FREQUENCY_HOUR,
+)
 from .models import MeridianMeasurement, MeridianTokenSet, require_list, require_mapping
 
 
@@ -65,14 +70,13 @@ def parse_measurement(
     node: dict[str, Any], expected_direction: str
 ) -> MeridianMeasurement:
     """Parse one hourly electricity measurement."""
-    start_value = node.get("startAt") or node.get("readAt")
-    start = parse_datetime(start_value, "measurement start")
-    end_value = node.get("endAt")
-    end = parse_datetime(end_value, "measurement end") if end_value else None
-    try:
-        value = Decimal(str(node.get("value")))
-    except (InvalidOperation, TypeError) as err:
-        raise ValueError("Invalid measurement value") from err
+    start = parse_datetime(node.get("startAt"), "measurement start")
+    end = parse_datetime(node.get("endAt"), "measurement end")
+    if end.astimezone(UTC) - start.astimezone(UTC) != timedelta(hours=1):
+        raise ValueError("Measurement interval is not exactly one hour")
+    if required_string(node, "unit") != "kWh":
+        raise ValueError("Unexpected measurement unit")
+    value = _finite_decimal(node.get("value"), "measurement value")
     if value < 0:
         raise ValueError("Negative electricity measurement")
 
@@ -81,12 +85,34 @@ def parse_measurement(
     direction = required_string(filters, "readingDirection")
     if direction != expected_direction:
         raise ValueError("Unexpected measurement direction")
+    if required_string(filters, "readingFrequencyType") != READING_FREQUENCY_HOUR:
+        raise ValueError("Unexpected measurement frequency")
     quality = required_string(filters, "readingQuality")
-    channel_parts = [
-        str(filters[key])
+    channel_id = _measurement_channel_id(filters)
+
+    return MeridianMeasurement(
+        start=start,
+        end=end,
+        value_kwh=value,
+        quality=quality,
+        direction=direction,
+        channel_id=channel_id,
+        cost_cents=_measurement_cost_cents(metadata, direction),
+    )
+
+
+def _measurement_channel_id(filters: dict[str, Any]) -> str:
+    """Return a stable, privacy-safe identity for one physical meter channel."""
+    parts = [
+        required_string(filters, key)
         for key in ("marketSupplyPointId", "deviceId", "registerId")
-        if filters.get(key) not in {None, ""}
     ]
+    canonical = json.dumps(parts, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _measurement_cost_cents(metadata: dict[str, Any], direction: str) -> Decimal | None:
+    """Return a complete interval cost or credit, in cents."""
     allowed_cost_types = (
         GENERATION_CREDIT_TYPES if direction == "GENERATION" else COST_STATISTIC_TYPES
     )
@@ -109,20 +135,19 @@ def parse_measurement(
         if amount in {None, ""}:
             incomplete_cost = True
             continue
-        try:
-            cost_cents += abs(Decimal(str(amount)))
-        except InvalidOperation as err:
-            raise ValueError("Invalid measurement cost") from err
+        cost_cents += abs(_finite_decimal(amount, "measurement cost"))
+    return None if not found_cost or incomplete_cost else cost_cents
 
-    return MeridianMeasurement(
-        start=start,
-        end=end,
-        value_kwh=value,
-        quality=quality,
-        direction=direction,
-        channel_id=":".join(channel_parts) or "aggregate",
-        cost_cents=None if not found_cost or incomplete_cost else cost_cents,
-    )
+
+def _finite_decimal(value: Any, context: str) -> Decimal:
+    """Parse one finite upstream decimal value."""
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError) as err:
+        raise ValueError(f"Invalid {context}") from err
+    if not parsed.is_finite():
+        raise ValueError(f"{context.capitalize()} is not finite")
+    return parsed
 
 
 def parse_datetime(value: Any, context: str) -> datetime:
