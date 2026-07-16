@@ -14,10 +14,12 @@
       "cannot_connect": "Unable to reach Meridian. Check your internet connection and try again.",
       "email_not_found": "Meridian did not accept that email address.",
       "invalid_auth": "Meridian rejected the login attempt. Request a new code and try again.",
+      "invalid_data": "Meridian returned account data Home Assistant could not use. Try again later.",
       "otp_expired": "The code has expired. Start setup again to request a new one.",
       "otp_invalid": "The code is incorrect. Check the email and try again.",
       "otp_not_found": "The code has already been used or was not found. Start setup again.",
       "otp_too_many_attempts": "Too many attempts were made. Start setup again to request a new code.",
+      "rate_limited": "Meridian asked Home Assistant to wait before trying again. Please retry later.",
       "select_account": "Select at least one available Meridian account."
     },
     "step": {
@@ -41,6 +43,11 @@
           "otp": "Codes are single-use and expire quickly."
         }
       },
+      "discovery_retry": {
+        "title": "Retry Meridian account discovery",
+        "description": "Authentication succeeded, but Home Assistant could not retrieve your Meridian accounts. Submit to retry without requesting or reusing a login code.",
+        "data": {}
+      },
       "accounts": {
         "title": "Choose Meridian accounts",
         "description": "Select the electricity accounts to import. Each selected account will have its own device, billing-period totals and statistics.",
@@ -60,6 +67,11 @@
         "data_description": {
           "selected_accounts": "New accounts and grid-export metering are discovered automatically during regular topology refreshes."
         }
+      },
+      "reconfigure_discovery": {
+        "title": "Retry Meridian account discovery",
+        "description": "Home Assistant could not retrieve the available Meridian accounts. Submit to try again.",
+        "data": {}
       },
       "reauth_confirm": {
         "title": "Reconnect Meridian Energy",

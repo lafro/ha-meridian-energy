@@ -95,7 +95,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> 
             },
         )
     entry.runtime_data = MeridianRuntimeData(client, coordinator)
-    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     if hass.state is not CoreState.running:
 
         async def async_refresh_billing_after_start(_hass: HomeAssistant) -> None:
@@ -155,10 +154,3 @@ async def async_remove_config_entry_device(
         if identifier[0] == DOMAIN
     }
     return bool(device_keys) and device_keys.isdisjoint(current_keys)
-
-
-async def _async_update_listener(
-    hass: HomeAssistant, entry: MeridianConfigEntry
-) -> None:
-    """Reload the integration when selected accounts change."""
-    await hass.config_entries.async_reload(entry.entry_id)
