@@ -18,6 +18,7 @@ from custom_components.meridian_energy.api import (
     MeridianOtpError,
     MeridianRateLimitError,
     _graphql_error_code,
+    _is_active_feed_in_register,
     _MeridianHttpError,
     _optional_string,
     _parse_datetime,
@@ -486,6 +487,38 @@ async def test_get_accounts_ignores_inactive_feed_in_registers() -> None:
     accounts = await client.async_get_accounts()
 
     assert accounts[0].properties[0].meter_points[0].has_feed_in is False
+
+
+@pytest.mark.parametrize(
+    ("register", "today", "expected"),
+    [
+        ({"isFeedIn": False}, date(2026, 7, 16), False),
+        ({"isFeedIn": True}, date(2026, 7, 16), True),
+        (
+            {
+                "isFeedIn": True,
+                "activeFrom": "2026-07-16",
+                "activeTo": "2026-07-16",
+            },
+            date(2026, 7, 16),
+            True,
+        ),
+        (
+            {"isFeedIn": True, "activeFrom": None, "activeTo": "2026-07-15"},
+            date(2026, 7, 16),
+            False,
+        ),
+    ],
+)
+def test_active_feed_in_register_contract(
+    register: dict[str, object], today: date, expected: bool
+) -> None:
+    assert _is_active_feed_in_register(register, today) is expected
+
+
+def test_active_feed_in_register_rejects_invalid_flag() -> None:
+    with pytest.raises(ValueError, match="flag"):
+        _is_active_feed_in_register({"isFeedIn": "yes"}, date(2026, 7, 16))
 
 
 @pytest.mark.asyncio
