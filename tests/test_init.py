@@ -16,7 +16,6 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 from custom_components.meridian_energy import (
     MeridianDataCoordinator,
     MeridianRuntimeData,
-    _async_update_listener,
     async_migrate_entry,
     async_remove_config_entry_device,
     async_setup_entry,
@@ -144,6 +143,7 @@ async def test_setup_entry_and_rotating_token_persistence(hass) -> None:
         patch.object(
             hass.config_entries, "async_forward_entry_setups", AsyncMock()
         ) as forward,
+        patch.object(hass.config_entries, "async_reload", AsyncMock()) as reload_entry,
     ):
         assert await async_setup_entry(hass, entry) is True
         callback = client_class.call_args.kwargs["token_update_callback"]
@@ -155,12 +155,14 @@ async def test_setup_entry_and_rotating_token_persistence(hass) -> None:
                 user_id="new-user",
             )
         )
+        await hass.async_block_till_done()
 
     assert isinstance(entry.runtime_data, MeridianRuntimeData)
     coordinator.async_config_entry_first_refresh.assert_awaited_once()
     forward.assert_awaited_once()
     assert entry.data[CONF_REFRESH_TOKEN] == "rotated-refresh"
     assert "id_token" not in entry.data
+    reload_entry.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -335,14 +337,6 @@ async def test_manual_device_removal_only_allows_stale_meridian_devices(hass) ->
     assert not await async_remove_config_entry_device(hass, entry, active)
     assert await async_remove_config_entry_device(hass, entry, stale)
     assert not await async_remove_config_entry_device(hass, entry, unrelated)
-
-
-@pytest.mark.asyncio
-async def test_update_listener_reloads_entry(hass) -> None:
-    entry = _entry(version=3)
-    with patch.object(hass.config_entries, "async_reload", AsyncMock()) as reload_entry:
-        await _async_update_listener(hass, entry)
-    reload_entry.assert_awaited_once_with(entry.entry_id)
 
 
 class TestPublicConfigEntryLifecycle:

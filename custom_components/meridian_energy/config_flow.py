@@ -10,6 +10,7 @@ from uuid import uuid4
 
 import voluptuous as vol
 from homeassistant.config_entries import (
+    SOURCE_REAUTH,
     ConfigEntry,
     ConfigFlow,
     ConfigFlowResult,
@@ -23,7 +24,9 @@ from .api import (
     MeridianApiClient,
     MeridianAuthenticationError,
     MeridianConnectionError,
+    MeridianGraphQLError,
     MeridianOtpError,
+    MeridianRateLimitError,
 )
 from .const import (
     CONF_AUTO_ADD_ACCOUNTS,
@@ -59,6 +62,8 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
         self._reauth_entry: ConfigEntry | None = None
         self._pending_data: dict[str, Any] | None = None
         self._tokens: MeridianTokenSet | None = None
+        self._discovery_client: MeridianApiClient | None = None
+        self._reconfigure_tokens: MeridianTokenSet | None = None
         self._accounts: tuple[MeridianAccount, ...] = ()
         self._selected_accounts: frozenset[str] = frozenset()
         self._initial_import_task: asyncio.Task[None] | None = None
@@ -135,14 +140,33 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
         """Discover accounts after authentication and route to selection."""
         self._pending_data = data
         self._tokens = tokens
+        self._discovery_client = self._authenticated_client(tokens)
+        return await self.async_step_discovery_retry()
+
+    async def async_step_discovery_retry(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Retry authenticated account discovery without reusing the OTP."""
+        del user_input
+        if self._discovery_client is None:
+            return self.async_abort(reason="login_expired")
+        errors: dict[str, str] = {}
         try:
-            self._accounts = await self._authenticated_client(
-                tokens
-            ).async_get_accounts()
+            self._accounts = await self._discovery_client.async_get_accounts()
+        except MeridianRateLimitError:
+            errors["base"] = "rate_limited"
         except MeridianConnectionError:
-            return self._show_otp_form({"base": "cannot_connect"})
-        except MeridianAuthenticationError, ValueError:
-            return self._show_otp_form({"base": "invalid_auth"})
+            errors["base"] = "cannot_connect"
+        except MeridianAuthenticationError:
+            return self.async_abort(reason="login_expired")
+        except MeridianGraphQLError, ValueError:
+            errors["base"] = "invalid_data"
+        if errors:
+            return self.async_show_form(
+                step_id="discovery_retry",
+                data_schema=vol.Schema({}),
+                errors=errors,
+            )
         if not self._accounts:
             return self.async_abort(reason="no_accounts")
         if len(self._accounts) > 1:
@@ -283,7 +307,22 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
 
     def _authenticated_client(self, tokens: MeridianTokenSet) -> MeridianApiClient:
         """Create a client using the session validated by this flow."""
-        return MeridianApiClient(async_get_clientsession(self.hass), tokens=tokens)
+        return MeridianApiClient(
+            async_get_clientsession(self.hass),
+            tokens=tokens,
+            token_update_callback=self._async_store_discovery_tokens,
+        )
+
+    async def _async_store_discovery_tokens(self, tokens: MeridianTokenSet) -> None:
+        """Retain credentials rotated during discovery or the initial import."""
+        self._tokens = tokens
+        if self._pending_data is not None:
+            self._pending_data.update(
+                {
+                    CONF_REFRESH_TOKEN: tokens.refresh_token,
+                    CONF_FIREBASE_USER_ID: tokens.user_id,
+                }
+            )
 
     def _show_otp_form(self, errors: dict[str, str]) -> ConfigFlowResult:
         """Show the serializable six-digit login-code form."""
@@ -348,21 +387,11 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
         entry = self._get_reconfigure_entry()
         errors: dict[str, str] = {}
         if not self._accounts:
-            tokens = MeridianTokenSet(
-                id_token="",
-                refresh_token=str(entry.data[CONF_REFRESH_TOKEN]),
-                expires_at=datetime.fromtimestamp(0, UTC),
-                user_id=str(entry.data[CONF_FIREBASE_USER_ID]),
-            )
-            client = MeridianApiClient(
-                async_get_clientsession(self.hass), tokens=tokens
-            )
-            try:
-                self._accounts = await client.async_get_accounts()
-            except MeridianConnectionError:
-                errors["base"] = "cannot_connect"
-            except MeridianAuthenticationError:
-                errors["base"] = "invalid_auth"
+            discovery_result = await self._async_discover_reconfigure_accounts(entry)
+            if discovery_result is not None:
+                return discovery_result
+        if not self._accounts:
+            return self.async_abort(reason="no_accounts")
 
         available = {account.number for account in self._accounts}
         if user_input is not None and available:
@@ -372,12 +401,20 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
             if not selected or not selected.issubset(available):
                 errors["base"] = "select_account"
             else:
+                data_updates: dict[str, Any] = {
+                    CONF_SELECTED_ACCOUNTS: sorted(selected),
+                    CONF_AUTO_ADD_ACCOUNTS: selected == available,
+                }
+                if self._reconfigure_tokens is not None:
+                    data_updates.update(
+                        {
+                            CONF_REFRESH_TOKEN: self._reconfigure_tokens.refresh_token,
+                            CONF_FIREBASE_USER_ID: self._reconfigure_tokens.user_id,
+                        }
+                    )
                 return self.async_update_reload_and_abort(
                     entry,
-                    data_updates={
-                        CONF_SELECTED_ACCOUNTS: sorted(selected),
-                        CONF_AUTO_ADD_ACCOUNTS: selected == available,
-                    },
+                    data_updates=data_updates,
                 )
 
         current = entry.data.get(CONF_SELECTED_ACCOUNTS, sorted(available))
@@ -403,6 +440,66 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
                 }
             ),
             errors=errors,
+        )
+
+    async def async_step_reconfigure_discovery(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """Retry account discovery while reconfiguring."""
+        del user_input
+        return await self.async_step_reconfigure()
+
+    async def _async_discover_reconfigure_accounts(
+        self, entry: ConfigEntry
+    ) -> ConfigFlowResult | None:
+        """Discover accounts and preserve any credentials rotated during refresh."""
+        tokens = self._reconfigure_tokens or MeridianTokenSet(
+            id_token="",
+            refresh_token=str(entry.data[CONF_REFRESH_TOKEN]),
+            expires_at=datetime.fromtimestamp(0, UTC),
+            user_id=str(entry.data[CONF_FIREBASE_USER_ID]),
+        )
+
+        async def async_capture_tokens(updated: MeridianTokenSet) -> None:
+            self._reconfigure_tokens = updated
+            self.hass.config_entries.async_update_entry(
+                entry,
+                data={
+                    **entry.data,
+                    CONF_REFRESH_TOKEN: updated.refresh_token,
+                    CONF_FIREBASE_USER_ID: updated.user_id,
+                },
+            )
+
+        runtime_data = getattr(entry, "runtime_data", None)
+        client = getattr(runtime_data, "client", None)
+        if client is None:
+            client = MeridianApiClient(
+                async_get_clientsession(self.hass),
+                tokens=tokens,
+                token_update_callback=async_capture_tokens,
+            )
+        try:
+            self._accounts = await client.async_get_accounts()
+        except MeridianRateLimitError:
+            error = "rate_limited"
+        except MeridianConnectionError:
+            error = "cannot_connect"
+        except MeridianAuthenticationError:
+            self.context["source"] = SOURCE_REAUTH
+            self._reauth_entry = entry
+            self._email = str(entry.data[CONF_EMAIL]).strip().lower()
+            return await self.async_step_reauth_confirm()
+        except MeridianGraphQLError, ValueError:
+            error = "invalid_data"
+        else:
+            if isinstance(client.tokens, MeridianTokenSet):
+                self._reconfigure_tokens = client.tokens
+            return None
+        return self.async_show_form(
+            step_id="reconfigure_discovery",
+            data_schema=vol.Schema({}),
+            errors={"base": error},
         )
 
 
