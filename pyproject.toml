@@ -9,7 +9,7 @@ license = "MIT"
 [dependency-groups]
 dev = [
   "aioresponses>=0.7.8",
-  "homeassistant==2026.7.2",
+  "homeassistant==2026.7.4",
   "mypy>=1.17.0",
   "pytest>=8.4.1",
   "pytest-asyncio>=1.1.0",
@@ -20,7 +20,13 @@ dev = [
 
 [tool.uv]
 package = false
-required-version = "==0.11.14"
+required-version = ">=0.11.8,<0.12"
+override-dependencies = [
+  # Home Assistant 2026.7.4 pins the vulnerable predecessors. These patched
+  # versions match Home Assistant's development branch pending its next release.
+  "Pillow==12.3.0",
+  "PyJWT==2.13.0"
+]
 
 [tool.pytest.ini_options]
 addopts = "--strict-config --strict-markers --cov=custom_components.meridian_energy --cov-report=term-missing --cov-report=xml --cov-fail-under=98"

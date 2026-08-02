@@ -804,9 +804,15 @@ async def test_direction_mode_does_not_backfill_only_for_missing_money(hass) -> 
 async def test_restart_with_missing_money_uses_revision_window(hass) -> None:
     for _ in range(2):
         coordinator = MeridianDataCoordinator(hass, MagicMock())
-        with patch(
-            "custom_components.meridian_energy.coordinator.async_latest_numeric_statistic_start",
-            new=AsyncMock(side_effect=[NOW, None]),
+        with (
+            patch(
+                "custom_components.meridian_energy.coordinator.async_latest_numeric_statistic_start",
+                new=AsyncMock(side_effect=[NOW, None]),
+            ),
+            patch(
+                "custom_components.meridian_energy.coordinator._utcnow",
+                return_value=NOW,
+            ),
         ):
             mode = await coordinator._direction_mode(
                 CACHE_KEY,
