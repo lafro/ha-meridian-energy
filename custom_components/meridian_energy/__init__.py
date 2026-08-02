@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -18,7 +19,9 @@ from .const import (
     CONF_FIREBASE_USER_ID,
     CONF_REFRESH_TOKEN,
     CONF_SELECTED_ACCOUNTS,
+    CONF_STATISTICS_STATE_VERSION,
     DOMAIN,
+    STATISTICS_STATE_VERSION,
 )
 from .coordinator import MeridianDataCoordinator
 from .models import MeridianTokenSet
@@ -26,6 +29,7 @@ from .statistics import account_key
 
 PLATFORMS = [Platform.SENSOR]
 CONFIG_ENTRY_VERSION = 3
+CONFIG_ENTRY_MINOR_VERSION = 1
 
 
 @dataclass(slots=True)
@@ -37,6 +41,21 @@ class MeridianRuntimeData:
 
 
 type MeridianConfigEntry = ConfigEntry[MeridianRuntimeData]
+
+
+def _selected_accounts(data: Mapping[str, object]) -> frozenset[str]:
+    """Validate and normalize the required selected-account config field."""
+    configured_accounts = data[CONF_SELECTED_ACCOUNTS]
+    if (
+        not isinstance(configured_accounts, list)
+        or not configured_accounts
+        or any(
+            not isinstance(account, str) or not account
+            for account in configured_accounts
+        )
+    ):
+        raise ValueError("Invalid Meridian account selection")
+    return frozenset(configured_accounts)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> bool:
@@ -58,6 +77,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> 
             },
         )
 
+    selected_accounts = _selected_accounts(entry.data)
     tokens = MeridianTokenSet(
         id_token="",
         refresh_token=str(entry.data[CONF_REFRESH_TOKEN]),
@@ -68,9 +88,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> 
         async_get_clientsession(hass),
         tokens=tokens,
         token_update_callback=async_store_tokens,
-    )
-    selected_accounts = frozenset(
-        str(value) for value in entry.data[CONF_SELECTED_ACCOUNTS]
     )
     coordinator = MeridianDataCoordinator(
         hass,
@@ -99,9 +116,28 @@ async def async_unload_entry(hass: HomeAssistant, entry: MeridianConfigEntry) ->
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Accept only the supported config-entry version."""
-    del hass
-    return entry.version == CONFIG_ENTRY_VERSION
+    """Promote completed v0.2.4 entries to the v0.2.5 compatibility boundary."""
+    if entry.version != CONFIG_ENTRY_VERSION:
+        return False
+    if entry.minor_version == CONFIG_ENTRY_MINOR_VERSION:
+        return True
+    if entry.minor_version != 0:
+        return False
+    try:
+        _selected_accounts(entry.data)
+    except KeyError, ValueError:
+        return False
+    marker = entry.data.get(CONF_STATISTICS_STATE_VERSION)
+    if type(marker) is not int or marker != STATISTICS_STATE_VERSION:
+        return False
+    data = dict(entry.data)
+    data.pop(CONF_STATISTICS_STATE_VERSION)
+    hass.config_entries.async_update_entry(
+        entry,
+        data=data,
+        minor_version=CONFIG_ENTRY_MINOR_VERSION,
+    )
+    return True
 
 
 async def async_remove_config_entry_device(

@@ -54,7 +54,7 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
     """Set up a Meridian Energy account."""
 
     VERSION = 3
-    MINOR_VERSION = 0
+    MINOR_VERSION = 1
 
     def __init__(self) -> None:
         self._email: str | None = None
