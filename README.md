@@ -29,6 +29,9 @@ Home Assistant renews the saved session automatically. Another code is needed on
 
 Home Assistant 2026.7.2 or newer is required.
 
+Upgrading to v0.2.5 requires an existing v0.2.4 or newer installation; older
+config entries are not supported.
+
 ## Entities
 
 Each selected account is represented by one service device.

@@ -144,7 +144,10 @@ async def test_user_flow_success(hass) -> None:
 
     assert result["type"] is FlowResultType.CREATE_ENTRY
     assert result["title"] == NAME
+    assert result["data"][CONF_EMAIL] == "person@example.com"
     assert result["data"][CONF_REFRESH_TOKEN] == "synthetic-refresh"
+    assert result["data"][CONF_FIREBASE_USER_ID] == "synthetic-user"
+    assert result["data"][CONF_SELECTED_ACCOUNTS] == ["synthetic-account"]
     assert result["data"][CONF_AUTO_ADD_ACCOUNTS] is True
     assert "id_token" not in result["data"]
     assert "otp" not in result["data"]

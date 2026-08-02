@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import CoreState, HomeAssistant, callback
+from homeassistant.core import CoreState, HomeAssistant
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceEntry
 from homeassistant.helpers.start import async_at_started
@@ -18,24 +18,14 @@ from .const import (
     CONF_FIREBASE_USER_ID,
     CONF_REFRESH_TOKEN,
     CONF_SELECTED_ACCOUNTS,
-    CONF_STATISTICS_STATE_VERSION,
     DOMAIN,
-    NAME,
-    STATISTICS_STATE_VERSION,
 )
 from .coordinator import MeridianDataCoordinator
 from .models import MeridianTokenSet
-from .statistics import (
-    account_key,
-    async_repair_external_statistics_states,
-    consumption_ids,
-    generation_ids,
-    property_key,
-)
+from .statistics import account_key
 
 PLATFORMS = [Platform.SENSOR]
 CONFIG_ENTRY_VERSION = 3
-_OPTIONS_FLOW_ENTRY_VERSION = 2
 
 
 @dataclass(slots=True)
@@ -47,55 +37,6 @@ class MeridianRuntimeData:
 
 
 type MeridianConfigEntry = ConfigEntry[MeridianRuntimeData]
-
-
-def _statistics_state_version(entry: MeridianConfigEntry) -> int:
-    """Return the stored external-statistics state contract version."""
-    raw_state_version = entry.data.get(CONF_STATISTICS_STATE_VERSION, 0)
-    try:
-        return int(raw_state_version)
-    except TypeError, ValueError:
-        return 0
-
-
-async def _async_repair_statistics(
-    hass: HomeAssistant,
-    entry: MeridianConfigEntry,
-    statistic_ids: set[str],
-) -> None:
-    """Repair statistics and mark the completed contract version."""
-    if _statistics_state_version(entry) >= STATISTICS_STATE_VERSION:
-        return
-    if not await async_repair_external_statistics_states(
-        hass, statistic_ids=statistic_ids
-    ):
-        return
-    hass.config_entries.async_update_entry(
-        entry,
-        data={
-            **entry.data,
-            CONF_STATISTICS_STATE_VERSION: STATISTICS_STATE_VERSION,
-        },
-    )
-
-
-@callback
-def _schedule_statistics_repair(
-    hass: HomeAssistant,
-    entry: MeridianConfigEntry,
-    statistic_ids: set[str],
-) -> None:
-    """Schedule config-entry-owned repair after Home Assistant starts."""
-
-    @callback
-    def schedule(_hass: HomeAssistant) -> None:
-        entry.async_create_background_task(
-            hass,
-            _async_repair_statistics(hass, entry, statistic_ids),
-            f"{DOMAIN} statistics state repair",
-        )
-
-    entry.async_on_unload(async_at_started(hass, schedule))
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> bool:
@@ -128,11 +69,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> 
         tokens=tokens,
         token_update_callback=async_store_tokens,
     )
-    configured_accounts = entry.data.get(CONF_SELECTED_ACCOUNTS)
-    selected_accounts = (
-        frozenset(str(value) for value in configured_accounts)
-        if configured_accounts is not None
-        else None
+    selected_accounts = frozenset(
+        str(value) for value in entry.data[CONF_SELECTED_ACCOUNTS]
     )
     coordinator = MeridianDataCoordinator(
         hass,
@@ -142,30 +80,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> 
         auto_add_accounts=bool(entry.data.get(CONF_AUTO_ADD_ACCOUNTS, False)),
     )
     await coordinator.async_config_entry_first_refresh()
-    statistics_state_version = _statistics_state_version(entry)
-    owned_statistic_ids = {
-        statistic_id
-        for account in coordinator.accounts
-        for property_data in account.properties
-        for statistic_id in (
-            *consumption_ids(property_key(account.number, property_data.id)),
-            *generation_ids(property_key(account.number, property_data.id)),
-        )
-    }
-    if configured_accounts is None:
-        hass.config_entries.async_update_entry(
-            entry,
-            data={
-                **entry.data,
-                CONF_SELECTED_ACCOUNTS: sorted(
-                    account.number for account in coordinator.accounts
-                ),
-            },
-        )
     entry.runtime_data = MeridianRuntimeData(client, coordinator)
-
-    if statistics_state_version < STATISTICS_STATE_VERSION:
-        _schedule_statistics_repair(hass, entry, owned_statistic_ids)
 
     if needs_startup_billing_refresh:
 
@@ -184,28 +99,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: MeridianConfigEntry) ->
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Migrate legacy account options into reconfigurable entry data."""
-    if entry.version == 1:
-        hass.config_entries.async_update_entry(entry, version=2, minor_version=0)
-    if entry.version == _OPTIONS_FLOW_ENTRY_VERSION:
-        selected_accounts = entry.options.get(
-            CONF_SELECTED_ACCOUNTS, entry.data.get(CONF_SELECTED_ACCOUNTS)
-        )
-        data = dict(entry.data)
-        if selected_accounts is not None:
-            data[CONF_SELECTED_ACCOUNTS] = sorted(
-                str(value) for value in selected_accounts
-            )
-        data.setdefault(CONF_AUTO_ADD_ACCOUNTS, False)
-        hass.config_entries.async_update_entry(
-            entry,
-            data=data,
-            options={},
-            title=NAME,
-            version=CONFIG_ENTRY_VERSION,
-            minor_version=0,
-        )
-        return True
+    """Accept only the supported config-entry version."""
+    del hass
     return entry.version == CONFIG_ENTRY_VERSION
 
 
