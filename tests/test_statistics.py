@@ -232,18 +232,39 @@ async def test_latest_numeric_statistic_start_skips_null_rows() -> None:
 
 
 @pytest.mark.asyncio
-async def test_clear_statistics_handles_empty_and_sorted_ids() -> None:
+async def test_clear_statistics_handles_empty_and_sorted_ids(hass) -> None:
     instance = MagicMock()
-    instance.async_add_executor_job = AsyncMock()
+    instance.async_clear_statistics.side_effect = lambda _ids, *, on_done: on_done()
     with patch(
         "custom_components.meridian_energy.statistics.get_instance",
         return_value=instance,
     ):
-        await async_clear_statistics(AsyncMock(), set())
-        instance.async_add_executor_job.assert_not_awaited()
-        await async_clear_statistics(AsyncMock(), {"b", "a"})
+        await async_clear_statistics(hass, set())
+        instance.async_clear_statistics.assert_not_called()
+        await async_clear_statistics(hass, {"b", "a"})
 
-    assert instance.async_add_executor_job.await_args.args[2] == ["a", "b"]
+    assert instance.async_clear_statistics.call_args.args == (["a", "b"],)
+
+
+@pytest.mark.asyncio
+async def test_clear_statistics_timeout_keeps_caller_error_path(hass, caplog) -> None:
+    """A slow recorder stops the wait without raising over the original error."""
+    instance = MagicMock()
+    with (
+        patch(
+            "custom_components.meridian_energy.statistics.get_instance",
+            return_value=instance,
+        ),
+        patch(
+            "custom_components.meridian_energy.statistics."
+            "CLEAR_STATISTICS_TIMEOUT_SECONDS",
+            0,
+        ),
+    ):
+        await async_clear_statistics(hass, {"a"})
+
+    instance.async_clear_statistics.assert_called_once()
+    assert "removal remains queued" in caplog.text
 
 
 @pytest.mark.asyncio

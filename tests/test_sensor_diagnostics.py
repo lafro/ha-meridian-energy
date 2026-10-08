@@ -82,14 +82,14 @@ def test_sensor_descriptions_follow_home_assistant_semantics() -> None:
         description = descriptions[key]
         assert description.device_class is SensorDeviceClass.ENERGY
         assert description.native_unit_of_measurement is UnitOfEnergy.KILO_WATT_HOUR
-        assert description.state_class is SensorStateClass.TOTAL
+        assert description.state_class is None
         assert description.suggested_display_precision == 1
 
     for key in ("current_bill_cost", "current_bill_credit"):
         description = descriptions[key]
         assert description.device_class is SensorDeviceClass.MONETARY
         assert description.native_unit_of_measurement == "NZD"
-        assert description.state_class is SensorStateClass.TOTAL
+        assert description.state_class is None
         assert description.suggested_display_precision == 2
 
     for key in ("billing_period_start", "billing_period_end", "next_billing_date"):
@@ -226,7 +226,7 @@ async def test_sensor_values_and_device_identifier_are_redacted(hass) -> None:
         "next_billing_date": date(2026, 8, 1),
         "data_complete": True,
     }
-    assert entities[3].last_reset == datetime(2026, 6, 30, 12, tzinfo=UTC)
+    assert entities[3].last_reset is None
     assert entities[0].last_reset is None
     coordinator.data = replace(
         coordinator.data,
@@ -590,3 +590,76 @@ async def test_diagnostics_exclude_all_sensitive_fields(hass) -> None:
     assert "private-refresh" not in serialized
     assert "private-user" not in serialized
     assert "hashed-key" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_snapshot(hass, snapshot, freezer) -> None:
+    """The full diagnostics payload, so any new field is reviewed for privacy."""
+    freezer.move_to("2026-07-15T01:00:00+00:00")
+    coordinator = MagicMock()
+    coordinator.data = _data()
+    coordinator.last_update_success = True
+    coordinator.last_exception = UpdateFailed("safe")
+    coordinator.billing_metadata_unavailable_count = 1
+    coordinator.billing_metadata_cache_age_seconds = 3600.125
+    entry = _entry(coordinator)
+
+    assert await async_get_config_entry_diagnostics(hass, entry) == snapshot
+
+
+@pytest.mark.asyncio
+async def test_entities_before_first_sync_come_from_topology(hass) -> None:
+    """Setup no longer waits for data, so entities start out unavailable."""
+    account = _account()
+    solar_meter = replace(account.properties[0].meter_points[0], has_feed_in=True)
+    account = replace(
+        account,
+        properties=(replace(account.properties[0], meter_points=(solar_meter,)),),
+    )
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    coordinator._topology = (account,)
+    assert coordinator.data is None
+    entities = []
+    entry = _entry(coordinator)
+
+    await async_setup_entry(hass, entry, entities.extend)
+
+    assert len(entities) == 10
+    assert {entity.entity_description.key for entity in entities} == {
+        description.key for description in DESCRIPTIONS
+    }
+    for entity in entities:
+        assert entity.available is False
+        assert entity.native_value is None
+        assert entity.last_reset is None
+        assert entity.extra_state_attributes is None
+
+    coordinator.data = replace(
+        _data(),
+        account_results=(replace(_data().account_results[0], has_feed_in=True),),
+    )
+    assert all(entity.available for entity in entities)
+    await entry._async_process_on_unload(hass)
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_before_first_sync(hass) -> None:
+    coordinator = MagicMock()
+    coordinator.data = None
+    coordinator.accounts = (_account(),)
+    coordinator.last_update_success = True
+    coordinator.last_exception = None
+    coordinator.billing_metadata_cache_age_seconds = None
+    entry = _entry(coordinator)
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, entry)
+
+    assert diagnostics["coordinator"] == {
+        "last_update_success": True,
+        "last_exception_type": None,
+        "first_sync_pending": True,
+        "account_count": 1,
+    }
+    serialized = str(diagnostics)
+    assert ACCOUNT_NUMBER not in serialized
+    assert "private@example.com" not in serialized

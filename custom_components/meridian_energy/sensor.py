@@ -5,10 +5,9 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, time
+from datetime import date, datetime
 from decimal import Decimal
 from typing import Any
-from zoneinfo import ZoneInfo
 
 from homeassistant.components.sensor import (
     SensorDeviceClass,
@@ -31,7 +30,6 @@ from .models import AccountSyncResult, MeridianAccount, MeridianSyncData
 from .statistics import account_key
 
 PARALLEL_UPDATES = 0
-_NZ = ZoneInfo("Pacific/Auckland")
 
 NativeValue = date | datetime | Decimal | int | None
 ValueFn = Callable[[MeridianSyncData, str], NativeValue]
@@ -77,12 +75,15 @@ DESCRIPTIONS = (
             item.estimated_rows for item in data.results if item.account_key == key
         ),
     ),
+    # The current-bill sensors deliberately have no state class, so Home
+    # Assistant keeps no long-term statistics for them and does not offer them
+    # in the Energy dashboard. The external grid statistics are the long-term
+    # record; a bill-to-date total would only duplicate them.
     MeridianSensorDescription(
         key="current_bill_usage",
         translation_key="current_bill_usage",
         device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        state_class=SensorStateClass.TOTAL,
         suggested_display_precision=1,
         value_fn=lambda data, key: _billing_total(data, key, "usage"),
     ),
@@ -91,7 +92,6 @@ DESCRIPTIONS = (
         translation_key="current_bill_cost",
         device_class=SensorDeviceClass.MONETARY,
         native_unit_of_measurement="NZD",
-        state_class=SensorStateClass.TOTAL,
         suggested_display_precision=2,
         value_fn=lambda data, key: _billing_total(data, key, "cost"),
     ),
@@ -100,7 +100,6 @@ DESCRIPTIONS = (
         translation_key="current_bill_export",
         device_class=SensorDeviceClass.ENERGY,
         native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        state_class=SensorStateClass.TOTAL,
         suggested_display_precision=1,
         conditional_feed_in=True,
         value_fn=lambda data, key: _billing_total(data, key, "export"),
@@ -110,7 +109,6 @@ DESCRIPTIONS = (
         translation_key="current_bill_credit",
         device_class=SensorDeviceClass.MONETARY,
         native_unit_of_measurement="NZD",
-        state_class=SensorStateClass.TOTAL,
         suggested_display_precision=2,
         conditional_feed_in=True,
         value_fn=lambda data, key: _billing_total(data, key, "credit"),
@@ -166,15 +164,21 @@ async def async_setup_entry(
         for account in coordinator.accounts:
             key = account_key(account.number)
             current_account_keys.add(key)
-            result = _account_result(coordinator.data, key)
-            if result is None:
-                incoherent_account_keys.add(key)
-                continue
+            if coordinator.data is None:
+                # Before the first sync, entities come from the cached topology
+                # and stay unavailable until that sync supplies their values.
+                has_feed_in = _account_has_feed_in(account)
+            else:
+                result = _account_result(coordinator.data, key)
+                if result is None:
+                    incoherent_account_keys.add(key)
+                    continue
+                has_feed_in = result.has_feed_in
             for description in DESCRIPTIONS:
                 sensor_key = (key, description.key)
                 if description.conditional_feed_in:
                     conditional_sensor_keys.add(sensor_key)
-                if description.conditional_feed_in and not result.has_feed_in:
+                if description.conditional_feed_in and not has_feed_in:
                     continue
                 desired_sensor_keys.add(sensor_key)
                 if sensor_key in created_sensors:
@@ -303,6 +307,8 @@ class MeridianAccountSensor(CoordinatorEntity[MeridianDataCoordinator], SensorEn
     @property
     def native_value(self) -> NativeValue:
         """Return this account's current value."""
+        if self.coordinator.data is None:
+            return None
         return self._description.value_fn(self.coordinator.data, self._account_key)
 
     @property
@@ -314,26 +320,10 @@ class MeridianAccountSensor(CoordinatorEntity[MeridianDataCoordinator], SensorEn
         )
 
     @property
-    def last_reset(self) -> datetime | None:
-        """Return the retailer billing-period boundary for bill-to-date totals."""
-        if self.entity_description.key not in {
-            "current_bill_usage",
-            "current_bill_cost",
-            "current_bill_export",
-            "current_bill_credit",
-        }:
-            return None
-        result = _account_result(self.coordinator.data, self._account_key)
-        if result is None:
-            return None
-        period = result.billing_period
-        if period is None or period.start is None:
-            return None
-        return datetime.combine(period.start, time.min, tzinfo=_NZ).astimezone(UTC)
-
-    @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
         """Expose useful, non-sensitive context for diagnostics and billing."""
+        if self.coordinator.data is None:
+            return None
         key = self.entity_description.key
         if key == "estimated_readings":
             return self._provisional_attributes()
@@ -388,10 +378,23 @@ class MeridianAccountSensor(CoordinatorEntity[MeridianDataCoordinator], SensorEn
         }
 
 
-def _account_result(data: MeridianSyncData, key: str) -> AccountSyncResult | None:
+def _account_result(
+    data: MeridianSyncData | None, key: str
+) -> AccountSyncResult | None:
     """Find a coordinator account result by its non-sensitive key."""
+    if data is None:
+        return None
     return next(
         (item for item in data.account_results if item.account_key == key), None
+    )
+
+
+def _account_has_feed_in(account: MeridianAccount) -> bool:
+    """Return whether any meter on the account reports feed-in metering."""
+    return any(
+        meter.has_feed_in
+        for property_data in account.properties
+        for meter in property_data.meter_points
     )
 
 

@@ -27,11 +27,12 @@ An unofficial Home Assistant integration for Meridian electricity usage, cost an
 
 Home Assistant renews the saved session automatically. Another code is needed only if Meridian invalidates it.
 
-Home Assistant 2026.7.2 or newer is required.
+Home Assistant 2026.10.0 or newer is required.
 
-Upgrading to v0.2.5 requires a completed v0.2.4 installation. Older or
-incomplete config entries intentionally stop at migration error; restore or
-complete them on v0.2.4 before upgrading.
+Upgrading from v0.2.4 or earlier requires a completed v0.2.4 installation.
+Older or incomplete config entries intentionally stop at a migration error that
+says so; restore or complete them on v0.2.4 before upgrading, or remove the
+integration and add it again.
 
 ## Entities
 
@@ -48,6 +49,8 @@ Each selected account is represented by one service device.
 | **Current bill export credit** | Retailer credit for that export; feed-in accounts only. |
 
 **Billing period start**, **Billing period end** and **Next billing date** are disabled by default. Current-bill values remain unavailable until Home Assistant has complete data from the start of the period; missing cost is never treated as zero.
+
+The **Current bill** sensors are running totals for the current period, with the period dates as attributes. They have no state class, so Home Assistant keeps no long-term statistics for them and does not offer them in the Energy dashboard; the statistics below are the long-term record.
 
 ## Energy dashboard statistics
 
@@ -72,6 +75,50 @@ Grid export is not total solar production: Meridian cannot see electricity used 
 - **Weekly and after restart:** full 14-day reconciliation.
 
 Meridian data is delayed rather than real-time. Revisions older than 14 days are outside the normal correction window.
+
+At start-up the integration only renews its session and loads the account list, so it does not hold up Home Assistant. The restart reconciliation runs in the background once Home Assistant has started; until it finishes, the Meridian entities show as unavailable. If Meridian cannot be reached or returns unusable data, that first sync is retried after 10 minutes rather than at the next hourly update; a Meridian rate limit is honoured as usual.
+
+## Automation examples
+
+Entity IDs below assume the default device name; check yours under **Settings → Devices & services → Meridian Energy**.
+
+Notify when the current bill passes a budget:
+
+```yaml
+alias: Electricity bill over budget
+triggers:
+  - trigger: numeric_state
+    entity_id: sensor.meridian_energy_current_bill_cost
+    above: 250
+actions:
+  - action: notify.notify
+    data:
+      title: Electricity bill
+      message: >-
+        This bill has reached
+        ${{ states('sensor.meridian_energy_current_bill_cost') }}.
+```
+
+Notify when Meridian data has stopped updating, for example after Meridian revokes the session:
+
+```yaml
+alias: Meridian data unavailable
+triggers:
+  - trigger: state
+    entity_id: sensor.meridian_energy_last_data_update
+    to: unavailable
+    for:
+      hours: 3
+actions:
+  - action: notify.notify
+    data:
+      title: Meridian Energy
+      message: >-
+        Meridian data has not updated for 3 hours. Check Settings → Devices &
+        services for a reauthentication request.
+```
+
+For Energy dashboard sources, use the **Meridian grid import** statistics described above; the **Current bill** sensors are not offered there.
 
 ## Limitations and troubleshooting
 

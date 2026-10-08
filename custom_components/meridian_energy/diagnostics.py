@@ -18,16 +18,29 @@ async def async_get_config_entry_diagnostics(
     data = coordinator.data
     last_exception = coordinator.last_exception
     billing_cache_age = coordinator.billing_metadata_cache_age_seconds
+    config_entry = {
+        "version": entry.version,
+        "minor_version": entry.minor_version,
+    }
+    status = {
+        "last_update_success": coordinator.last_update_success,
+        "last_exception_type": (
+            type(last_exception).__name__ if last_exception is not None else None
+        ),
+        "first_sync_pending": data is None,
+    }
+    if data is None:
+        return {
+            "config_entry": config_entry,
+            "coordinator": {
+                **status,
+                "account_count": len(coordinator.accounts),
+            },
+        }
     return {
-        "config_entry": {
-            "version": entry.version,
-            "minor_version": entry.minor_version,
-        },
+        "config_entry": config_entry,
         "coordinator": {
-            "last_update_success": coordinator.last_update_success,
-            "last_exception_type": (
-                type(last_exception).__name__ if last_exception is not None else None
-            ),
+            **status,
             "account_count": data.account_count,
             "property_count": data.property_count,
             "sync_mode": data.sync_mode,

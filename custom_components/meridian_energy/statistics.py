@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import logging
 from collections import defaultdict
 from collections.abc import Iterable
 from datetime import UTC, datetime
@@ -20,7 +22,6 @@ from homeassistant.components.recorder.models import (
 from homeassistant.components.recorder.statistics import (
     StatisticsRow,
     async_add_external_statistics,
-    clear_statistics,
     get_last_statistics,
     statistics_during_period,
 )
@@ -38,7 +39,9 @@ from .const import (
 )
 from .models import BillingPeriodTotals, MeridianMeasurement
 
+_LOGGER = logging.getLogger(__name__)
 _CENTS_PER_DOLLAR = Decimal(100)
+CLEAR_STATISTICS_TIMEOUT_SECONDS = 30
 _SECONDS_PER_HOUR = 3600
 
 
@@ -100,13 +103,33 @@ async def async_latest_numeric_statistic_start(
 
 
 async def async_clear_statistics(hass: HomeAssistant, statistic_ids: set[str]) -> None:
-    """Remove statistics created by an incomplete first-install import."""
+    """
+    Remove statistics created by an incomplete first-install import.
+
+    Deletion must run on the recorder thread, so queue it through the public
+    Recorder API and wait for its completion callback, as Home Assistant's own
+    ``recorder/clear_statistics`` command does. A timeout only stops the wait:
+    the queued deletion still runs, and the caller's original error is kept.
+    """
     if not statistic_ids:
         return
-    instance = get_instance(hass)
-    await instance.async_add_executor_job(
-        clear_statistics, instance, sorted(statistic_ids)
+    done = asyncio.Event()
+
+    def _clear_done() -> None:
+        hass.loop.call_soon_threadsafe(done.set)
+
+    get_instance(hass).async_clear_statistics(
+        sorted(statistic_ids), on_done=_clear_done
     )
+    try:
+        async with asyncio.timeout(CLEAR_STATISTICS_TIMEOUT_SECONDS):
+            await done.wait()
+    except TimeoutError:
+        _LOGGER.warning(
+            "Timed out waiting for Home Assistant to remove %d incomplete "
+            "Meridian statistics; removal remains queued",
+            len(statistic_ids),
+        )
 
 
 async def async_import_measurements(

@@ -5,12 +5,14 @@ rules:
     comment: The integration does not provide actions.
   appropriate-polling: done
   brands:
-    status: todo
-    comment: Local HACS brand assets are complete; an official brands repository submission belongs with any future Core proposal.
+    status: done
+    comment: Brand images ship in custom_components/meridian_energy/brand/, which Home Assistant 2026.3 and later serve for custom integrations.
   common-modules: done
   config-flow-test-coverage: done
   config-flow: done
-  dependency-transparency: done
+  dependency-transparency:
+    status: exempt
+    comment: The integration has no external Python requirements; its API client is embedded.
   docs-actions:
     status: exempt
     comment: The integration does not provide actions.
@@ -57,9 +59,7 @@ rules:
     status: exempt
     comment: Meridian accounts are authenticated cloud resources, not discoverable devices.
   docs-data-update: done
-  docs-examples:
-    status: todo
-    comment: No supported automation blueprint has been published yet.
+  docs-examples: done
   docs-known-limitations: done
   docs-supported-devices: done
   docs-supported-functions: done

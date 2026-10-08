@@ -1,0 +1,121 @@
+name: Compatibility
+
+# Runs the test suite against the newest Home Assistant test harness, unpinned,
+# so a breaking Home Assistant release or beta shows up here before it reaches
+# production. The pinned harness in uv.lock is tested by validate.yml.
+#
+# - stable: the newest pytest-homeassistant-custom-component build for a final
+#   Home Assistant release. Skipped while that release is older than the
+#   minimum in hacs.json (the harness for a new release can lag it by a day).
+# - beta: the newest build overall. Skipped when it is not a pre-release.
+#
+# A scheduled failure opens, or comments on, one tracking issue.
+
+on:
+  schedule:
+    - cron: "41 4 * * 2"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/compat.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: tests (${{ matrix.channel }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - channel: stable
+            prerelease: disallow
+          - channel: beta
+            prerelease: allow
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          python-version: "3.14"
+          enable-cache: false
+      - name: Install the newest test harness, unpinned
+        env:
+          PRERELEASE: ${{ matrix.prerelease }}
+        run: |
+          uv venv
+          uv pip install --prerelease "$PRERELEASE" \
+            pytest-homeassistant-custom-component aioresponses
+      - name: Decide whether this channel applies
+        id: plan
+        env:
+          CHANNEL: ${{ matrix.channel }}
+        run: |
+          .venv/bin/python - <<'PY'
+          import json
+          import os
+          from importlib.metadata import version
+          from pathlib import Path
+
+          from packaging.version import Version
+
+          channel = os.environ["CHANNEL"]
+          ha = Version(version("homeassistant"))
+          harness = version("pytest-homeassistant-custom-component")
+          minimum = Version(json.loads(Path("hacs.json").read_text())["homeassistant"])
+          if channel == "beta" and not ha.is_prerelease:
+              run, reason = False, "no Home Assistant beta is current"
+          elif channel == "stable" and ha < minimum:
+              run, reason = False, f"newest stable harness is below the minimum {minimum}"
+          else:
+              run, reason = True, "testing"
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              output.write(f"run={str(run).lower()}\n")
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as summary:
+              summary.write(
+                  f"### {channel}\n\n"
+                  f"- Home Assistant {ha}\n"
+                  f"- pytest-homeassistant-custom-component {harness}\n"
+                  f"- {reason}\n"
+              )
+          if not run:
+              print(f"::notice title=Compatibility ({channel})::Skipped: {reason}")
+          PY
+      - name: Run the test suite
+        if: steps.plan.outputs.run == 'true'
+        run: .venv/bin/python -m pytest
+
+  report:
+    needs: tests
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Compatibility check failing against the newest Home Assistant"
+          number="$(
+            gh issue list --state open --search "in:title \"$title\"" \
+              --json number,title \
+              --jq "map(select(.title == \"$title\")) | .[0].number // empty"
+          )"
+          body="The weekly compatibility run failed: $RUN_URL"
+          if [[ -n "$number" ]]; then
+            gh issue comment "$number" --body "$body"
+          else
+            gh issue create --title "$title" --body "$body"
+          fi

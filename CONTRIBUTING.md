@@ -11,14 +11,18 @@ Never use production credentials in automated tests or commit captured Meridian 
 ## Setup
 
 ```bash
-uv sync --all-groups
+uv sync --locked --all-groups
 uv run pytest
+uv run python scripts/check_module_coverage.py
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy custom_components/meridian_energy
+uv run python scripts/check_versions.py
 ```
 
-Run Hassfest and HACS validation through the GitHub Actions workflow before releasing.
+`uv sync --locked` fails when `uv.lock` is out of date; update it with `uv lock` (or `uv lock --upgrade-package <name>`) rather than editing it. The exact `pytest-homeassistant-custom-component` pin selects the Home Assistant version under test.
+
+Run Hassfest and HACS validation through the GitHub Actions workflow before releasing. The weekly **Compatibility** workflow tests against the newest Home Assistant release and beta.
 
 ## Pull requests
 
@@ -27,12 +31,15 @@ Run Hassfest and HACS validation through the GitHub Actions workflow before rele
 - Treat API responses as untrusted input.
 - Never log request payloads, response payloads, headers or identifiers.
 - Update the README for user-visible changes.
+- Snapshot tests (`tests/snapshots/`) cover entity states and diagnostics. After an intended change, run `uv run pytest --snapshot-update` and review the `.ambr` diff.
 
 Pull requests must pass Python, Hassfest, HACS, dependency-review and CodeQL checks. The repository uses squash merges and automatically deletes merged branches.
 
+Developer notes are in [`docs/`](docs/README.md).
+
 ## Release checklist
 
-1. Confirm `manifest.json`, `pyproject.toml` and the proposed `v…` tag contain the same version.
+1. Confirm `manifest.json`, `pyproject.toml` and the proposed `v…` tag contain the same version, and `CHANGELOG.md` has a `## X.Y.Z` section for it (`check_versions.py` enforces this). That section becomes the release notes.
 2. Run the full local commands above and review the branch-coverage report.
 3. Merge only through a protected pull request with all conversations resolved.
 4. Run the protected **Release** workflow from `main`; do not create or move release tags manually.

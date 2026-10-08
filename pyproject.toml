@@ -1,6 +1,6 @@
 [project]
 name = "ha-meridian-energy"
-version = "0.2.5"
+version = "0.2.6"
 description = "Unofficial Meridian Energy integration for Home Assistant"
 readme = "README.md"
 requires-python = ">=3.14.2,<3.15"
@@ -9,24 +9,23 @@ license = "MIT"
 [dependency-groups]
 dev = [
   "aioresponses>=0.7.8",
-  "homeassistant==2026.7.4",
   "mypy>=1.17.0",
   "pytest>=8.4.1",
   "pytest-asyncio>=1.1.0",
   "pytest-cov>=6.2.1",
-  "pytest-homeassistant-custom-component>=0.13.0",
-  "ruff>=0.12.0"
+  # The test harness pins Home Assistant exactly, so this one pin selects the
+  # Home Assistant version under test. Bump it rather than adding a separate
+  # homeassistant pin, which the harness pin would contradict.
+  "pytest-homeassistant-custom-component==0.13.370",
+  "ruff>=0.12.0",
+  "syrupy>=6.1.1"
 ]
 
 [tool.uv]
 package = false
-required-version = ">=0.11.8,<0.12"
-override-dependencies = [
-  # Home Assistant 2026.7.4 pins the vulnerable predecessors. These patched
-  # versions match Home Assistant's development branch pending its next release.
-  "Pillow==12.3.0",
-  "PyJWT==2.13.0"
-]
+# Lower bound only: an upper bound stops Dependabot and fresh environments
+# that run a newer uv.
+required-version = ">=0.12"
 
 [tool.pytest.ini_options]
 addopts = "--strict-config --strict-markers --cov=custom_components.meridian_energy --cov-report=term-missing --cov-report=xml --cov-fail-under=98"
@@ -45,11 +44,14 @@ exclude_also = [
 [tool.ruff]
 target-version = "py314"
 line-length = 88
+# The agent guard runs on whatever python3 an agent session has.
+per-file-target-version = { ".claude/hooks/*.py" = "py39" }
 
 [tool.ruff.lint]
 select = ["ALL"]
 ignore = [
   "ANN401",
+  "CPY001",
   "D107",
   "D203",
   "D212",
@@ -70,6 +72,17 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["ANN", "D", "FBT001", "INP001", "PLR2004", "S", "SLF001"]
+# The agent guard is a standalone hook script, not part of the integration.
+".claude/hooks/*.py" = [
+  "BLE001",
+  "C901",
+  "INP001",
+  "PLR0911",
+  "PLR0912",
+  "PLR2004",
+  "S603",
+  "S607"
+]
 
 [tool.mypy]
 python_version = "3.14"

@@ -4,16 +4,23 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
+import probatio
 import pytest
+from homeassistant.components.recorder.statistics import (
+    async_add_external_statistics,
+)
 from homeassistant.config_entries import SOURCE_REAUTH, SOURCE_RECONFIGURE, SOURCE_USER
 from homeassistant.const import CONF_EMAIL
 from homeassistant.data_entry_flow import FlowResultType
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import selector
 from pytest_homeassistant_custom_component.common import MockConfigEntry
-from voluptuous_serialize import convert
+from pytest_homeassistant_custom_component.components.recorder.common import (
+    async_wait_recording_done,
+)
 
 from custom_components.meridian_energy.api import (
     MeridianAuthenticationError,
@@ -36,9 +43,17 @@ from custom_components.meridian_energy.const import (
 )
 from custom_components.meridian_energy.models import (
     MeridianAccount,
+    MeridianMeasurement,
     MeridianMeterPoint,
     MeridianProperty,
     MeridianTokenSet,
+)
+from custom_components.meridian_energy.statistics import (
+    _energy_metadata,
+    async_has_statistics,
+    async_import_measurements,
+    consumption_ids,
+    property_key,
 )
 
 
@@ -188,6 +203,73 @@ async def test_initial_import_failure_aborts(hass) -> None:
 
 
 @pytest.mark.asyncio
+async def test_failed_initial_import_rolls_back_on_real_recorder(hass) -> None:
+    """A partial first import is removed through the recorder's own thread.
+
+    This module runs every test with the real recorder (``recorder_mock``), so
+    the rollback is not mocked: clearing from the wrong thread raises here.
+    """
+    account = _account()
+    key = property_key(account.number, account.properties[0].id)
+    energy_id, cost_id = consumption_ids(key)
+    unrelated_id = "meridian_energy:consumption_unrelated000"
+    async_add_external_statistics(
+        hass,
+        _energy_metadata(unrelated_id, "Unrelated"),
+        [{"start": datetime(2026, 8, 1, tzinfo=UTC), "state": 1.0, "sum": 1.0}],
+    )
+    await async_wait_recording_done(hass)
+
+    flow = MeridianEnergyConfigFlow()
+    flow.hass = hass
+    flow.context = {}
+    flow._accounts = (account,)
+    flow._selected_accounts = frozenset({account.number})
+    await flow._async_prepare_import_rollback()
+    assert flow._initial_statistic_ids == {energy_id, cost_id}
+    assert flow._existing_statistic_ids == set()
+
+    async def partial_import(
+        tokens: MeridianTokenSet, selected_accounts: frozenset[str]
+    ) -> None:
+        del tokens, selected_accounts
+        start = datetime(2026, 8, 1, tzinfo=UTC)
+        await async_import_measurements(
+            hass,
+            stat_energy_id=energy_id,
+            stat_cost_id=cost_id,
+            energy_name="Meridian grid import",
+            cost_name="Meridian grid import cost",
+            measurements=[
+                MeridianMeasurement(
+                    start=start,
+                    end=start + timedelta(hours=1),
+                    value_kwh=Decimal("1.5"),
+                    quality="ACTUAL",
+                    direction="CONSUMPTION",
+                    channel_id="synthetic-meter:synthetic-register",
+                    cost_cents=Decimal(45),
+                )
+            ],
+        )
+        await async_wait_recording_done(hass)
+        assert await async_has_statistics(hass, energy_id)
+        raise MeridianConnectionError
+
+    with (
+        patch.object(flow, "_async_initial_import", side_effect=partial_import),
+        pytest.raises(MeridianConnectionError),
+    ):
+        await flow._async_initial_import_with_rollback(
+            _tokens(), frozenset({account.number})
+        )
+
+    assert not await async_has_statistics(hass, energy_id)
+    assert not await async_has_statistics(hass, cost_id)
+    assert await async_has_statistics(hass, unrelated_id)
+
+
+@pytest.mark.asyncio
 async def test_initial_import_and_finish_expired_guards(hass) -> None:
     flow = MeridianEnergyConfigFlow()
     flow.hass = hass
@@ -265,7 +347,9 @@ async def test_otp_form_is_serializable_and_validates_locally(hass) -> None:
     client.async_validate_otp = AsyncMock()
 
     result = await flow.async_step_otp()
-    convert(result["data_schema"], custom_serializer=cv.custom_serializer)
+    probatio.to_field_list(
+        result["data_schema"], custom_serializer=cv.custom_serializer
+    )
 
     with patch.object(
         MeridianEnergyConfigFlow,
@@ -451,14 +535,50 @@ async def test_expired_flow_guards(hass) -> None:
 
 
 @pytest.mark.asyncio
-async def test_reauth_missing_entry_aborts(hass) -> None:
-    flow = MeridianEnergyConfigFlow()
-    flow.hass = hass
-    flow.context = {"entry_id": "missing"}
+async def test_reauth_aborts_on_unique_id_mismatch(hass) -> None:
+    """
+    Home Assistant's unique-ID check is wired into reauthentication.
 
-    result = await flow.async_step_reauth({CONF_EMAIL: "person@example.com"})
+    Setup never creates an entry whose stored email differs from its unique ID,
+    so this builds that inconsistent entry directly to reach the abort.
+    """
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title=NAME,
+        unique_id="person@example.com",
+        data={
+            CONF_EMAIL: "someone-else@example.com",
+            CONF_REFRESH_TOKEN: "old-refresh",
+            CONF_FIREBASE_USER_ID: "old-user",
+        },
+    )
+    entry.add_to_hass(hass)
+    client = MagicMock()
+    client.async_send_otp = AsyncMock()
+    client.async_validate_otp = AsyncMock(return_value=_tokens())
+    with (
+        patch.object(
+            MeridianEnergyConfigFlow,
+            "_client",
+            new_callable=PropertyMock,
+            return_value=client,
+        ),
+        patch.object(hass.config_entries, "async_reload", AsyncMock()) as reload_entry,
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
+            data=dict(entry.data),
+        )
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"otp": "123456"}
+        )
 
-    assert result["reason"] == "reauth_entry_missing"
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "unique_id_mismatch"
+    assert entry.data[CONF_REFRESH_TOKEN] == "old-refresh"
+    reload_entry.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -862,6 +982,7 @@ async def test_reconfigure_auth_failure_routes_to_reauthentication(hass) -> None
     entry = MockConfigEntry(
         domain=DOMAIN,
         title=NAME,
+        unique_id="person@example.com",
         data={
             CONF_EMAIL: "person@example.com",
             CONF_REFRESH_TOKEN: "refresh",
