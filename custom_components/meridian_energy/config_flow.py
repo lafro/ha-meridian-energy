@@ -133,6 +133,9 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
                     CONF_FIREBASE_USER_ID: tokens.user_id,
                 }
                 if self.source == SOURCE_REAUTH:
+                    # Quality-scale pattern: reauthentication always uses the
+                    # entry's own stored email, which is its unique ID, so this
+                    # check guards only against an inconsistent entry.
                     await self.async_set_unique_id(self._email)
                     self._abort_if_unique_id_mismatch()
                     return self.async_update_reload_and_abort(

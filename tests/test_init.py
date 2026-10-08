@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
+from dataclasses import replace
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -24,7 +25,10 @@ from homeassistant.exceptions import (
     ConfigEntryError,
 )
 from homeassistant.helpers import entity_registry as er
-from pytest_homeassistant_custom_component.common import MockConfigEntry
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    snapshot_platform,
+)
 from pytest_homeassistant_custom_component.components.recorder.common import (
     async_recorder_block_till_done,
 )
@@ -51,6 +55,7 @@ from custom_components.meridian_energy.const import (
 from custom_components.meridian_energy.models import (
     AccountSyncResult,
     MeridianAccount,
+    MeridianBillingPeriod,
     MeridianMeterPoint,
     MeridianProperty,
     MeridianSyncData,
@@ -376,10 +381,22 @@ async def test_migrate_accepts_clean_v025_entry(hass) -> None:
 
 
 @pytest.mark.asyncio
+async def test_migrate_keeps_a_newer_minor_version_loadable(hass) -> None:
+    """A rollback to this release still loads an entry from a later 3.x release."""
+    entry = _entry(minor_version=2)
+    original_data = dict(entry.data)
+
+    assert await async_migrate_entry(hass, entry) is True
+
+    assert entry.version == 3
+    assert entry.minor_version == 2
+    assert dict(entry.data) == original_data
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("minor_version", "data"),
     [
-        (2, None),
         (
             0,
             {
@@ -410,13 +427,8 @@ async def test_migrate_rejects_incomplete_or_malformed_entry(
     with pytest.raises(ConfigEntryError) as raised:
         await async_migrate_entry(hass, entry)
 
-    expected_key = (
-        "migration_unsupported_version"
-        if minor_version != 0
-        else "migration_incomplete_entry"
-    )
     assert raised.value.translation_domain == DOMAIN
-    assert raised.value.translation_key == expected_key
+    assert raised.value.translation_key == "migration_incomplete_entry"
     assert entry.minor_version == minor_version
     assert dict(entry.data) == original_data
 
@@ -539,6 +551,63 @@ class TestPublicConfigEntryLifecycle:
         assert after == before
 
     @pytest.mark.asyncio
+    async def test_newer_minor_version_entry_sets_up_after_rollback(
+        self, recorder_mock, hass
+    ) -> None:
+        """Home Assistant's own migration step accepts a newer minor version."""
+        del recorder_mock
+        entry = _entry(minor_version=2)
+        entry.add_to_hass(hass)
+
+        with _patched_meridian(lambda: (_account(),), _sync_data):
+            assert await hass.config_entries.async_setup(entry.entry_id)
+            await hass.async_block_till_done(wait_background_tasks=True)
+
+        assert entry.state is ConfigEntryState.LOADED
+        assert entry.minor_version == 2
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("entity_registry_enabled_by_default")
+    async def test_entity_snapshot(
+        self, recorder_mock, hass, entity_registry, snapshot, freezer
+    ) -> None:
+        """Snapshot every entity's registry entry and state for a feed-in account."""
+        del recorder_mock
+        freezer.move_to("2026-07-15T01:00:00+00:00")
+        entry = _entry(version=3)
+        entry.add_to_hass(hass)
+
+        def _data() -> MeridianSyncData:
+            data = _sync_data(feed_in=True)
+            account_result = replace(
+                data.account_results[0],
+                billing_period=MeridianBillingPeriod(
+                    period_length="MONTHLY",
+                    period_length_multiplier=1,
+                    is_fixed=True,
+                    start=date(2026, 7, 1),
+                    end=date(2026, 7, 31),
+                    next_billing_date=date(2026, 8, 1),
+                    period_start_day=1,
+                ),
+                current_bill_export=Decimal("2.5"),
+                current_bill_credit=Decimal("0.42"),
+                usage_complete=True,
+                cost_complete=True,
+                export_complete=True,
+                credit_complete=True,
+            )
+            return replace(data, account_results=(account_result,))
+
+        with _patched_meridian(lambda: (_account(feed_in=True),), _data):
+            assert await hass.config_entries.async_setup(entry.entry_id)
+            await hass.async_block_till_done(wait_background_tasks=True)
+
+        await snapshot_platform(hass, entity_registry, snapshot, entry.entry_id)
+        assert await hass.config_entries.async_unload(entry.entry_id)
+
+    @pytest.mark.asyncio
     async def test_load_reload_and_unload(self, recorder_mock, hass) -> None:
         """Load, reload, and unload through Home Assistant's public APIs."""
         del recorder_mock
@@ -569,6 +638,24 @@ class TestPublicConfigEntryLifecycle:
             assert provisional_state.state == "0"
             assert provisional_state.attributes["state_class"] == "measurement"
             assert "unit_of_measurement" not in provisional_state.attributes
+
+            # The current-bill sensors keep no long-term statistics (NRG-15):
+            # no state class and no last_reset, but the period is still shown.
+            for suffix in (
+                "_current_bill_usage",
+                "_current_bill_cost",
+                "_current_bill_export",
+                "_current_bill_credit",
+            ):
+                bill_entry = next(
+                    item for item in entry_entities if item.unique_id.endswith(suffix)
+                )
+                assert not bill_entry.capabilities
+                bill_state = hass.states.get(bill_entry.entity_id)
+                assert bill_state is not None
+                assert "state_class" not in bill_state.attributes
+                assert "last_reset" not in bill_state.attributes
+                assert "billing_period_start" in bill_state.attributes
 
             topology["feed_in"] = False
             assert await hass.config_entries.async_reload(entry.entry_id)

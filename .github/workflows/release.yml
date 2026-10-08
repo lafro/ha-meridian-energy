@@ -20,22 +20,33 @@ jobs:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    outputs:
+      notes: ${{ steps.versions.outputs.notes }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
       - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           python-version: "3.14"
-          enable-cache: true
-          prune-cache: true
+          # No cache restore: the release gates install from a clean state.
+          enable-cache: false
       - run: uv sync --all-groups --locked
-      - name: Validate release tag and committed versions
+      - name: Validate release tag, committed versions and CHANGELOG entry
+        id: versions
         env:
           RELEASE_TAG: ${{ inputs.tag }}
         run: |
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          uv run python scripts/check_versions.py "$RELEASE_TAG"
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          uv run python scripts/check_versions.py "$RELEASE_TAG" --release-notes "$notes_file"
+          delimiter="notes_$(openssl rand -hex 16)"
+          {
+            echo "notes<<$delimiter"
+            cat "$notes_file"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
       - run: uv run ruff format --check .
       - run: uv run ruff check .
       - run: uv run mypy custom_components/meridian_energy
@@ -48,6 +59,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: home-assistant/actions/hassfest@06749dd8c0b54f350bc69c8752456cee498808a3
 
   hacs:
@@ -56,6 +69,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: hacs/action@1ebf01c408f29afcb6406bd431bc98fd8cbb15aa
         with:
           category: integration
@@ -97,9 +112,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RELEASE_TAG: ${{ inputs.tag }}
-        run: >-
-          gh release create "$RELEASE_TAG"
-          --verify-tag
-          --title "$RELEASE_TAG"
-          --generate-notes
-          --fail-on-no-commits
+          # This version's CHANGELOG.md section, checked by the python job.
+          RELEASE_NOTES: ${{ needs.python.outputs.notes }}
+        run: |
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          printf '%s\n' "$RELEASE_NOTES" > "$notes_file"
+          [[ -n "$RELEASE_NOTES" ]]
+          gh release create "$RELEASE_TAG" \
+            --verify-tag \
+            --title "$RELEASE_TAG" \
+            --notes-file "$notes_file" \
+            --generate-notes \
+            --fail-on-no-commits

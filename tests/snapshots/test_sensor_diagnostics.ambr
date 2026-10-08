@@ -1,0 +1,73 @@
+# serializer version: 1
+# name: test_diagnostics_snapshot
+  dict({
+    'config_entry': dict({
+      'minor_version': 1,
+      'version': 1,
+    }),
+    'coordinator': dict({
+      'account_count': 1,
+      'account_results': list([
+        dict({
+          'billing_data_complete': dict({
+            'cost': True,
+            'credit': False,
+            'export': False,
+            'usage': True,
+          }),
+          'billing_metadata_available': True,
+          'billing_period_fixed': True,
+          'billing_period_type': 'MONTHLY',
+          'cost_available': True,
+          'credit_available': False,
+          'export_available': False,
+          'has_feed_in': False,
+          'usage_available': True,
+        }),
+      ]),
+      'billing_metadata_cache_age_seconds': 3600.125,
+      'billing_metadata_unavailable_count': 1,
+      'first_sync_pending': False,
+      'last_exception_type': 'UpdateFailed',
+      'last_update_success': True,
+      'property_count': 1,
+      'property_results': list([
+        dict({
+          'api_pages': dict({
+            'consumption': 1,
+            'generation': 0,
+          }),
+          'estimated_rows': 2,
+          'latest_reading': HAFakeDatetime(2026, 7, 14, 1, 0, tzinfo=datetime.timezone.utc),
+          'newest_provisional_interval': HAFakeDatetime(2026, 7, 14, 1, 0, tzinfo=datetime.timezone.utc),
+          'observed_rows_per_hour': 1.0,
+          'oldest_provisional_interval': HAFakeDatetime(2026, 7, 14, 0, 0, tzinfo=datetime.timezone.utc),
+          'requested_window_end': HAFakeDatetime(2026, 7, 15, 1, 0, tzinfo=datetime.timezone.utc),
+          'requested_window_start': HAFakeDatetime(2026, 7, 13, 1, 0, tzinfo=datetime.timezone.utc),
+          'rows_imported': dict({
+            'consumption': 24,
+            'generation': 0,
+          }),
+          'rows_received': dict({
+            'consumption': 24,
+            'generation': 0,
+          }),
+          'rows_retained': dict({
+            'consumption': 24,
+            'generation': 0,
+          }),
+          'sync_mode': <SyncMode.TIP: 'tip'>,
+          'upstream_quality_counts': dict({
+            'ACTUAL': 22,
+            'ESTIMATE': 2,
+          }),
+        }),
+      ]),
+      'sync_duration_seconds': 0.0,
+      'sync_mode': <SyncMode.TIP: 'tip'>,
+      'synced_at': HAFakeDatetime(2026, 7, 15, 1, 0, tzinfo=datetime.timezone.utc),
+      'topology_cache_age_seconds': 3600,
+      'topology_refreshed': False,
+    }),
+  })
+# ---

@@ -6,7 +6,7 @@
       "login_expired": "The login attempt expired. Start setup again to request a new code.",
       "initial_import_failed": "The initial Meridian history import did not complete. Check the connection and start setup again; no login code or password was stored.",
       "no_accounts": "No active Meridian electricity accounts were found for this login.",
-      "unique_id_mismatch": "That login belongs to a different Meridian account. Reconnect using the email address this integration was set up with."
+      "unique_id_mismatch": "This login does not match the configured Meridian entry. Remove the integration and add it again with the email address you want to use."
     },
     "error": {
       "cannot_connect": "Unable to reach Meridian. Check your internet connection and try again.",

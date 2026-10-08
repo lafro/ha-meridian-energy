@@ -50,6 +50,8 @@ Each selected account is represented by one service device.
 
 **Billing period start**, **Billing period end** and **Next billing date** are disabled by default. Current-bill values remain unavailable until Home Assistant has complete data from the start of the period; missing cost is never treated as zero.
 
+The **Current bill** sensors are running totals for the current period, with the period dates as attributes. They have no state class, so Home Assistant keeps no long-term statistics for them and does not offer them in the Energy dashboard; the statistics below are the long-term record.
+
 ## Energy dashboard statistics
 
 For each property, the integration creates:
@@ -116,7 +118,7 @@ actions:
         services for a reauthentication request.
 ```
 
-Do not add the **Current bill** sensors to the Energy dashboard; use the **Meridian grid import** statistics described above.
+For Energy dashboard sources, use the **Meridian grid import** statistics described above; the **Current bill** sensors are not offered there.
 
 ## Limitations and troubleshooting
 

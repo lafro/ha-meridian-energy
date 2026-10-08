@@ -535,8 +535,13 @@ async def test_expired_flow_guards(hass) -> None:
 
 
 @pytest.mark.asyncio
-async def test_reauth_rejects_a_different_account(hass) -> None:
-    """Reauthentication cannot move an entry onto another Meridian login."""
+async def test_reauth_aborts_on_unique_id_mismatch(hass) -> None:
+    """
+    Home Assistant's unique-ID check is wired into reauthentication.
+
+    Setup never creates an entry whose stored email differs from its unique ID,
+    so this builds that inconsistent entry directly to reach the abort.
+    """
     entry = MockConfigEntry(
         domain=DOMAIN,
         title=NAME,

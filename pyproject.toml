@@ -43,6 +43,8 @@ exclude_also = [
 [tool.ruff]
 target-version = "py314"
 line-length = 88
+# The agent guard runs on whatever python3 an agent session has.
+per-file-target-version = { ".claude/hooks/*.py" = "py39" }
 
 [tool.ruff.lint]
 select = ["ALL"]
@@ -69,6 +71,17 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["ANN", "D", "FBT001", "INP001", "PLR2004", "S", "SLF001"]
+# The agent guard is a standalone hook script, not part of the integration.
+".claude/hooks/*.py" = [
+  "BLE001",
+  "C901",
+  "INP001",
+  "PLR0911",
+  "PLR0912",
+  "PLR2004",
+  "S603",
+  "S607"
+]
 
 [tool.mypy]
 python_version = "3.14"

@@ -1,10 +1,19 @@
 {
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
   "permissions": {
     "deny": [
       "mcp__claude_ai_Home_Assistant",
       "Bash(gh pr merge *)",
+      "Bash(gh api *pulls/*/merge*)",
+      "Bash(gh api *git/refs*)",
+      "Bash(gh api *git/tags*)",
+      "Bash(gh release create *)",
+      "Bash(gh release edit *)",
+      "Bash(gh release upload *)",
       "Bash(gh release delete *)",
       "Bash(gh release delete-asset *)",
+      "Bash(gh workflow run release*)",
+      "Bash(gh workflow run Release*)",
       "Bash(gh repo delete *)",
       "Bash(gh api * -X DELETE *)",
       "Bash(gh api * --method DELETE *)",
@@ -17,6 +26,10 @@
       "Bash(git push * --delete *)",
       "Bash(git push * -d *)",
       "Bash(git push * :refs/tags/*)",
+      "Bash(git push * refs/tags/*)",
+      "Bash(git push * v*)",
+      "Bash(git push *--tags*)",
+      "Bash(git push *--follow-tags*)",
       "Bash(git push * main)",
       "Bash(git push * HEAD:main)",
       "Bash(git tag *)"
@@ -25,5 +38,29 @@
   "deniedMcpServers": [
     { "serverName": "claude.ai Home Assistant" },
     { "serverName": "claude.ai Home Assistant (read-only)" }
-  ]
+  ],
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "mcp__.*__ha_.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'Blocked by this repository: Home Assistant tools are never used from here. Live checks, HACS downloads and restarts happen in the home-configuration repository sessions.' >&2; exit 2",
+            "timeout": 10
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"${CLAUDE_PROJECT_DIR}/.claude/hooks/guard.sh\"",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
+  }
 }

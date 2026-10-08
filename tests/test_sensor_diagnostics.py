@@ -82,14 +82,14 @@ def test_sensor_descriptions_follow_home_assistant_semantics() -> None:
         description = descriptions[key]
         assert description.device_class is SensorDeviceClass.ENERGY
         assert description.native_unit_of_measurement is UnitOfEnergy.KILO_WATT_HOUR
-        assert description.state_class is SensorStateClass.TOTAL
+        assert description.state_class is None
         assert description.suggested_display_precision == 1
 
     for key in ("current_bill_cost", "current_bill_credit"):
         description = descriptions[key]
         assert description.device_class is SensorDeviceClass.MONETARY
         assert description.native_unit_of_measurement == "NZD"
-        assert description.state_class is SensorStateClass.TOTAL
+        assert description.state_class is None
         assert description.suggested_display_precision == 2
 
     for key in ("billing_period_start", "billing_period_end", "next_billing_date"):
@@ -226,7 +226,7 @@ async def test_sensor_values_and_device_identifier_are_redacted(hass) -> None:
         "next_billing_date": date(2026, 8, 1),
         "data_complete": True,
     }
-    assert entities[3].last_reset == datetime(2026, 6, 30, 12, tzinfo=UTC)
+    assert entities[3].last_reset is None
     assert entities[0].last_reset is None
     coordinator.data = replace(
         coordinator.data,
@@ -590,6 +590,21 @@ async def test_diagnostics_exclude_all_sensitive_fields(hass) -> None:
     assert "private-refresh" not in serialized
     assert "private-user" not in serialized
     assert "hashed-key" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_snapshot(hass, snapshot, freezer) -> None:
+    """The full diagnostics payload, so any new field is reviewed for privacy."""
+    freezer.move_to("2026-07-15T01:00:00+00:00")
+    coordinator = MagicMock()
+    coordinator.data = _data()
+    coordinator.last_update_success = True
+    coordinator.last_exception = UpdateFailed("safe")
+    coordinator.billing_metadata_unavailable_count = 1
+    coordinator.billing_metadata_cache_age_seconds = 3600.125
+    entry = _entry(coordinator)
+
+    assert await async_get_config_entry_diagnostics(hass, entry) == snapshot
 
 
 @pytest.mark.asyncio

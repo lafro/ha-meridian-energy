@@ -126,13 +126,13 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """
     Promote completed v0.2.4 entries to the v0.2.5 compatibility boundary.
 
-    Unsupported entries raise a translated ``ConfigEntryError``, which leaves
-    the entry in ``migration_error`` with a reason the user can act on.
+    A higher minor version of the same major version is accepted unchanged:
+    Home Assistant treats minor versions as backward compatible, so rolling
+    back to this release must still load an entry written by a later 3.x
+    release. Unsupported entries raise a translated ``ConfigEntryError``, which
+    leaves the entry in ``migration_error`` with a reason the user can act on.
     """
-    if entry.version != CONFIG_ENTRY_VERSION or entry.minor_version not in {
-        0,
-        CONFIG_ENTRY_MINOR_VERSION,
-    }:
+    if entry.version != CONFIG_ENTRY_VERSION:
         raise ConfigEntryError(
             translation_domain=DOMAIN,
             translation_key="migration_unsupported_version",
@@ -140,7 +140,7 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "version": f"{entry.version}.{entry.minor_version}"
             },
         )
-    if entry.minor_version == CONFIG_ENTRY_MINOR_VERSION:
+    if entry.minor_version >= CONFIG_ENTRY_MINOR_VERSION:
         return True
     marker = entry.data.get(CONF_STATISTICS_STATE_VERSION)
     try:
