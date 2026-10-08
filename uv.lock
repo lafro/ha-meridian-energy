@@ -1050,6 +1050,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "pytest-homeassistant-custom-component" },
     { name = "ruff" },
+    { name = "syrupy" },
 ]
 
 [package.metadata]
@@ -1063,6 +1064,7 @@ dev = [
     { name = "pytest-cov", specifier = ">=6.2.1" },
     { name = "pytest-homeassistant-custom-component", specifier = "==0.13.370" },
     { name = "ruff", specifier = ">=0.12.0" },
+    { name = "syrupy", specifier = ">=6.1.1" },
 ]
 
 [[package]]

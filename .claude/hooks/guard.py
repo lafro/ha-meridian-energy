@@ -50,6 +50,7 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlsplit
 
 PROTECTED = "main"
 WRITE_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
@@ -608,9 +609,21 @@ def check_gh(tokens: list[str], cwd: str) -> str | None:
     return check_gh_api(args[args.index("api") + 1 :], cwd)
 
 
+def is_github_api_url(arg: str) -> bool:
+    """Return whether a command-line word is a URL on the GitHub REST API host."""
+    if arg.startswith("-"):
+        return False
+    candidate = arg if "://" in arg else f"https://{arg}"
+    try:
+        host = urlsplit(candidate).hostname
+    except ValueError:
+        return False
+    return host == "api.github.com"
+
+
 def check_http(tokens: list[str]) -> str | None:
     """Return why a curl/wget/httpie call to the GitHub API is blocked, or None."""
-    url = next((a for a in tokens[1:] if "api.github.com" in a), None)
+    url = next((a for a in tokens[1:] if is_github_api_url(a)), None)
     if url is None:
         return None
     prog = Path(tokens[0]).name

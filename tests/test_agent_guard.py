@@ -111,6 +111,7 @@ ALLOWED = [
     ("gh api repos/owner/repo/git/ref/tags/v0.2.5", None),
     ("gh api -X PATCH repos/owner/repo/issues/5 -f state=closed", None),
     ("curl -s https://api.github.com/repos/owner/repo/releases", None),
+    ("curl -X PUT https://example.com/?next=api.github.com/x/pulls/1/merge", None),
     ("uv run pytest && git push origin fix/thing", {"branch": "fix/thing"}),
 ]
 
@@ -129,6 +130,8 @@ BLOCKED = [
         ),
         None,
     ),
+    ("curl -X PUT api.github.com/repos/owner/repo/pulls/1/merge", None),
+    ("wget --method=DELETE https://api.github.com/repos/owner/repo", None),
     (
         (
             "gh api graphql -f query='mutation { mergePullRequest(input: "
