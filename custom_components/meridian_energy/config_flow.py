@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 from typing import Any
 from uuid import uuid4
 
-import voluptuous as vol
+import probatio
 from homeassistant.config_entries import (
     SOURCE_REAUTH,
     ConfigEntry,
@@ -92,9 +92,9 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="user",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required(CONF_EMAIL): selector.TextSelector(
+                    probatio.Required(CONF_EMAIL): selector.TextSelector(
                         selector.TextSelectorConfig(
                             type=selector.TextSelectorType.EMAIL,
                             autocomplete="email",
@@ -173,7 +173,7 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
         if errors:
             return self.async_show_form(
                 step_id="discovery_retry",
-                data_schema=vol.Schema({}),
+                data_schema=probatio.Schema({}),
                 errors=errors,
             )
         if not self._accounts:
@@ -209,9 +209,9 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
         ]
         return self.async_show_form(
             step_id="accounts",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required(
+                    probatio.Required(
                         CONF_SELECTED_ACCOUNTS,
                         default=[account.number for account in self._accounts],
                     ): selector.SelectSelector(
@@ -337,9 +337,9 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
         """Show the serializable six-digit login-code form."""
         return self.async_show_form(
             step_id="otp",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required("otp"): selector.TextSelector(
+                    probatio.Required("otp"): selector.TextSelector(
                         selector.TextSelectorConfig(
                             type=selector.TextSelectorType.TEL,
                             autocomplete="one-time-code",
@@ -380,7 +380,7 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
                 return await self.async_step_otp()
         return self.async_show_form(
             step_id="reauth_confirm",
-            data_schema=vol.Schema({}),
+            data_schema=probatio.Schema({}),
             errors=errors,
             description_placeholders={"email": self._email or ""},
         )
@@ -429,9 +429,9 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
         current = entry.data.get(CONF_SELECTED_ACCOUNTS, sorted(available))
         return self.async_show_form(
             step_id="reconfigure",
-            data_schema=vol.Schema(
+            data_schema=probatio.Schema(
                 {
-                    vol.Required(
+                    probatio.Required(
                         CONF_SELECTED_ACCOUNTS, default=list(current)
                     ): selector.SelectSelector(
                         selector.SelectSelectorConfig(
@@ -507,7 +507,7 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
             return None
         return self.async_show_form(
             step_id="reconfigure_discovery",
-            data_schema=vol.Schema({}),
+            data_schema=probatio.Schema({}),
             errors={"base": error},
         )
 
