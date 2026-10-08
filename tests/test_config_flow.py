@@ -535,14 +535,45 @@ async def test_expired_flow_guards(hass) -> None:
 
 
 @pytest.mark.asyncio
-async def test_reauth_missing_entry_aborts(hass) -> None:
-    flow = MeridianEnergyConfigFlow()
-    flow.hass = hass
-    flow.context = {"entry_id": "missing"}
+async def test_reauth_rejects_a_different_account(hass) -> None:
+    """Reauthentication cannot move an entry onto another Meridian login."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title=NAME,
+        unique_id="person@example.com",
+        data={
+            CONF_EMAIL: "someone-else@example.com",
+            CONF_REFRESH_TOKEN: "old-refresh",
+            CONF_FIREBASE_USER_ID: "old-user",
+        },
+    )
+    entry.add_to_hass(hass)
+    client = MagicMock()
+    client.async_send_otp = AsyncMock()
+    client.async_validate_otp = AsyncMock(return_value=_tokens())
+    with (
+        patch.object(
+            MeridianEnergyConfigFlow,
+            "_client",
+            new_callable=PropertyMock,
+            return_value=client,
+        ),
+        patch.object(hass.config_entries, "async_reload", AsyncMock()) as reload_entry,
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN,
+            context={"source": SOURCE_REAUTH, "entry_id": entry.entry_id},
+            data=dict(entry.data),
+        )
+        result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {"otp": "123456"}
+        )
 
-    result = await flow.async_step_reauth({CONF_EMAIL: "person@example.com"})
-
-    assert result["reason"] == "reauth_entry_missing"
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "unique_id_mismatch"
+    assert entry.data[CONF_REFRESH_TOKEN] == "old-refresh"
+    reload_entry.assert_not_awaited()
 
 
 @pytest.mark.parametrize(
@@ -946,6 +977,7 @@ async def test_reconfigure_auth_failure_routes_to_reauthentication(hass) -> None
     entry = MockConfigEntry(
         domain=DOMAIN,
         title=NAME,
+        unique_id="person@example.com",
         data={
             CONF_EMAIL: "person@example.com",
             CONF_REFRESH_TOKEN: "refresh",

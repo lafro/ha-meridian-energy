@@ -4,8 +4,15 @@ updates:
     directory: /
     schedule:
       interval: monthly
-  - package-ecosystem: pip
+    groups:
+      github-actions:
+        patterns: ["*"]
+  # uv updates pyproject.toml and uv.lock together, so CI (uv sync --locked)
+  # tests exactly what a pull request proposes.
+  - package-ecosystem: uv
     directory: /
     schedule:
       interval: monthly
-
+    groups:
+      development-dependencies:
+        patterns: ["*"]

@@ -1,5 +1,7 @@
 """Tests for security-critical repository and release contracts."""
 
+import re
+import tomllib
 from pathlib import Path
 
 import yaml
@@ -35,3 +37,29 @@ def test_release_validators_use_isolated_workspaces() -> None:
         ]
         assert any("actions/checkout@" in action for action in uses)
         assert not any("setup-uv@" in action for action in uses)
+
+
+def test_dependency_updates_keep_the_lock_file_authoritative() -> None:
+    """Dependabot must update uv.lock, and CI must refuse a stale lock."""
+    config = yaml.safe_load(Path(".github/dependabot.yml").read_text())
+    assert {update["package-ecosystem"] for update in config["updates"]} == {
+        "github-actions",
+        "uv",
+    }
+    for name in ("validate.yml", "release.yml"):
+        workflow = Path(".github/workflows", name).read_text()
+        assert "uv sync --all-groups --locked" in workflow
+        assert "--frozen" not in workflow
+
+    project = tomllib.loads(Path("pyproject.toml").read_text())
+    assert "<" not in project["tool"]["uv"]["required-version"]
+
+
+def test_workflow_actions_are_pinned_to_commit_shas() -> None:
+    pinned = re.compile(r"^[\w.-]+/[\w./-]+@[0-9a-f]{40}$")
+    for path in Path(".github/workflows").glob("*.yml"):
+        workflow = yaml.safe_load(path.read_text())
+        for job in workflow["jobs"].values():
+            for step in job.get("steps", []):
+                if "uses" in step:
+                    assert pinned.match(step["uses"]), (path.name, step["uses"])

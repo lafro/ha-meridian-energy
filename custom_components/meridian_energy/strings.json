@@ -6,9 +6,7 @@
       "login_expired": "The login attempt expired. Start setup again to request a new code.",
       "initial_import_failed": "The initial Meridian history import did not complete. Check the connection and start setup again; no login code or password was stored.",
       "no_accounts": "No active Meridian electricity accounts were found for this login.",
-      "reauth_entry_missing": "The Meridian configuration entry could not be found.",
-      "reauth_successful": "Meridian Energy was reauthenticated successfully.",
-      "reconfigure_successful": "The selected Meridian accounts were updated successfully."
+      "unique_id_mismatch": "That login belongs to a different Meridian account. Reconnect using the email address this integration was set up with."
     },
     "error": {
       "cannot_connect": "Unable to reach Meridian. Check your internet connection and try again.",
@@ -98,6 +96,12 @@
     },
     "rate_limited": {
       "message": "Meridian asked Home Assistant to wait before trying again."
+    },
+    "migration_unsupported_version": {
+      "message": "This Meridian Energy configuration entry (version {version}) is not supported by this release. Remove the integration and add it again."
+    },
+    "migration_incomplete_entry": {
+      "message": "This Meridian Energy configuration entry was not completed on v0.2.4, so it cannot be upgraded safely. Restore it, or complete it on v0.2.4, before upgrading; or remove the integration and add it again."
     }
   },
   "entity": {

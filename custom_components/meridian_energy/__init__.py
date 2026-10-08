@@ -8,7 +8,8 @@ from datetime import UTC, datetime
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
-from homeassistant.core import CoreState, HomeAssistant
+from homeassistant.core import HomeAssistant, callback
+from homeassistant.exceptions import ConfigEntryError
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceEntry
 from homeassistant.helpers.start import async_at_started
@@ -59,8 +60,14 @@ def _selected_accounts(data: Mapping[str, object]) -> frozenset[str]:
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> bool:
-    """Set up Meridian Energy from a config entry."""
-    needs_startup_billing_refresh = hass.state is not CoreState.running
+    """
+    Set up Meridian Energy from a config entry.
+
+    Setup only renews the stored session and caches the account topology, so
+    Home Assistant start-up does not wait for the measurement sync. The first
+    sync, which imports statistics, runs as a background task once Home
+    Assistant has started, or straight away when it is already running.
+    """
 
     async def async_store_tokens(tokens: MeridianTokenSet) -> None:
         if (
@@ -96,17 +103,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> 
         selected_accounts=selected_accounts,
         auto_add_accounts=bool(entry.data.get(CONF_AUTO_ADD_ACCOUNTS, False)),
     )
-    await coordinator.async_config_entry_first_refresh()
+    await coordinator.async_prepare_topology()
     entry.runtime_data = MeridianRuntimeData(client, coordinator)
-
-    if needs_startup_billing_refresh:
-
-        async def async_refresh_billing_after_start(_hass: HomeAssistant) -> None:
-            """Populate Recorder-derived billing totals once startup is complete."""
-            await coordinator.async_refresh_billing_totals()
-
-        entry.async_on_unload(async_at_started(hass, async_refresh_billing_after_start))
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    @callback
+    def _async_start_first_sync(_hass: HomeAssistant) -> None:
+        entry.async_create_background_task(
+            hass, coordinator.async_refresh(), f"{DOMAIN} first sync"
+        )
+
+    entry.async_on_unload(async_at_started(hass, _async_start_first_sync))
     return True
 
 
@@ -116,20 +123,37 @@ async def async_unload_entry(hass: HomeAssistant, entry: MeridianConfigEntry) ->
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Promote completed v0.2.4 entries to the v0.2.5 compatibility boundary."""
-    if entry.version != CONFIG_ENTRY_VERSION:
-        return False
+    """
+    Promote completed v0.2.4 entries to the v0.2.5 compatibility boundary.
+
+    Unsupported entries raise a translated ``ConfigEntryError``, which leaves
+    the entry in ``migration_error`` with a reason the user can act on.
+    """
+    if entry.version != CONFIG_ENTRY_VERSION or entry.minor_version not in {
+        0,
+        CONFIG_ENTRY_MINOR_VERSION,
+    }:
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="migration_unsupported_version",
+            translation_placeholders={
+                "version": f"{entry.version}.{entry.minor_version}"
+            },
+        )
     if entry.minor_version == CONFIG_ENTRY_MINOR_VERSION:
         return True
-    if entry.minor_version != 0:
-        return False
+    marker = entry.data.get(CONF_STATISTICS_STATE_VERSION)
     try:
         _selected_accounts(entry.data)
     except KeyError, ValueError:
-        return False
-    marker = entry.data.get(CONF_STATISTICS_STATE_VERSION)
-    if type(marker) is not int or marker != STATISTICS_STATE_VERSION:
-        return False
+        complete = False
+    else:
+        complete = type(marker) is int and marker == STATISTICS_STATE_VERSION
+    if not complete:
+        raise ConfigEntryError(
+            translation_domain=DOMAIN,
+            translation_key="migration_incomplete_entry",
+        )
     data = dict(entry.data)
     data.pop(CONF_STATISTICS_STATE_VERSION)
     hass.config_entries.async_update_entry(

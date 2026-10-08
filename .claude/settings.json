@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "deny": [
+      "mcp__claude_ai_Home_Assistant",
+      "Bash(gh pr merge *)",
+      "Bash(gh release delete *)",
+      "Bash(gh release delete-asset *)",
+      "Bash(gh repo delete *)",
+      "Bash(gh api * -X DELETE *)",
+      "Bash(gh api * --method DELETE *)",
+      "Bash(git push --force *)",
+      "Bash(git push -f *)",
+      "Bash(git push * --force *)",
+      "Bash(git push * -f *)",
+      "Bash(git push --delete *)",
+      "Bash(git push -d *)",
+      "Bash(git push * --delete *)",
+      "Bash(git push * -d *)",
+      "Bash(git push * :refs/tags/*)",
+      "Bash(git push * main)",
+      "Bash(git push * HEAD:main)",
+      "Bash(git tag *)"
+    ]
+  },
+  "deniedMcpServers": [
+    { "serverName": "claude.ai Home Assistant" },
+    { "serverName": "claude.ai Home Assistant (read-only)" }
+  ]
+}

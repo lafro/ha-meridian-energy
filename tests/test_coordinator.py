@@ -8,13 +8,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant.config_entries import ConfigEntryAuthFailed
+from homeassistant.exceptions import ConfigEntryNotReady
 from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from custom_components.meridian_energy.api import (
     MeridianAuthenticationError,
     MeridianConnectionError,
     MeridianGraphQLError,
+    MeridianRateLimitError,
 )
+from custom_components.meridian_energy.const import FIRST_SYNC_RETRY_SECONDS
 from custom_components.meridian_energy.coordinator import MeridianDataCoordinator
 from custom_components.meridian_energy.models import (
     MeasurementFetchResult,
@@ -202,6 +205,87 @@ async def test_update_maps_errors(
 
     with pytest.raises(expected):
         await coordinator._async_update_data()
+
+
+@pytest.mark.parametrize(
+    ("error", "expected", "translation_key"),
+    [
+        (MeridianAuthenticationError(), ConfigEntryAuthFailed, "invalid_auth"),
+        (MeridianRateLimitError(120), ConfigEntryNotReady, "rate_limited"),
+        (MeridianConnectionError(), ConfigEntryNotReady, "cannot_connect"),
+        (
+            MeridianGraphQLError("accounts", ("CODE",)),
+            ConfigEntryNotReady,
+            "invalid_data",
+        ),
+        (ValueError("bad data"), ConfigEntryNotReady, "invalid_data"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_prepare_topology_maps_errors_for_setup(
+    hass, error: Exception, expected: type[Exception], translation_key: str
+) -> None:
+    """Setup's only Meridian call raises config-entry exceptions HA acts on."""
+    client = MagicMock()
+    client.async_get_accounts = AsyncMock(side_effect=error)
+    coordinator = MeridianDataCoordinator(hass, client)
+
+    with pytest.raises(expected) as raised:
+        await coordinator.async_prepare_topology()
+
+    assert raised.value.translation_key == translation_key
+
+
+@pytest.mark.asyncio
+async def test_prepare_topology_rejects_missing_selected_accounts(hass) -> None:
+    client = MagicMock()
+    client.async_get_accounts = AsyncMock(return_value=(_account(),))
+    coordinator = MeridianDataCoordinator(
+        hass, client, selected_accounts=frozenset({"A-OTHER"})
+    )
+
+    with pytest.raises(ConfigEntryNotReady):
+        await coordinator.async_prepare_topology()
+
+
+@pytest.mark.asyncio
+async def test_prepare_topology_caches_accounts_for_the_first_sync(hass) -> None:
+    """The first sync reuses the topology fetched during setup."""
+    client = MagicMock()
+    client.async_get_accounts = AsyncMock(return_value=(_account(),))
+    coordinator = MeridianDataCoordinator(hass, client)
+
+    await coordinator.async_prepare_topology()
+
+    assert coordinator.accounts == (_account(),)
+    accounts, refreshed = await coordinator._async_get_topology(
+        coordinator._topology_cached_at
+    )
+    assert accounts == (_account(),)
+    assert refreshed is False
+    client.async_get_accounts.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [MeridianConnectionError(), MeridianGraphQLError("accounts", ("CODE",))],
+)
+@pytest.mark.asyncio
+async def test_failed_first_sync_retries_sooner_than_the_hourly_poll(
+    hass, error: Exception
+) -> None:
+    client = MagicMock()
+    client.async_get_accounts = AsyncMock(side_effect=error)
+    coordinator = MeridianDataCoordinator(hass, client)
+
+    with pytest.raises(UpdateFailed) as first:
+        await coordinator._async_update_data()
+    assert first.value.retry_after == FIRST_SYNC_RETRY_SECONDS
+
+    coordinator._initial_refresh_complete = True
+    with pytest.raises(UpdateFailed) as later:
+        await coordinator._async_update_data()
+    assert later.value.retry_after is None
 
 
 @pytest.mark.asyncio

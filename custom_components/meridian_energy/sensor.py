@@ -166,15 +166,21 @@ async def async_setup_entry(
         for account in coordinator.accounts:
             key = account_key(account.number)
             current_account_keys.add(key)
-            result = _account_result(coordinator.data, key)
-            if result is None:
-                incoherent_account_keys.add(key)
-                continue
+            if coordinator.data is None:
+                # Before the first sync, entities come from the cached topology
+                # and stay unavailable until that sync supplies their values.
+                has_feed_in = _account_has_feed_in(account)
+            else:
+                result = _account_result(coordinator.data, key)
+                if result is None:
+                    incoherent_account_keys.add(key)
+                    continue
+                has_feed_in = result.has_feed_in
             for description in DESCRIPTIONS:
                 sensor_key = (key, description.key)
                 if description.conditional_feed_in:
                     conditional_sensor_keys.add(sensor_key)
-                if description.conditional_feed_in and not result.has_feed_in:
+                if description.conditional_feed_in and not has_feed_in:
                     continue
                 desired_sensor_keys.add(sensor_key)
                 if sensor_key in created_sensors:
@@ -303,6 +309,8 @@ class MeridianAccountSensor(CoordinatorEntity[MeridianDataCoordinator], SensorEn
     @property
     def native_value(self) -> NativeValue:
         """Return this account's current value."""
+        if self.coordinator.data is None:
+            return None
         return self._description.value_fn(self.coordinator.data, self._account_key)
 
     @property
@@ -334,6 +342,8 @@ class MeridianAccountSensor(CoordinatorEntity[MeridianDataCoordinator], SensorEn
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
         """Expose useful, non-sensitive context for diagnostics and billing."""
+        if self.coordinator.data is None:
+            return None
         key = self.entity_description.key
         if key == "estimated_readings":
             return self._provisional_attributes()
@@ -388,10 +398,23 @@ class MeridianAccountSensor(CoordinatorEntity[MeridianDataCoordinator], SensorEn
         }
 
 
-def _account_result(data: MeridianSyncData, key: str) -> AccountSyncResult | None:
+def _account_result(
+    data: MeridianSyncData | None, key: str
+) -> AccountSyncResult | None:
     """Find a coordinator account result by its non-sensitive key."""
+    if data is None:
+        return None
     return next(
         (item for item in data.account_results if item.account_key == key), None
+    )
+
+
+def _account_has_feed_in(account: MeridianAccount) -> bool:
+    """Return whether any meter on the account reports feed-in metering."""
+    return any(
+        meter.has_feed_in
+        for property_data in account.properties
+        for meter in property_data.meter_points
     )
 
 

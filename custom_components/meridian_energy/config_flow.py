@@ -59,7 +59,6 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         self._email: str | None = None
         self._journey_id: str | None = None
-        self._reauth_entry: ConfigEntry | None = None
         self._pending_data: dict[str, Any] | None = None
         self._tokens: MeridianTokenSet | None = None
         self._discovery_client: MeridianApiClient | None = None
@@ -133,11 +132,11 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
                     CONF_REFRESH_TOKEN: tokens.refresh_token,
                     CONF_FIREBASE_USER_ID: tokens.user_id,
                 }
-                if self._reauth_entry is not None:
+                if self.source == SOURCE_REAUTH:
+                    await self.async_set_unique_id(self._email)
+                    self._abort_if_unique_id_mismatch()
                     return self.async_update_reload_and_abort(
-                        self._reauth_entry,
-                        data_updates=data,
-                        reason="reauth_successful",
+                        self._get_reauth_entry(), data_updates=data
                     )
                 return await self._async_prepare_accounts(tokens, data)
 
@@ -353,11 +352,6 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
 
     async def async_step_reauth(self, entry_data: dict[str, Any]) -> ConfigFlowResult:
         """Begin reauthentication for an expired Firebase session."""
-        self._reauth_entry = self.hass.config_entries.async_get_entry(
-            self.context["entry_id"]
-        )
-        if self._reauth_entry is None:
-            return self.async_abort(reason="reauth_entry_missing")
         self._email = str(entry_data[CONF_EMAIL]).strip().lower()
         return await self.async_step_reauth_confirm()
 
@@ -495,8 +489,9 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
         except MeridianConnectionError:
             error = "cannot_connect"
         except MeridianAuthenticationError:
+            # The stored session is no longer accepted: continue this flow as a
+            # reauthentication of the same entry (context keeps its entry_id).
             self.context["source"] = SOURCE_REAUTH
-            self._reauth_entry = entry
             self._email = str(entry.data[CONF_EMAIL]).strip().lower()
             return await self.async_step_reauth_confirm()
         except MeridianGraphQLError, ValueError:

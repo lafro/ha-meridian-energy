@@ -35,7 +35,6 @@ from custom_components.meridian_energy.models import (
     MeridianMeasurement,
     MeridianMeterPoint,
     MeridianProperty,
-    MeridianSyncData,
     SyncMode,
 )
 from custom_components.meridian_energy.statistics import consumption_ids, property_key
@@ -491,58 +490,6 @@ async def test_future_billing_period_does_not_query_recorder(hass) -> None:
 
     calculate.assert_not_awaited()
     assert result[0].current_bill_usage is None
-
-
-@pytest.mark.asyncio
-async def test_refresh_billing_totals_reuses_existing_sync_data(hass) -> None:
-    hass.set_state(CoreState.running)
-    coordinator = MeridianDataCoordinator(hass, MagicMock())
-    coordinator._topology = (_account(),)
-    original = MeridianSyncData(
-        account_count=1,
-        property_count=1,
-        results=(),
-        account_results=(),
-        synced_at=NOW,
-        sync_mode=SyncMode.RESTART,
-        topology_refreshed=True,
-        topology_cache_age_seconds=0,
-    )
-    coordinator.data = original
-    refreshed = (MagicMock(),)
-    coordinator._async_account_results = AsyncMock(return_value=refreshed)
-
-    await coordinator.async_refresh_billing_totals()
-
-    coordinator._async_account_results.assert_awaited_once()
-    assert coordinator.data.account_results == refreshed
-    assert coordinator.data.synced_at == NOW
-    assert coordinator.data.sync_mode is SyncMode.RESTART
-
-
-@pytest.mark.asyncio
-async def test_refresh_billing_totals_skips_until_data_and_runtime_are_ready(
-    hass,
-) -> None:
-    coordinator = MeridianDataCoordinator(hass, MagicMock())
-    coordinator._async_account_results = AsyncMock()
-
-    await coordinator.async_refresh_billing_totals()
-    coordinator._async_account_results.assert_not_awaited()
-
-    coordinator.data = MeridianSyncData(
-        account_count=0,
-        property_count=0,
-        results=(),
-        account_results=(),
-        synced_at=NOW,
-        sync_mode=SyncMode.RESTART,
-        topology_refreshed=False,
-        topology_cache_age_seconds=0,
-    )
-    hass.set_state(CoreState.starting)
-    await coordinator.async_refresh_billing_totals()
-    coordinator._async_account_results.assert_not_awaited()
 
 
 def test_billing_metadata_cache_age_handles_empty_and_future_cache(hass) -> None:

@@ -5,14 +5,13 @@ from __future__ import annotations
 import logging
 import math
 from collections import Counter
-from dataclasses import replace
 from datetime import UTC, date, datetime, time, timedelta
 from time import monotonic
 from zoneinfo import ZoneInfo
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import CoreState, HomeAssistant
-from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
 from .api import (
@@ -29,6 +28,7 @@ from .const import (
     CONF_AUTO_ADD_ACCOUNTS,
     CONF_SELECTED_ACCOUNTS,
     DOMAIN,
+    FIRST_SYNC_RETRY_SECONDS,
     FULL_RECONCILIATION_INTERVAL,
     INITIAL_BACKFILL,
     MAX_MEASUREMENT_PAGES,
@@ -162,11 +162,47 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         oldest_cached_at = min(self._billing_cached_at.values())
         return max(0.0, (now - oldest_cached_at).total_seconds())
 
+    async def async_prepare_topology(self) -> None:
+        """
+        Renew the stored session and cache the selected account topology.
+
+        This is the only Meridian work done during config-entry setup. Errors
+        are raised as config-entry exceptions so Home Assistant starts
+        reauthentication or retries setup with its own backoff.
+        """
+        try:
+            await self._async_get_topology(_utcnow())
+        except MeridianAuthenticationError as err:
+            raise ConfigEntryAuthFailed(
+                translation_domain=DOMAIN,
+                translation_key="invalid_auth",
+            ) from err
+        except MeridianRateLimitError as err:
+            raise ConfigEntryNotReady(
+                translation_domain=DOMAIN,
+                translation_key="rate_limited",
+            ) from err
+        except MeridianConnectionError as err:
+            raise ConfigEntryNotReady(
+                translation_domain=DOMAIN,
+                translation_key="cannot_connect",
+            ) from err
+        except (MeridianError, ValueError) as err:
+            raise ConfigEntryNotReady(
+                translation_domain=DOMAIN,
+                translation_key="invalid_data",
+            ) from err
+
     async def _async_update_data(self) -> MeridianSyncData:
         return await self.async_fetch_and_import()
 
     async def async_fetch_and_import(self) -> MeridianSyncData:
         """Fetch Meridian data and import statistics for setup or polling."""
+        # Until one sync has succeeded, retry sooner than the hourly poll: the
+        # first sync runs after setup, so setup's own retry no longer covers it.
+        first_sync_retry = (
+            None if self._initial_refresh_complete else FIRST_SYNC_RETRY_SECONDS
+        )
         try:
             data = await self._async_fetch_and_import_data()
         except MeridianAuthenticationError as err:
@@ -184,11 +220,13 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             raise UpdateFailed(
                 translation_domain=DOMAIN,
                 translation_key="cannot_connect",
+                retry_after=first_sync_retry,
             ) from err
         except (MeridianError, ValueError) as err:
             raise UpdateFailed(
                 translation_domain=DOMAIN,
                 translation_key="invalid_data",
+                retry_after=first_sync_retry,
             ) from err
         else:
             return data
@@ -272,13 +310,6 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             sum(result.estimated_rows for result in data.results),
             data.topology_refreshed,
         )
-
-    async def async_refresh_billing_totals(self) -> None:
-        """Refresh Recorder-derived billing totals without polling Meridian usage."""
-        if self.data is None or self.hass.state is not CoreState.running:
-            return
-        account_results = await self._async_account_results(self.accounts, _utcnow())
-        self.async_set_updated_data(replace(self.data, account_results=account_results))
 
     def _select_sync_mode(self, now: datetime) -> SyncMode:
         if not self._initial_refresh_complete:
