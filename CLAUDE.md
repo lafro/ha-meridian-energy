@@ -9,7 +9,7 @@ Public HACS custom integration (`custom_components/meridian_energy`, domain `mer
 - **No Home Assistant access from this repo.** Sessions here never call Home Assistant tools. Live checks, HACS downloads and restarts happen in sessions on the maintainer's private home-configuration repository.
 - **GitHub only.** Use no connector other than GitHub from this repo (no issue trackers, email, chat, calendars, website or marketing tools).
 - **Never delete** tags, releases or the repository, and never force-push. Tags and releases are immutable by ruleset; only the maintainer deletes anything.
-- **The maintainer merges and releases.** In practice that is the maintainer's interactive session in the private home-configuration repository, once CI passes and an independent review of the latest commit says merge; it is never a session in this repository. Here: open a pull request, wait for CI (`gh pr checks --watch`), and stop. Never create or push tags, publish releases or dispatch the Release workflow.
+- **The maintainer merges and releases.** In practice that is one of the maintainer's own interactive sessions outside this repository, once CI passes and an independent review of the latest commit says merge; it is never a session in this repository. Here: open a pull request, wait for CI (`gh pr checks --watch`), and stop. Never create or push tags, publish releases or dispatch the Release workflow.
 
 ## How the rules are enforced
 
