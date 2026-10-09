@@ -77,11 +77,11 @@ def test_dependabot_leaves_the_harness_pins_to_the_harness() -> None:
     _check_harness_ignore_list(_dependabot_uv_ignore())
 
 
-@pytest.mark.parametrize("name", [None, ""])
-def test_dependabot_contract_rejects_an_empty_dependency_name(
-    name: str | None,
+@pytest.mark.parametrize("name", [None, "", 123, True, ["pytest"]])
+def test_dependabot_contract_rejects_a_dependency_name_that_is_not_a_name(
+    name: object,
 ) -> None:
-    """A dependency-name with no value fails the named assertion, not an error."""
+    """An empty or non-string dependency-name fails the assertion, not an error."""
     entry = {"dependency-name": name}
     with pytest.raises(
         AssertionError, match="not just a package name: .*" + re.escape(repr(entry))
@@ -110,13 +110,13 @@ def _check_harness_ignore_list(ignore: list[dict[str, Any]]) -> None:
         )
         if any(spec.operator == "==" for spec in requirement.specifier)
     }
-    # An entry whose dependency-name is missing, None or empty shows as its
-    # repr, so this assertion reports it rather than a KeyError or an error
-    # from canonicalize_name.
+    # An entry whose dependency-name is missing, empty or not a string shows
+    # as its repr, so this assertion reports it rather than a KeyError, a
+    # TypeError from sorting or an error from canonicalize_name.
     narrowed = sorted(
-        item.get("dependency-name") or repr(item)
+        _ignore_entry_label(item)
         for item in ignore
-        if item.keys() != {"dependency-name"} or not item["dependency-name"]
+        if item.keys() != {"dependency-name"} or not _is_package_name(item)
     )
     assert not narrowed, f"not just a package name: {narrowed}"
     ignored = {canonicalize_name(item["dependency-name"]) for item in ignore}
@@ -129,6 +129,15 @@ def _check_harness_ignore_list(ignore: list[dict[str, Any]]) -> None:
         f"not a direct dev dependency pinned with == by the harness: "
         f"{sorted(ignored - expected)}"
     )
+
+
+def _is_package_name(item: dict[str, Any]) -> bool:
+    name = item.get("dependency-name")
+    return isinstance(name, str) and bool(name)
+
+
+def _ignore_entry_label(item: dict[str, Any]) -> str:
+    return item["dependency-name"] if _is_package_name(item) else repr(item)
 
 
 def test_dependabot_labels_are_explicit() -> None:
