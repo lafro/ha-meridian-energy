@@ -118,10 +118,10 @@ jobs:
           if [[ -n "$number" ]]; then
             gh issue comment "$number" --body "$body"
           else
-            # Fails harmlessly when the label already exists. issues: write
-            # is enough to create a label.
-            gh label create compat --color e99695 \
-              --description "Weekly HA compatibility check failed (opened by compat.yml)" \
-              || true
+            # --force updates the label when it already exists, so any other
+            # failure stops the step here. issues: write is enough to create
+            # or update a label.
+            gh label create compat --force --color e99695 \
+              --description "Weekly HA compatibility check failed (opened by compat.yml)"
             gh issue create --title "$title" --body "$body" --label compat
           fi

@@ -68,7 +68,10 @@ def test_dependabot_leaves_the_harness_pins_to_the_harness() -> None:
     and records an error that fails the uv job (pytest 9.1.1 did, against the
     harness's ``pytest==9.0.3``). Those packages move when the harness pin is
     bumped instead. The list must not cover anything else, because ``ignore``
-    also stops Dependabot's security pull requests for a package.
+    also stops Dependabot's security pull requests for a package. Each entry
+    must name the package only: one narrowed with ``versions`` or
+    ``update-types`` lets Dependabot try the package's other updates, which
+    cannot resolve either.
     """
     project = tomllib.loads(Path("pyproject.toml").read_text())
     direct = {
@@ -86,10 +89,12 @@ def test_dependabot_leaves_the_harness_pins_to_the_harness() -> None:
     uv_updates = next(
         update for update in config["updates"] if update["package-ecosystem"] == "uv"
     )
-    ignored = {
-        canonicalize_name(item["dependency-name"])
-        for item in uv_updates.get("ignore", [])
-    }
+    ignore = uv_updates.get("ignore", [])
+    narrowed = sorted(
+        item["dependency-name"] for item in ignore if item.keys() != {"dependency-name"}
+    )
+    assert not narrowed, f"narrowed beyond the package name: {narrowed}"
+    ignored = {canonicalize_name(item["dependency-name"]) for item in ignore}
 
     # Equality catches a missing entry, a misspelt one, one the harness does
     # not pin and one the harness has stopped pinning exactly.
@@ -120,7 +125,16 @@ def test_compat_failures_open_a_labelled_tracking_issue() -> None:
     assert report["permissions"] == {"issues": "write"}
     assert workflow["permissions"] == {"contents": "read"}
     script = report["steps"][0]["run"]
-    assert "gh label create compat --color e99695" in script
+    # Join continuation lines and whitespace so each command matches whole.
+    commands = " ".join(script.replace("\\\n", " ").split())
+    # --force, not "|| true": only "already exists" is harmless. The colour and
+    # description are the live label's.
+    assert (
+        "gh label create compat --force --color e99695 "
+        '--description "Weekly HA compatibility check failed (opened by compat.yml)" '
+        "gh issue create"
+    ) in commands
+    assert "|| true" not in script
     assert 'gh issue create --title "$title" --body "$body" --label compat' in script
 
 
