@@ -62,11 +62,13 @@ def test_dependency_updates_keep_the_lock_file_authoritative() -> None:
 
 
 def test_dependabot_leaves_the_harness_pins_to_the_harness() -> None:
-    """Dependabot must not bump a dev dependency the test harness pins exactly.
+    """Dependabot ignores exactly the dev dependencies the harness pins with ==.
 
-    On its own, such an update cannot resolve, and it fails the whole grouped
-    uv update (pytest did, against the harness's ``pytest==9.0.3``). Those
-    packages move when the harness pin is bumped instead.
+    An update to one of them on its own cannot resolve, so Dependabot skips it
+    and records an error that fails the uv job (pytest 9.1.1 did, against the
+    harness's ``pytest==9.0.3``). Those packages move when the harness pin is
+    bumped instead. The list must not cover anything else, because ``ignore``
+    also stops Dependabot's security pull requests for a package.
     """
     project = tomllib.loads(Path("pyproject.toml").read_text())
     direct = {
@@ -89,9 +91,14 @@ def test_dependabot_leaves_the_harness_pins_to_the_harness() -> None:
         for item in uv_updates.get("ignore", [])
     }
 
-    assert direct & harness_pins <= ignored
-    # Every ignored name is a direct dev dependency, so a typo cannot hide.
-    assert ignored <= direct
+    # Equality catches a missing entry, a misspelt one, one the harness does
+    # not pin and one the harness has stopped pinning exactly.
+    expected = direct & harness_pins
+    assert ignored == expected, (
+        f"missing: {sorted(expected - ignored)}; "
+        f"not a direct dev dependency pinned with == by the harness: "
+        f"{sorted(ignored - expected)}"
+    )
 
 
 def test_workflow_actions_are_pinned_to_commit_shas() -> None:
