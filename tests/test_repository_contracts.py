@@ -4,6 +4,7 @@ import re
 import tomllib
 from importlib.metadata import requires
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
@@ -73,6 +74,30 @@ def test_dependabot_leaves_the_harness_pins_to_the_harness() -> None:
     ``update-types`` lets Dependabot try the package's other updates, which
     cannot resolve either.
     """
+    _check_harness_ignore_list(_dependabot_uv_ignore())
+
+
+@pytest.mark.parametrize("name", [None, ""])
+def test_dependabot_contract_rejects_an_empty_dependency_name(
+    name: str | None,
+) -> None:
+    """A dependency-name with no value fails the named assertion, not an error."""
+    entry = {"dependency-name": name}
+    with pytest.raises(
+        AssertionError, match="not just a package name: .*" + re.escape(repr(entry))
+    ):
+        _check_harness_ignore_list([*_dependabot_uv_ignore(), entry])
+
+
+def _dependabot_uv_ignore() -> list[dict[str, Any]]:
+    config = yaml.safe_load(Path(".github/dependabot.yml").read_text())
+    uv_updates = next(
+        update for update in config["updates"] if update["package-ecosystem"] == "uv"
+    )
+    return uv_updates.get("ignore", [])
+
+
+def _check_harness_ignore_list(ignore: list[dict[str, Any]]) -> None:
     project = tomllib.loads(Path("pyproject.toml").read_text())
     direct = {
         canonicalize_name(Requirement(requirement).name)
@@ -85,17 +110,13 @@ def test_dependabot_leaves_the_harness_pins_to_the_harness() -> None:
         )
         if any(spec.operator == "==" for spec in requirement.specifier)
     }
-    config = yaml.safe_load(Path(".github/dependabot.yml").read_text())
-    uv_updates = next(
-        update for update in config["updates"] if update["package-ecosystem"] == "uv"
-    )
-    ignore = uv_updates.get("ignore", [])
-    # An entry with no dependency-name shows as its repr, so this assertion
-    # reports it rather than a KeyError.
+    # An entry whose dependency-name is missing, None or empty shows as its
+    # repr, so this assertion reports it rather than a KeyError or an error
+    # from canonicalize_name.
     narrowed = sorted(
-        item.get("dependency-name", repr(item))
+        item.get("dependency-name") or repr(item)
         for item in ignore
-        if item.keys() != {"dependency-name"}
+        if item.keys() != {"dependency-name"} or not item["dependency-name"]
     )
     assert not narrowed, f"not just a package name: {narrowed}"
     ignored = {canonicalize_name(item["dependency-name"]) for item in ignore}
