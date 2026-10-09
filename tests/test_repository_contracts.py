@@ -90,10 +90,14 @@ def test_dependabot_leaves_the_harness_pins_to_the_harness() -> None:
         update for update in config["updates"] if update["package-ecosystem"] == "uv"
     )
     ignore = uv_updates.get("ignore", [])
+    # An entry with no dependency-name shows as its repr, so this assertion
+    # reports it rather than a KeyError.
     narrowed = sorted(
-        item["dependency-name"] for item in ignore if item.keys() != {"dependency-name"}
+        item.get("dependency-name", repr(item))
+        for item in ignore
+        if item.keys() != {"dependency-name"}
     )
-    assert not narrowed, f"narrowed beyond the package name: {narrowed}"
+    assert not narrowed, f"not just a package name: {narrowed}"
     ignored = {canonicalize_name(item["dependency-name"]) for item in ignore}
 
     # Equality catches a missing entry, a misspelt one, one the harness does
