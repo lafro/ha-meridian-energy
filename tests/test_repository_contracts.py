@@ -2,10 +2,13 @@
 
 import re
 import tomllib
+from importlib.metadata import requires
 from pathlib import Path
 
 import pytest
 import yaml
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 
 from scripts import check_versions
 
@@ -56,6 +59,46 @@ def test_dependency_updates_keep_the_lock_file_authoritative() -> None:
 
     project = tomllib.loads(Path("pyproject.toml").read_text())
     assert "<" not in project["tool"]["uv"]["required-version"]
+
+
+def test_dependabot_leaves_the_harness_pins_to_the_harness() -> None:
+    """Dependabot ignores exactly the dev dependencies the harness pins with ==.
+
+    An update to one of them on its own cannot resolve, so Dependabot skips it
+    and records an error that fails the uv job (pytest 9.1.1 did, against the
+    harness's ``pytest==9.0.3``). Those packages move when the harness pin is
+    bumped instead. The list must not cover anything else, because ``ignore``
+    also stops Dependabot's security pull requests for a package.
+    """
+    project = tomllib.loads(Path("pyproject.toml").read_text())
+    direct = {
+        canonicalize_name(Requirement(requirement).name)
+        for requirement in project["dependency-groups"]["dev"]
+    }
+    harness_pins = {
+        canonicalize_name(requirement.name)
+        for requirement in map(
+            Requirement, requires("pytest-homeassistant-custom-component") or []
+        )
+        if any(spec.operator == "==" for spec in requirement.specifier)
+    }
+    config = yaml.safe_load(Path(".github/dependabot.yml").read_text())
+    uv_updates = next(
+        update for update in config["updates"] if update["package-ecosystem"] == "uv"
+    )
+    ignored = {
+        canonicalize_name(item["dependency-name"])
+        for item in uv_updates.get("ignore", [])
+    }
+
+    # Equality catches a missing entry, a misspelt one, one the harness does
+    # not pin and one the harness has stopped pinning exactly.
+    expected = direct & harness_pins
+    assert ignored == expected, (
+        f"missing: {sorted(expected - ignored)}; "
+        f"not a direct dev dependency pinned with == by the harness: "
+        f"{sorted(ignored - expected)}"
+    )
 
 
 def test_workflow_actions_are_pinned_to_commit_shas() -> None:
