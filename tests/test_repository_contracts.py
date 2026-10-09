@@ -101,6 +101,29 @@ def test_dependabot_leaves_the_harness_pins_to_the_harness() -> None:
     )
 
 
+def test_dependabot_labels_are_explicit() -> None:
+    """Without labels, Dependabot creates and applies github_actions."""
+    config = yaml.safe_load(Path(".github/dependabot.yml").read_text())
+    labels = {
+        update["package-ecosystem"]: update["labels"] for update in config["updates"]
+    }
+    assert labels == {
+        "github-actions": ["dependencies", "github-actions"],
+        "uv": ["dependencies", "python"],
+    }
+
+
+def test_compat_failures_open_a_labelled_tracking_issue() -> None:
+    workflow = yaml.safe_load(Path(".github/workflows/compat.yml").read_text())
+    report = workflow["jobs"]["report"]
+    assert report["if"] == "failure() && github.event_name == 'schedule'"
+    assert report["permissions"] == {"issues": "write"}
+    assert workflow["permissions"] == {"contents": "read"}
+    script = report["steps"][0]["run"]
+    assert "gh label create compat --color e99695" in script
+    assert 'gh issue create --title "$title" --body "$body" --label compat' in script
+
+
 def test_workflow_actions_are_pinned_to_commit_shas() -> None:
     pinned = re.compile(r"^[\w.-]+/[\w./-]+@[0-9a-f]{40}$")
     for path in Path(".github/workflows").glob("*.yml"):
