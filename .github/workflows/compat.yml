@@ -9,7 +9,8 @@ name: Compatibility
 #   minimum in hacs.json (the harness for a new release can lag it by a day).
 # - beta: the newest build overall. Skipped when it is not a pre-release.
 #
-# A scheduled failure opens, or comments on, one tracking issue.
+# A scheduled failure opens, or comments on, one tracking issue, labelled
+# compat.
 
 on:
   schedule:
@@ -117,5 +118,10 @@ jobs:
           if [[ -n "$number" ]]; then
             gh issue comment "$number" --body "$body"
           else
-            gh issue create --title "$title" --body "$body"
+            # Fails harmlessly when the label already exists. issues: write
+            # is enough to create a label.
+            gh label create compat --color e99695 \
+              --description "Weekly HA compatibility check failed (opened by compat.yml)" \
+              || true
+            gh issue create --title "$title" --body "$body" --label compat
           fi
