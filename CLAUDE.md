@@ -37,6 +37,7 @@ uv run python scripts/check_versions.py vX.Y.Z  # manifest = pyproject = tag, CH
 
 - Use the global uv cache (`~/.cache/uv`); never create `.uv-cache/` in the repo. If `.venv` is broken, delete it and run `uv sync --locked --all-groups`.
 - `pytest-homeassistant-custom-component` is pinned exactly and pins Home Assistant itself, so bump that one pin to move the Home Assistant version under test. Do not add a separate `homeassistant` pin.
+- The harness also pins `pytest`, `pytest-asyncio`, `pytest-cov` and `syrupy` exactly, so Dependabot ignores them (an update to one alone cannot resolve and fails the whole grouped update); they move with the harness. `test_dependabot_leaves_the_harness_pins_to_the_harness` keeps the ignore list in step with the installed harness.
 - `.github/workflows/compat.yml` runs weekly against the newest harness (stable and beta) unpinned and opens an issue when it fails. GitHub disables scheduled workflows in a public repository after 60 days without activity; check with `gh run list --workflow compat.yml` and re-enable with `gh workflow enable compat.yml` (and `validate.yml`).
 - Tests that touch statistics must also pass on the real recorder (`recorder_mock`); see `tests/test_statistics_recorder.py`.
 - Snapshot tests (syrupy) cover entity states and diagnostics: `tests/snapshots/`. After an intended change, run `uv run pytest --snapshot-update`, then review the `.ambr` diff before committing it.

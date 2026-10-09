@@ -2,10 +2,13 @@
 
 import re
 import tomllib
+from importlib.metadata import requires
 from pathlib import Path
 
 import pytest
 import yaml
+from packaging.requirements import Requirement
+from packaging.utils import canonicalize_name
 
 from scripts import check_versions
 
@@ -56,6 +59,39 @@ def test_dependency_updates_keep_the_lock_file_authoritative() -> None:
 
     project = tomllib.loads(Path("pyproject.toml").read_text())
     assert "<" not in project["tool"]["uv"]["required-version"]
+
+
+def test_dependabot_leaves_the_harness_pins_to_the_harness() -> None:
+    """Dependabot must not bump a dev dependency the test harness pins exactly.
+
+    On its own, such an update cannot resolve, and it fails the whole grouped
+    uv update (pytest did, against the harness's ``pytest==9.0.3``). Those
+    packages move when the harness pin is bumped instead.
+    """
+    project = tomllib.loads(Path("pyproject.toml").read_text())
+    direct = {
+        canonicalize_name(Requirement(requirement).name)
+        for requirement in project["dependency-groups"]["dev"]
+    }
+    harness_pins = {
+        canonicalize_name(requirement.name)
+        for requirement in map(
+            Requirement, requires("pytest-homeassistant-custom-component") or []
+        )
+        if any(spec.operator == "==" for spec in requirement.specifier)
+    }
+    config = yaml.safe_load(Path(".github/dependabot.yml").read_text())
+    uv_updates = next(
+        update for update in config["updates"] if update["package-ecosystem"] == "uv"
+    )
+    ignored = {
+        canonicalize_name(item["dependency-name"])
+        for item in uv_updates.get("ignore", [])
+    }
+
+    assert direct & harness_pins <= ignored
+    # Every ignored name is a direct dev dependency, so a typo cannot hide.
+    assert ignored <= direct
 
 
 def test_workflow_actions_are_pinned_to_commit_shas() -> None:
