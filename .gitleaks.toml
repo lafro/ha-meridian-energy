@@ -1,0 +1,12 @@
+# Secret scan settings for the content-checks workflow. Run the same scans
+# locally with `gitleaks git -c .gitleaks.toml .` and
+# `gitleaks dir -c .gitleaks.toml .`.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "The Meridian web app's public Firebase client key (see SECURITY.md)"
+targetRules = ["gcp-api-key", "generic-api-key"]
+condition = "AND"
+paths = ['''^custom_components/meridian_energy/const\.py$''']
+regexes = ['''^AIzaSyCYCKXQhGmo7haJxAAyO_7mIPrV7jtxsK8$''']

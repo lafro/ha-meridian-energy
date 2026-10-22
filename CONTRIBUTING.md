@@ -33,7 +33,7 @@ Run Hassfest and HACS validation through the GitHub Actions workflow before rele
 - Update the README for user-visible changes.
 - Snapshot tests (`tests/snapshots/`) cover entity states and diagnostics. After an intended change, run `uv run pytest --snapshot-update` and review the `.ambr` diff.
 
-Pull requests must pass Python, Hassfest, HACS, dependency-review and CodeQL checks. The repository uses squash merges and automatically deletes merged branches.
+Pull requests must pass the Python, Hassfest, HACS, dependency-review and CodeQL checks, and the content checks: a secret scan, and a check against a private list of terms that must never be published (pull requests from forks and Dependabot skip it, because they get no repository secrets). The repository uses squash merges and automatically deletes merged branches.
 
 Developer notes are in [`docs/`](docs/README.md).
 
@@ -43,5 +43,5 @@ Developer notes are in [`docs/`](docs/README.md).
 2. Run the full local commands above and review the branch-coverage report.
 3. Merge only through a protected pull request with all conversations resolved.
 4. Run the protected **Release** workflow from `main`; do not create or move release tags manually.
-5. Install the published release through HACS and complete the documented canary on that exact release.
-6. If the canary finds a material defect, fix it through a new protected pull request and publish a new patch version; never replace an existing release in place.
+5. Install the published release through HACS on a Home Assistant instance and confirm that it loads and completes a sync.
+6. If that finds a material defect, fix it through a new pull request and publish a new patch version; never replace an existing release in place.

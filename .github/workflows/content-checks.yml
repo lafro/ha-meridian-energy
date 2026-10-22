@@ -1,0 +1,134 @@
+name: Content checks
+
+on:
+  pull_request:
+    # edited: re-check when a pull request's title or description changes.
+    types: [opened, synchronize, reopened, edited]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "41 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secrets:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl -sSfL -o "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  ${archive}" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
+      - name: Scan the history and the tree
+        run: |
+          "$RUNNER_TEMP/gitleaks" git --no-banner --redact -c .gitleaks.toml .
+          "$RUNNER_TEMP/gitleaks" dir --no-banner --redact -c .gitleaks.toml .
+
+  # Fails when a term from the maintainer's private list (the PRIVATE_TERMS
+  # repository secret, one term per line) appears in the tree, a file name, a
+  # pull request's title, description, commit messages or commit authors, or
+  # the checked-out commit. The log is public, so it names only where a term
+  # appears, never the term. Terms match as whole words (grep -w), so a term
+  # that starts or ends with punctuation only matches next to a non-word
+  # character.
+  private-terms:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Check for private terms
+        env:
+          PRIVATE_TERMS: ${{ secrets.PRIVATE_TERMS }}
+          OWN_RUN: ${{ github.event_name != 'pull_request' || (github.event.pull_request.head.repo.full_name == github.repository && github.actor != 'dependabot[bot]') }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ -z "${PRIVATE_TERMS}" ]; then
+            if [ "${OWN_RUN}" = "true" ]; then
+              echo "::error::The PRIVATE_TERMS repository secret is missing or empty."
+              exit 1
+            fi
+            echo "::notice::Skipped: repository secrets are not available to pull requests from forks or Dependabot."
+            exit 0
+          fi
+          terms="$RUNNER_TEMP/private-terms"
+          printf '%s\n' "${PRIVATE_TERMS}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' > "$terms"
+          found=0
+          scratch="$RUNNER_TEMP/private-terms-input"
+          # Is a term in file $1? grep exits 1 for no match and 2 for an error;
+          # an error fails the job. Called only in the main shell, so its exit
+          # ends the job.
+          has_term() {
+            rc=0
+            grep -q -i -w -F -f "$terms" -- "$1" || rc=$?
+            if [ "$rc" -gt 1 ]; then
+              echo "::error::The term check could not run."
+              exit 1
+            fi
+            return "$rc"
+          }
+
+          rc=0
+          git -c core.quotePath=false grep -I -l -z -i -w -F -f "$terms" > "$RUNNER_TEMP/hits" || rc=$?
+          if [ "$rc" -gt 1 ]; then
+            echo "::error::The tree scan could not run."
+            exit 1
+          fi
+          while IFS= read -r -d '' path; do
+            printf '%s\n' "$path" > "$scratch"
+            if has_term "$scratch"; then
+              echo "::error::Private term in a file whose name also contains one."
+            else
+              lines=$(grep -n -i -w -F -f "$terms" -- "$path" | cut -d: -f1 | paste -sd, -) || lines="?"
+              echo "::error::Private term in ${path}, line ${lines}"
+            fi
+            found=1
+          done < "$RUNNER_TEMP/hits"
+          git -c core.quotePath=false ls-files > "$scratch"
+          if has_term "$scratch"; then
+            echo "::error::Private term in a file name."
+            found=1
+          fi
+          git log -1 --format='%an%n%ae%n%cn%n%ce%n%B' HEAD > "$scratch"
+          if has_term "$scratch"; then
+            echo "::error::Private term in the message or author of the checked-out commit."
+            found=1
+          fi
+          if [ -n "${HEAD_SHA}" ]; then
+            printf '%s\n%s\n' "${PR_TITLE}" "${PR_BODY}" > "$scratch"
+            if has_term "$scratch"; then
+              echo "::error::Private term in the pull request's title or description."
+              found=1
+            fi
+            commits=$(git rev-list "${BASE_SHA}..${HEAD_SHA}")
+            for commit in $commits; do
+              git log -1 --format='%an%n%ae%n%cn%n%ce%n%B' "$commit" > "$scratch"
+              if has_term "$scratch"; then
+                echo "::error::Private term in the message or author of commit ${commit}."
+                found=1
+              fi
+            done
+          fi
+          exit "$found"

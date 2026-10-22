@@ -8,4 +8,3 @@ __pycache__/
 *.py[cod]
 coverage.xml
 htmlcov/
-.claude/settings.local.json
