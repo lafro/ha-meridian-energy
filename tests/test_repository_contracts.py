@@ -36,6 +36,7 @@ def test_release_validators_use_isolated_workspaces() -> None:
 
     assert {"python", "hassfest", "hacs", "release"} <= jobs.keys()
     assert jobs["release"]["needs"] == ["python", "hassfest", "hacs"]
+    assert jobs["release"]["environment"] == "release"
     for job_name in ("hassfest", "hacs"):
         uses = [
             step.get("uses", "")
