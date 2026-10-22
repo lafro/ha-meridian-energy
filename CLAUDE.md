@@ -4,24 +4,9 @@ Public HACS custom integration (`custom_components/meridian_energy`, domain `mer
 
 ## Rules
 
-- **Synthetic data only.** Fixtures, tests, docs, commits, PR text and logs never contain real emails, account numbers, ICPs, meter IDs, addresses, tokens, usage or cost, nor details of the maintainer's own installation. Use values such as `A-TEST-1`, `synthetic-account`, `person@example.com`.
-- **Secret scan before every push**: `gitleaks git --log-opts="origin/main..HEAD"` and `gitleaks dir .` (or a grep for the same patterns if gitleaks is missing). The one expected finding is `FIREBASE_API_KEY` in `const.py`, the Meridian web app's public client key (see SECURITY.md); anything else blocks the push.
-- **No Home Assistant access from this repo.** Sessions here never call Home Assistant tools. Live checks, HACS downloads and restarts happen in sessions on the maintainer's private home-configuration repository.
-- **GitHub only.** Use no connector other than GitHub from this repo (no issue trackers, email, chat, calendars, website or marketing tools).
-- **Never delete** tags, releases or the repository, and never force-push. Tags and releases are immutable by ruleset; only the maintainer deletes anything.
-- **The maintainer merges and releases.** In practice that is one of the maintainer's own interactive sessions outside this repository, once CI passes and an independent review of the latest commit says merge; it is never a session in this repository. Here: open a pull request, wait for CI (`gh pr checks --watch`), and stop. Never create or push tags, publish releases or dispatch the Release workflow.
-
-## How the rules are enforced
-
-`.claude/settings.json` has three layers; none of them is relied on alone.
-
-1. **PreToolUse hooks** (the main layer):
-   - any tool whose name matches `mcp__.*__ha_.*` is refused with exit 2, whatever the connector's server name;
-   - every Bash call goes through `.claude/hooks/guard.sh` → `guard.py`, which blocks pushes to `main`, tag pushes and tag writes, force pushes and remote-ref deletion, merges, release writes and Release workflow dispatches, including `gh api`/curl spellings and `git -C`, `sh -c`, `$(...)` forms. The cases are in `tests/test_agent_guard.py`; extend them with every rule change.
-2. **Deny rules** for the same commands as written, and for the Home Assistant connector by its cloud tool prefix (`mcp__claude_ai_Home_Assistant`). Deny rules match a tool or command only as spelled, and connector tool prefixes differ by surface: in a desktop session the same connector's tools carry a per-installation ID prefix, which the cloud prefix does not match. Keep such IDs out of this public repo; a per-machine deny belongs in the gitignored `.claude/settings.local.json` or in user settings.
-3. **`deniedMcpServers`** by connector display name. Whether repository-scope entries reach a session's connectors has not been verified.
-
-The hooks match on tool names, so they work on any surface, but the guard has only been tested by feeding it events (`tests/test_agent_guard.py`), not yet in a live session. Treat this file's rules as binding either way.
+- **Synthetic data only.** Fixtures, tests, docs, commits, PR text and logs never contain real emails, account numbers, ICPs, meter IDs, addresses, tokens, usage or cost from any real installation. Use values such as `A-TEST-1`, `synthetic-account`, `person@example.com`.
+- **No secrets.** CI runs a secret scan on every pull request; you can run the same locally with `gitleaks git --log-opts="origin/main..HEAD"` and `gitleaks dir .`. The one expected finding is `FIREBASE_API_KEY` in `const.py`, the Meridian web app's public client key (see SECURITY.md).
+- **Pull requests only.** Never push to `main`, force-push, or create, move or delete tags or releases. Tags and releases are immutable by ruleset and come only from the Release workflow, which the maintainer runs.
 
 ## Development
 
@@ -43,7 +28,6 @@ uv run python scripts/check_versions.py vX.Y.Z  # manifest = pyproject = tag, CH
 - Tests that touch statistics must also pass on the real recorder (`recorder_mock`); see `tests/test_statistics_recorder.py`.
 - Snapshot tests (syrupy) cover entity states and diagnostics: `tests/snapshots/`. After an intended change, run `uv run pytest --snapshot-update`, then review the `.ambr` diff before committing it.
 - Every behaviour change needs a test; keep `strings.json` and `translations/en.json` identical.
-- `.claude/hooks/guard.py` must stay runnable on Python 3.9 with the standard library only (ruff checks it with a py39 target; a test parses it with the 3.9 grammar).
 
 ## Design notes
 
@@ -58,8 +42,8 @@ Fuller, public notes are in [`docs/`](docs/README.md).
 
 ## Branches, pull requests and releases
 
-- Branches: `<type>/<slug>` (`fix/`, `feat/`, `chore/`, `docs/`, `release/`). `main` is squash-only with required checks `python`, `hassfest`, `hacs`, `dependency-review` and `Analyze Python`.
+- Branches: `<type>/<slug>` (`fix/`, `feat/`, `chore/`, `docs/`, `release/`). `main` is squash-only with required checks `python`, `hassfest`, `hacs`, `dependency-review`, `Analyze Python`, `secrets` and `private-terms`.
 - A shippable change bumps `version` in `manifest.json` and `pyproject.toml` together and adds a `## X.Y.Z` section to `CHANGELOG.md`; `check_versions.py` fails without it. HACS only offers an update when the version string changes, so never cut a release for CI-only changes.
-- Release (maintainer only): after the PR is merged, run the **Release** workflow from `main` with tag `vX.Y.Z` (GitHub Mobile can dispatch it). The workflow re-runs the gates, creates the immutable tag and publishes the release with that version's CHANGELOG section as its notes. Never create or move tags by hand.
-- Deploy: the GitHub release, then a HACS download of that version and a Home Assistant restart, done from the home-configuration repository's sessions. Never copy files into `/config/custom_components` by hand.
+- Release (maintainer only): after the PR is merged, run the **Release** workflow from `main` with tag `vX.Y.Z`. The workflow re-runs the gates, creates the immutable tag and publishes the release with that version's CHANGELOG section as its notes. Never create or move tags by hand.
+- Users install a GitHub release through HACS. Never copy files into `/config/custom_components` by hand.
 - A defect found after release is fixed forward with a new patch version; existing releases are never replaced.
