@@ -5,7 +5,7 @@ Public HACS custom integration (`custom_components/meridian_energy`, domain `mer
 ## Rules
 
 - **Synthetic data only.** Fixtures, tests, docs, commits, PR text and logs never contain real emails, account numbers, ICPs, meter IDs, addresses, tokens, usage or cost from any real installation. Use values such as `A-TEST-1`, `synthetic-account`, `person@example.com`.
-- **No secrets.** CI runs a secret scan on every pull request; you can run the same locally with `gitleaks git --log-opts="origin/main..HEAD"` and `gitleaks dir .`. The one expected finding is `FIREBASE_API_KEY` in `const.py`, the Meridian web app's public client key (see SECURITY.md).
+- **No secrets.** CI runs a secret scan on every pull request; run the same locally with `gitleaks git -c .gitleaks.toml .` and `gitleaks dir -c .gitleaks.toml .`. `.gitleaks.toml` allows `FIREBASE_API_KEY` in `const.py`, the Meridian web app's public client key (see SECURITY.md); anything else blocks the pull request.
 - **Pull requests only.** Never push to `main`, force-push, or create, move or delete tags or releases. Tags and releases are immutable by ruleset and come only from the Release workflow, which the maintainer runs.
 
 ## Development

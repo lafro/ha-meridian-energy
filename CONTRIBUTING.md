@@ -33,7 +33,7 @@ Run Hassfest and HACS validation through the GitHub Actions workflow before rele
 - Update the README for user-visible changes.
 - Snapshot tests (`tests/snapshots/`) cover entity states and diagnostics. After an intended change, run `uv run pytest --snapshot-update` and review the `.ambr` diff.
 
-Pull requests must pass the Python, Hassfest, HACS, dependency-review and CodeQL checks, and the content checks: a secret scan, and a check against a private list of terms that must never be published (it is skipped for pull requests from forks). The repository uses squash merges and automatically deletes merged branches.
+Pull requests must pass the Python, Hassfest, HACS, dependency-review and CodeQL checks, and the content checks: a secret scan, and a check against a private list of terms that must never be published (pull requests from forks and Dependabot skip it, because they get no repository secrets). The repository uses squash merges and automatically deletes merged branches.
 
 Developer notes are in [`docs/`](docs/README.md).
 

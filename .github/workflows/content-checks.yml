@@ -42,9 +42,12 @@ jobs:
           "$RUNNER_TEMP/gitleaks" dir --no-banner --redact -c .gitleaks.toml .
 
   # Fails when a term from the maintainer's private list (the PRIVATE_TERMS
-  # repository secret, one term per line) appears in the tree, a file name, or
-  # a pull request's title, description, commit messages or commit authors.
-  # The log is public, so it names only where a term appears, never the term.
+  # repository secret, one term per line) appears in the tree, a file name, a
+  # pull request's title, description, commit messages or commit authors, or
+  # the checked-out commit. The log is public, so it names only where a term
+  # appears, never the term. Terms match as whole words (grep -w), so a term
+  # that starts or ends with punctuation only matches next to a non-word
+  # character.
   private-terms:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -71,17 +74,44 @@ jobs:
             exit 0
           fi
           terms="$RUNNER_TEMP/private-terms"
-          printf '%s\n' "${PRIVATE_TERMS}" | sed -e 's/[[:space:]]*$//' -e '/^$/d' > "$terms"
+          printf '%s\n' "${PRIVATE_TERMS}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' > "$terms"
           found=0
-          has_term() { grep -q -i -w -F -f "$terms"; }
+          # grep exits 1 for no match and 2 for an error; an error fails the job.
+          has_term() {
+            rc=0
+            grep -q -i -w -F -f "$terms" || rc=$?
+            if [ "$rc" -gt 1 ]; then
+              echo "::error::The term check could not run."
+              exit 1
+            fi
+            return "$rc"
+          }
 
-          hits=$(git ls-files -z | xargs -0 grep -I -n -i -w -F -f "$terms" -- | cut -d: -f1,2 | sort -u || true)
-          if [ -n "$hits" ]; then
-            printf '%s\n' "$hits" | sed 's/^/::error::Private term in /'
+          rc=0
+          matches=$(git grep -I -n -i -w -F -f "$terms") || rc=$?
+          if [ "$rc" -gt 1 ]; then
+            echo "::error::The tree scan could not run."
+            exit 1
+          fi
+          if [ -n "$matches" ]; then
+            hits=$(printf '%s\n' "$matches" | cut -d: -f1,2 | sort -u)
+            while IFS= read -r hit; do
+              if printf '%s\n' "${hit%:*}" | has_term; then
+                echo "::error::Private term in a file whose name also contains one."
+              else
+                echo "::error::Private term in ${hit}"
+              fi
+            done <<EOF
+          $hits
+          EOF
             found=1
           fi
           if git ls-files | has_term; then
             echo "::error::Private term in a file name."
+            found=1
+          fi
+          if git log -1 --format='%an%n%ae%n%cn%n%ce%n%B' HEAD | has_term; then
+            echo "::error::Private term in the message or author of the checked-out commit."
             found=1
           fi
           if [ -n "${HEAD_SHA}" ]; then
@@ -89,7 +119,8 @@ jobs:
               echo "::error::Private term in the pull request's title or description."
               found=1
             fi
-            for commit in $(git rev-list "${BASE_SHA}..${HEAD_SHA}"); do
+            commits=$(git rev-list "${BASE_SHA}..${HEAD_SHA}")
+            for commit in $commits; do
               if git log -1 --format='%an%n%ae%n%cn%n%ce%n%B' "$commit" | has_term; then
                 echo "::error::Private term in the message or author of commit ${commit}."
                 found=1
