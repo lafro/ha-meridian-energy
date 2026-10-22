@@ -76,10 +76,13 @@ jobs:
           terms="$RUNNER_TEMP/private-terms"
           printf '%s\n' "${PRIVATE_TERMS}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d' > "$terms"
           found=0
-          # grep exits 1 for no match and 2 for an error; an error fails the job.
+          scratch="$RUNNER_TEMP/private-terms-input"
+          # Is a term in file $1? grep exits 1 for no match and 2 for an error;
+          # an error fails the job. Called only in the main shell, so its exit
+          # ends the job.
           has_term() {
             rc=0
-            grep -q -i -w -F -f "$terms" || rc=$?
+            grep -q -i -w -F -f "$terms" -- "$1" || rc=$?
             if [ "$rc" -gt 1 ]; then
               echo "::error::The term check could not run."
               exit 1
@@ -88,40 +91,41 @@ jobs:
           }
 
           rc=0
-          matches=$(git grep -I -n -i -w -F -f "$terms") || rc=$?
+          git -c core.quotePath=false grep -I -l -z -i -w -F -f "$terms" > "$RUNNER_TEMP/hits" || rc=$?
           if [ "$rc" -gt 1 ]; then
             echo "::error::The tree scan could not run."
             exit 1
           fi
-          if [ -n "$matches" ]; then
-            hits=$(printf '%s\n' "$matches" | cut -d: -f1,2 | sort -u)
-            while IFS= read -r hit; do
-              if printf '%s\n' "${hit%:*}" | has_term; then
-                echo "::error::Private term in a file whose name also contains one."
-              else
-                echo "::error::Private term in ${hit}"
-              fi
-            done <<EOF
-          $hits
-          EOF
+          while IFS= read -r -d '' path; do
+            printf '%s\n' "$path" > "$scratch"
+            if has_term "$scratch"; then
+              echo "::error::Private term in a file whose name also contains one."
+            else
+              lines=$(grep -n -i -w -F -f "$terms" -- "$path" | cut -d: -f1 | paste -sd, -) || lines="?"
+              echo "::error::Private term in ${path}, line ${lines}"
+            fi
             found=1
-          fi
-          if git ls-files | has_term; then
+          done < "$RUNNER_TEMP/hits"
+          git -c core.quotePath=false ls-files > "$scratch"
+          if has_term "$scratch"; then
             echo "::error::Private term in a file name."
             found=1
           fi
-          if git log -1 --format='%an%n%ae%n%cn%n%ce%n%B' HEAD | has_term; then
+          git log -1 --format='%an%n%ae%n%cn%n%ce%n%B' HEAD > "$scratch"
+          if has_term "$scratch"; then
             echo "::error::Private term in the message or author of the checked-out commit."
             found=1
           fi
           if [ -n "${HEAD_SHA}" ]; then
-            if printf '%s\n%s\n' "${PR_TITLE}" "${PR_BODY}" | has_term; then
+            printf '%s\n%s\n' "${PR_TITLE}" "${PR_BODY}" > "$scratch"
+            if has_term "$scratch"; then
               echo "::error::Private term in the pull request's title or description."
               found=1
             fi
             commits=$(git rev-list "${BASE_SHA}..${HEAD_SHA}")
             for commit in $commits; do
-              if git log -1 --format='%an%n%ae%n%cn%n%ce%n%B' "$commit" | has_term; then
+              git log -1 --format='%an%n%ae%n%cn%n%ce%n%B' "$commit" > "$scratch"
+              if has_term "$scratch"; then
                 echo "::error::Private term in the message or author of commit ${commit}."
                 found=1
               fi
