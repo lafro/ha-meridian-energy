@@ -21,7 +21,10 @@ from unittest.mock import AsyncMock
 import pytest
 from homeassistant.helpers.update_coordinator import UpdateFailed
 
-from custom_components.meridian_energy.api import MeridianGraphQLError
+from custom_components.meridian_energy.api import (
+    MeridianGraphQLError,
+    MeridianUpstreamError,
+)
 from custom_components.meridian_energy.const import (
     FIRST_SYNC_RETRY_SCHEDULE,
     POLL_BUDGET_SECONDS,
@@ -1101,6 +1104,56 @@ async def test_a_failed_setup_names_the_request_of_the_failure_it_raises(
     assert (call.property_index, call.direction) == (1, "CONSUMPTION")
     assert (call.window, call.window_count) == (1, 13)
     assert call.finished_at is None
+
+
+@pytest.mark.parametrize("degraded", ["CONSUMPTION", "GENERATION"])
+@pytest.mark.parametrize("cause", ["older_week", "time_budget"])
+@pytest.mark.asyncio
+async def test_a_failed_setup_raises_the_failure_that_kept_it_from_finishing(
+    hass, degraded: str, cause: str
+) -> None:
+    """
+    Setup fails with the failure of the direction that missed its newest week.
+
+    One direction imports its newest week, then stops at an older week with
+    unusable data, or once the time budget runs out at 40 s a request: it is
+    degraded, which does not keep setup from finishing. The other fails at
+    its newest week with Meridian's service error, and that is the failure
+    setup raises and the request it names, in either order of the two, so
+    that the form offers to continue without history.
+    """
+    blocking = "GENERATION" if degraded == "CONSUMPTION" else "CONSUMPTION"
+    clock = _Clock()
+    service = _service(clock)
+    if cause == "time_budget":
+        service.latency = 40.0
+
+    def fail(request: _Request) -> BaseException | None:
+        if request.direction == blocking:
+            return _unavailable()
+        if cause == "older_week" and request.end_on < TODAY:
+            return MeridianGraphQLError("measurements", ("UNKNOWN",))
+        return None
+
+    service.fail = fail
+    coordinator = MeridianDataCoordinator(
+        hass, _client(service, _account(feed_in=True))
+    )
+
+    with _running(clock), pytest.raises(UpdateFailed) as raised:
+        await coordinator.async_fetch_and_import(
+            setup_import=True, time_budget=SETUP_IMPORT_BUDGET_SECONDS
+        )
+
+    assert {unit.cache_key[1]: unit.outcome for unit in coordinator._run_units} == {
+        degraded: "degraded",
+        blocking: "failed",
+    }
+    assert raised.value.translation_key == "upstream_unavailable"
+    assert isinstance(raised.value.__cause__, MeridianUpstreamError)
+    call = coordinator.last_request
+    assert call is not None
+    assert (call.direction, call.window, call.window_count) == (blocking, 1, 13)
 
 
 @pytest.mark.asyncio

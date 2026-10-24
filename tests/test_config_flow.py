@@ -5984,6 +5984,67 @@ async def test_a_gateway_timeout_that_cost_setup_its_time_names_its_own_cause(
     assert "cause=MeridianUpstreamError root=TimeoutError" in record.getMessage()
 
 
+@pytest.mark.parametrize("cause", ["older_week", "time_budget"])
+@pytest.mark.asyncio
+async def test_a_degraded_direction_does_not_hide_the_failure_that_blocked_setup(
+    hass: HomeAssistant,
+    meridian: _FakeMeridian,
+    clock: _Clock,
+    caplog: pytest.LogCaptureFixture,
+    cause: str,
+) -> None:
+    """
+    The form shows the failure of the direction that missed its newest week.
+
+    Grid import, listed first, imports its newest week, then stops at its
+    second with unusable data, or once 40 s requests have used up the
+    import's 4 minutes: it is degraded. Grid export fails at its newest week
+    with Meridian's service error, which is what kept setup from finishing.
+    The form says so and offers to continue without history, and the
+    warning names grid export's request, not grid import's.
+    """
+    meridian.account = _test_account(feed_in=True)
+
+    def failure(direction: str, _before: str | None) -> BaseException | None:
+        if direction == "GENERATION":
+            clock.now += 1.0
+            error = MeridianUpstreamError(503, gateway=False)
+            error.__cause__ = MeridianHttpError(503, {})
+            return error
+        if cause == "time_budget":
+            clock.now += 40.0
+        elif meridian.calls(direction) > 1:
+            return MeridianGraphQLError("measurements", ("UNKNOWN",))
+        return None
+
+    async def wait(delay: float) -> None:
+        clock.now += delay
+
+    meridian.failure = failure
+    with (
+        patch.object(coordinator_module, "monotonic", side_effect=clock),
+        patch.object(coordinator_module, "_async_wait", side_effect=wait),
+    ):
+        result = await _submit_login(hass)
+        result = await _finish_import(hass, result["flow_id"])
+
+    assert result["step_id"] == "import_failed"
+    assert result["errors"] == {"base": "upstream_unavailable"}
+    assert _schema_fields(result) == ["continue_without_history"]
+    assert result["description_placeholders"]["detail"].startswith(
+        "HTTP 503 while requesting grid export history, window 1 of 13, page 1"
+    )
+    (record,) = _import_failure_records(caplog)
+    message = record.getMessage()
+    for field in (
+        "reason=upstream_unavailable",
+        "status=503",
+        "direction=GENERATION",
+        "window=1/13",
+    ):
+        assert field in message
+
+
 @pytest.mark.asyncio
 async def test_setup_can_go_on_without_history_after_meridian_failed(
     hass: HomeAssistant, meridian: _FakeMeridian, clock: _Clock

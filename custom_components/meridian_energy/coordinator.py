@@ -1040,11 +1040,16 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         readings in its 90 days, as one whose supply ended, imported no
         history: counted, it would create the entry with none while the
         active property failed. Otherwise the first unit's failure fails
-        it, as any failure failed every sync before 0.3.0, and
-        ``last_request`` names that unit's failed request, not a later
-        unit's; or, when every unit waited after an earlier failure, that
-        failure. A refused replay (``StatisticsAnchorError``) fails it only
-        when no unit failed otherwise: no retry clears a refusal, so it
+        it, as any failure failed every sync before 0.3.0, or, when every
+        unit waited after an earlier failure, that failure. In setup it is
+        the failure of the first unit that did not import its newest
+        window, which is what kept setup from succeeding: a unit degraded
+        after its newest window did not, and its failure would hide that
+        one, such as a service error after which the form offers to
+        continue without history. ``last_request`` names the failed request
+        of the unit whose failure is raised, not a later unit's. A refused
+        replay (``StatisticsAnchorError``) fails it only when no unit failed
+        otherwise: no retry clears a refusal, so it
         would hold a failed first sync to the hourly update
         (``async_fetch_and_import``) while another unit's failure, one
         Meridian may soon recover from, is tried again after 10 minutes.
@@ -1079,15 +1084,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                     self._warn_unit_failing(unit, setup_import=True)
             self._unreported.clear()
         if not succeeded:
-            failures = [unit for unit in units if unit.walk is not None and unit.error]
-            failed = next(
-                (
-                    unit
-                    for unit in failures
-                    if not isinstance(unit.error, StatisticsAnchorError)
-                ),
-                next(iter(failures), None),
-            )
+            failed = _failed_unit(units, setup_import=setup_import)
             if failed is not None and failed.error is not None:
                 if failed.walk is not None and failed.walk.call is not None:
                     # Other units' requests may have come after it: the
@@ -4504,6 +4501,29 @@ class _UnitWalk:
         ):
             return _PROBE if _is_gateway(err) else _SPLIT
         return _STOP
+
+
+def _failed_unit(units: list[_Unit], *, setup_import: bool) -> _Unit | None:
+    """
+    Return the unit whose failure a failed sync raises (``_settle_run``).
+
+    The first unit that failed, a refused replay (``StatisticsAnchorError``)
+    only when no other did. In setup, only a unit that did not import its
+    newest window counts, if any failed: one degraded after its newest
+    window did not keep setup from succeeding, and its failure would hide
+    the one that did.
+    """
+    failures = [unit for unit in units if unit.walk is not None and unit.error]
+    if setup_import:
+        failures = [unit for unit in failures if not unit.imported_newest] or failures
+    return next(
+        (
+            unit
+            for unit in failures
+            if not isinstance(unit.error, StatisticsAnchorError)
+        ),
+        next(iter(failures), None),
+    )
 
 
 class _Unit:
