@@ -24,6 +24,7 @@ from custom_components.meridian_energy.coordinator import MeridianDataCoordinato
 from custom_components.meridian_energy.diagnostics import (
     async_get_config_entry_diagnostics,
 )
+from custom_components.meridian_energy.lanes import LaneState
 from custom_components.meridian_energy.models import (
     AccountSyncResult,
     MeridianAccount,
@@ -33,6 +34,7 @@ from custom_components.meridian_energy.models import (
     MeridianSyncData,
     PropertySyncResult,
     SyncMode,
+    WindowWalk,
 )
 from custom_components.meridian_energy.sensor import (
     DESCRIPTIONS,
@@ -42,7 +44,8 @@ from custom_components.meridian_energy.sensor import (
     _remove_stale_entities,
     async_setup_entry,
 )
-from custom_components.meridian_energy.statistics import account_key
+from custom_components.meridian_energy.statistics import account_key, property_key
+from custom_components.meridian_energy.units import UnitFailure, UnitState
 
 ACCOUNT_NUMBER = "synthetic-account"
 ACCOUNT_KEY = account_key(ACCOUNT_NUMBER)
@@ -153,6 +156,9 @@ def _data() -> MeridianSyncData:
                 newest_estimated=reading,
                 quality_counts=(("ACTUAL", 22), ("ESTIMATE", 2)),
                 observed_rows_per_hour=1.0,
+                consumption_walk=WindowWalk(
+                    requested_days=2, windows_requested=1, rows_before_window=3
+                ),
             ),
         ),
         account_results=(
@@ -582,14 +588,59 @@ async def test_diagnostics_exclude_all_sensitive_fields(hass) -> None:
         "consumption": 1,
         "generation": 0,
     }
-    assert (
-        diagnostics["coordinator"]["property_results"][0]["requested_window_end"]
-        == coordinator.data.synced_at
-    )
+    result = diagnostics["coordinator"]["property_results"][0]
+    # What the windows sent asked for, not a cutoff the client applied.
+    assert "requested_window_start" not in result
+    assert "requested_window_end" not in result
+    assert result["requested_days"] == {"consumption": 2, "generation": 0}
+    assert result["windows_requested"] == {"consumption": 1, "generation": 0}
+    assert result["continuation_pages"] == {"consumption": 0, "generation": 0}
+    assert result["rows_before_window"] == {"consumption": 3, "generation": 0}
+    assert result["stopped_at_gap"] == {"consumption": False, "generation": False}
     assert "private@example.com" not in serialized
     assert "private-refresh" not in serialized
     assert "private-user" not in serialized
     assert "hashed-key" not in serialized
+
+
+def _units(hass) -> MeridianDataCoordinator:
+    """
+    Return a coordinator whose grid export failed 30 minutes ago.
+
+    Its grid import is degraded: it imported its newer weeks and owes the
+    weekly reconciliation, an hour after it degraded; the last two updates
+    ran out of time before they reached it. Its history reaches back to its
+    target, and Meridian showed where it starts. A first sync has
+    succeeded, so the units wait as their states say.
+    """
+    solar_meter = replace(_account().properties[0].meter_points[0], has_feed_in=True)
+    account = replace(
+        _account(),
+        properties=(replace(_account().properties[0], meter_points=(solar_meter,)),),
+    )
+    units = MeridianDataCoordinator(hass, MagicMock())
+    units._topology = (account,)
+    units._initial_refresh_complete = True
+    key = property_key(account.number, account.properties[0].id)
+    at = datetime(2026, 7, 15, 0, 30, tzinfo=UTC)
+    failure = UnitFailure(
+        reason="upstream_timeout",
+        cause="MeridianUpstreamError",
+        http_status=504,
+        at=at,
+        detail="HTTP 504",
+    )
+    units._unit_states[(key, "CONSUMPTION")] = UnitState()
+    units._unit_states[(key, "CONSUMPTION")].degrade(
+        at, failure, SyncMode.FULL_RECONCILIATION
+    )
+    units._unit_states[(key, "CONSUMPTION")].not_reached = 2
+    units._lanes[(key, "CONSUMPTION")] = LaneState(
+        reaches_target=True, history_start_found=True
+    )
+    units._unit_states[(key, "GENERATION")] = UnitState()
+    units._unit_states[(key, "GENERATION")].fail(at, failure, SyncMode.TIP)
+    return units
 
 
 @pytest.mark.asyncio
@@ -602,9 +653,19 @@ async def test_diagnostics_snapshot(hass, snapshot, freezer) -> None:
     coordinator.last_exception = UpdateFailed("safe")
     coordinator.billing_metadata_unavailable_count = 1
     coordinator.billing_metadata_cache_age_seconds = 3600.125
+    coordinator.unit_diagnostics = _units(hass).unit_diagnostics
     entry = _entry(coordinator)
 
-    assert await async_get_config_entry_diagnostics(hass, entry) == snapshot
+    diagnostics = await async_get_config_entry_diagnostics(hass, entry)
+
+    assert diagnostics == snapshot
+    assert [unit["status"] for unit in diagnostics["coordinator"]["units"]] == [
+        "degraded",
+        "failed",
+    ]
+    serialized = str(diagnostics)
+    assert ACCOUNT_NUMBER not in serialized
+    assert "1 Synthetic Street" not in serialized
 
 
 @pytest.mark.asyncio
@@ -642,14 +703,43 @@ async def test_entities_before_first_sync_come_from_topology(hass) -> None:
     await entry._async_process_on_unload(hass)
 
 
+@pytest.mark.parametrize("failed", [False, True])
 @pytest.mark.asyncio
-async def test_diagnostics_before_first_sync(hass) -> None:
+async def test_diagnostics_before_first_sync(hass, freezer, failed: bool) -> None:
+    """
+    Before a first sync has succeeded, no unit waits a time of its own.
+
+    Every attempt until then tries each unit, so one that failed in the
+    setup import or in a failed first attempt shows no wait; its state's
+    hour would be the wait only once a first sync had succeeded.
+    """
+    freezer.move_to("2026-07-15T01:00:00+00:00")
     coordinator = MagicMock()
     coordinator.data = None
     coordinator.accounts = (_account(),)
     coordinator.last_update_success = True
     coordinator.last_exception = None
     coordinator.billing_metadata_cache_age_seconds = None
+    units = MeridianDataCoordinator(hass, MagicMock())
+    units._topology = (_account(),)
+    failure = None
+    if failed:
+        at = datetime(2026, 7, 15, 0, 50, tzinfo=UTC)
+        state = UnitState()
+        state.fail(
+            at,
+            UnitFailure("upstream_timeout", "MeridianUpstreamError", 504, at),
+            SyncMode.INITIAL,
+        )
+        key = property_key(_account().number, _account().properties[0].id)
+        units._unit_states[(key, "CONSUMPTION")] = state
+        failure = {
+            "reason": "upstream_timeout",
+            "cause": "MeridianUpstreamError",
+            "http_status": 504,
+            "age_s": 600,
+        }
+    coordinator.unit_diagnostics = units.unit_diagnostics
     entry = _entry(coordinator)
 
     diagnostics = await async_get_config_entry_diagnostics(hass, entry)
@@ -659,6 +749,23 @@ async def test_diagnostics_before_first_sync(hass) -> None:
         "last_exception_type": None,
         "first_sync_pending": True,
         "account_count": 1,
+        "units": [
+            {
+                "account": "1/1",
+                "property": "1/1",
+                "direction": "consumption",
+                "status": "failed" if failed else "pending",
+                "degraded": False,
+                "owed_reconciliation": (
+                    SyncMode.FULL_RECONCILIATION if failed else None
+                ),
+                "retry_in_s": None,
+                "not_reached": 0,
+                "reaches_target": False,
+                "history_start_found": False,
+                "last_failure": failure,
+            }
+        ],
     }
     serialized = str(diagnostics)
     assert ACCOUNT_NUMBER not in serialized

@@ -170,7 +170,12 @@ def parse_datetime(value: Any, context: str) -> datetime:
     """Parse a timezone-aware upstream timestamp."""
     if not isinstance(value, str) or not value:
         raise ValueError(f"Missing {context}")
-    parsed = datetime.fromisoformat(value)
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        # The standard message quotes the string, or names its year and month,
+        # and a failed setup import logs the traceback: keep the value out.
+        raise ValueError(f"Invalid timestamp for {context}") from None
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError(f"Naive timestamp for {context}")
     return parsed
@@ -197,5 +202,6 @@ def optional_date(value: Any) -> date | None:
         raise ValueError("Invalid Meridian billing date")
     try:
         return date.fromisoformat(value)
-    except ValueError as err:
-        raise ValueError("Invalid Meridian billing date") from err
+    except ValueError:
+        # Not chained: the standard message would put the date in a traceback.
+        raise ValueError("Invalid Meridian billing date") from None

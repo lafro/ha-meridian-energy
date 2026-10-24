@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import base64
 import json
+import traceback
+from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from functools import partial
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -27,6 +30,7 @@ from custom_components.meridian_energy.api import (
     _parse_measurement,
     _parse_retry_after,
     _required_string,
+    exception_chain,
 )
 from custom_components.meridian_energy.models import (
     MeridianTokenSet,
@@ -42,6 +46,29 @@ def _tokens() -> MeridianTokenSet:
         refresh_token="refresh-token",
         expires_at=datetime.now(UTC) + timedelta(hours=1),
         user_id="user-id",
+    )
+
+
+def test_token_set_repr_hides_credentials() -> None:
+    """A token set that reaches a log line or traceback shows no credentials."""
+    tokens = MeridianTokenSet(
+        id_token="synthetic-id-token-value",
+        refresh_token="synthetic-refresh-token-value",
+        expires_at=datetime(2026, 7, 13, tzinfo=UTC),
+        user_id="synthetic-user-value",
+    )
+
+    text = repr(tokens)
+
+    assert "synthetic-id-token-value" not in text
+    assert "synthetic-refresh-token-value" not in text
+    assert "synthetic-user-value" not in text
+    assert text.startswith("MeridianTokenSet(")
+    assert tokens == MeridianTokenSet(
+        id_token="synthetic-id-token-value",
+        refresh_token="synthetic-refresh-token-value",
+        expires_at=datetime(2026, 7, 13, tzinfo=UTC),
+        user_id="synthetic-user-value",
     )
 
 
@@ -79,12 +106,11 @@ class _FakeResponse:
         payload,
         *,
         status: int = 200,
-        error: Exception | None = None,
+        body: bytes | None = None,
         headers=None,
     ):
-        self.payload = payload
+        self.body = json.dumps(payload).encode() if body is None else body
         self.status = status
-        self.error = error
         self.headers = headers or {}
 
     async def __aenter__(self):
@@ -93,11 +119,8 @@ class _FakeResponse:
     async def __aexit__(self, *_args):
         return None
 
-    async def json(self, *, content_type=None):
-        del content_type
-        if self.error:
-            raise self.error
-        return self.payload
+    async def read(self):
+        return self.body
 
 
 class _FakeSession:
@@ -613,7 +636,13 @@ async def test_get_billing_period_rejects_invalid_metadata(
 
 
 @pytest.mark.asyncio
-async def test_get_measurements_builds_first_and_cursor_queries() -> None:
+async def test_every_measurements_request_has_both_bounds() -> None:
+    """
+    Every page sends the window's dates and size; a continuation adds only before.
+
+    Until 0.3.0 a continuation page dropped ``endOn``, and no page had a start
+    bound, so each request could make Meridian resolve the whole history.
+    """
     node = _measurement_node()
     response = {
         "account": {
@@ -630,28 +659,35 @@ async def test_get_measurements_builds_first_and_cursor_queries() -> None:
     }
     client = MeridianApiClient(MagicMock(), tokens=_tokens())
     client._async_graphql = AsyncMock(return_value=response)
+    window = {
+        "account_number": "A-TEST",
+        "property_id": "property",
+        "direction": "CONSUMPTION",
+        "start_on": date(2026, 7, 7),
+        "end_on": date(2026, 7, 13),
+        "last": 214,
+    }
 
-    first = await client.async_get_measurements(
-        account_number="A-TEST",
-        property_id="property",
-        direction="CONSUMPTION",
-        end_on="2026-07-13",
-    )
-    await client.async_get_measurements(
-        account_number="A-TEST",
-        property_id="property",
-        direction="CONSUMPTION",
-        end_on="ignored",
-        before="cursor",
-    )
+    first = await client.async_get_measurements(**window)
+    await client.async_get_measurements(**window, before="cursor")
 
     assert len(first.measurements[0].channel_id) == 64
     assert "synthetic" not in first.measurements[0].channel_id
     assert first.has_previous_page is True
     assert first.start_cursor == "cursor"
-    assert client._async_graphql.await_args_list[0].args[2]["endOn"] == "2026-07-13"
-    assert client._async_graphql.await_args_list[1].args[2]["before"] == "cursor"
-    assert "endOn" not in client._async_graphql.await_args_list[1].args[2]
+    page_one, continuation = (
+        call.args[2] for call in client._async_graphql.await_args_list
+    )
+    for variables in (page_one, continuation):
+        assert variables["startOn"] == "2026-07-07"
+        assert variables["endOn"] == "2026-07-13"
+        assert variables["last"] == 214
+    assert "before" not in page_one
+    assert continuation == {**page_one, "before": "cursor"}
+    for call in client._async_graphql.await_args_list:
+        assert call.args[0] == "measurements"
+        assert call.kwargs["operation_name"] == "GetMeasurements"
+        assert call.kwargs["url"].endswith("?opName=GetMeasurements")
 
 
 def test_parse_consumption_measurement_filters_cost_types() -> None:
@@ -963,6 +999,49 @@ async def test_graphql_propagates_rate_limit_delay() -> None:
 
 
 @pytest.mark.asyncio
+async def test_kraken_rate_limit_code_is_a_rate_limit_of_an_hour() -> None:
+    """KT-CT-1199 arrives in an HTTP 200 body; it stops the sync like a 429."""
+    client = MeridianApiClient(MagicMock(), tokens=_tokens())
+    client._async_json_request = AsyncMock(
+        return_value={
+            "errors": [
+                {"message": "synthetic", "extensions": {"errorCode": "KT-CT-1199"}}
+            ]
+        }
+    )
+
+    with pytest.raises(MeridianRateLimitError) as raised:
+        await client._async_graphql("measurements", "query", {})
+
+    assert raised.value.retry_after == 3600
+    client._async_json_request.assert_awaited_once()
+
+
+@pytest.mark.parametrize("code", ["KT-CT-1188", "KT-CT-1189"])
+@pytest.mark.asyncio
+async def test_query_limit_codes_stay_graphql_errors_naming_the_code(
+    code: str,
+) -> None:
+    """A query over Kraken's complexity or node limit says so, and is not resent."""
+    client = MeridianApiClient(MagicMock(), tokens=_tokens())
+    client._async_json_request = AsyncMock(
+        return_value={
+            "errors": [{"message": "A-TEST-1", "extensions": {"errorCode": code}}]
+        }
+    )
+
+    with pytest.raises(MeridianGraphQLError) as raised:
+        await client._async_graphql("measurements", "query", {})
+
+    assert raised.value.codes == (code,)
+    assert (
+        str(raised.value) == f"Meridian GraphQL operation measurements failed ({code})"
+    )
+    assert "A-TEST-1" not in str(raised.value)
+    client._async_json_request.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_graphql_auth_code_requires_reauth() -> None:
     client = MeridianApiClient(MagicMock(), tokens=_tokens())
     client.async_refresh_tokens = AsyncMock(return_value=_tokens())
@@ -996,14 +1075,16 @@ async def test_graphql_auth_code_recovers_after_forced_refresh() -> None:
 async def test_json_request_success_and_http_error() -> None:
     client = MeridianApiClient(_FakeSession(_FakeResponse({"ok": True})))
     assert await client._async_json_request(
-        "https://example.test", authenticated=False
+        "https://example.test", operation="test", authenticated=False
     ) == {"ok": True}
 
     client = MeridianApiClient(
         _FakeSession(_FakeResponse({"error": "safe"}, status=500))
     )
     with pytest.raises(_MeridianHttpError):
-        await client._async_json_request("https://example.test", authenticated=False)
+        await client._async_json_request(
+            "https://example.test", operation="test", authenticated=False
+        )
 
 
 @pytest.mark.asyncio
@@ -1013,13 +1094,15 @@ async def test_json_request_preserves_rate_limit_header_on_non_json_error() -> N
             _FakeResponse(
                 None,
                 status=429,
-                error=ValueError(),
+                body=b"<html>Too many requests</html>",
                 headers={"Retry-After": "120"},
             )
         )
     )
     with pytest.raises(_MeridianHttpError) as raised:
-        await client._async_json_request("https://example.test", authenticated=False)
+        await client._async_json_request(
+            "https://example.test", operation="test", authenticated=False
+        )
     assert raised.value.status == 429
     assert raised.value.retry_after == 120
 
@@ -1036,7 +1119,9 @@ async def test_json_request_preserves_rate_limit_header_on_non_object_error() ->
         )
     )
     with pytest.raises(_MeridianHttpError) as raised:
-        await client._async_json_request("https://example.test", authenticated=False)
+        await client._async_json_request(
+            "https://example.test", operation="test", authenticated=False
+        )
 
     assert raised.value.status == 429
     assert raised.value.payload == {}
@@ -1059,19 +1144,25 @@ def test_retry_after_is_parsed_and_clamped(value, expected: float) -> None:
     assert _parse_retry_after(value) == expected
 
 
-@pytest.mark.parametrize("error", [ValueError(), TypeError()])
+@pytest.mark.parametrize(
+    "body", [b"<html>maintenance</html>", b'{"data": ', b"\xff\xfe\xfd"]
+)
 @pytest.mark.asyncio
-async def test_json_request_rejects_unreadable_response(error: Exception) -> None:
-    client = MeridianApiClient(_FakeSession(_FakeResponse(None, error=error)))
+async def test_json_request_rejects_unreadable_response(body: bytes) -> None:
+    client = MeridianApiClient(_FakeSession(_FakeResponse(None, body=body)))
     with pytest.raises(Exception, match="unreadable"):
-        await client._async_json_request("https://example.test", authenticated=False)
+        await client._async_json_request(
+            "https://example.test", operation="test", authenticated=False
+        )
 
 
 @pytest.mark.asyncio
 async def test_json_request_maps_network_error() -> None:
     client = MeridianApiClient(_FakeSession(error=ClientError()))
     with pytest.raises(Exception, match="Unable to reach"):
-        await client._async_json_request("https://example.test", authenticated=False)
+        await client._async_json_request(
+            "https://example.test", operation="test", authenticated=False
+        )
 
 
 @pytest.mark.parametrize(
@@ -1175,6 +1266,34 @@ def test_parse_measurement_defensive_validation() -> None:
     assert _parse_measurement(non_mapping_cost, "CONSUMPTION").cost_cents is None
 
 
+@pytest.mark.parametrize(
+    ("parse", "malformed"),
+    [
+        # Partials, not lambdas: a lambda's frame would show its source line,
+        # and with it the literal, in the formatted traceback.
+        (partial(_parse_datetime, context="measurement start"), "2026-07-16 noon"),
+        (partial(_parse_datetime, context="measurement end"), "2026-02-30T01:00Z"),
+        (optional_date, "2026-07-32"),
+    ],
+)
+def test_malformed_dates_stay_out_of_tracebacks(
+    parse: Callable[[str], object], malformed: str
+) -> None:
+    """
+    A malformed date from Meridian fails parsing without repeating any of it.
+
+    A failed setup import logs its traceback, and the standard library's own
+    messages quote an unparseable string, or name the year and month of an
+    impossible date.
+    """
+    with pytest.raises(ValueError, match="Invalid") as caught:
+        parse(malformed)
+
+    formatted = "".join(traceback.format_exception(caught.value))
+    assert malformed not in formatted
+    assert "2026" not in formatted
+
+
 def test_parsing_helpers_reject_invalid_values() -> None:
     with pytest.raises(ValueError, match="Missing"):
         _parse_datetime(None, "time")
@@ -1201,3 +1320,51 @@ def test_parsing_helpers_reject_invalid_values() -> None:
         require_mapping([], "test")
     with pytest.raises(ValueError, match="list"):
         require_list({}, "test")
+
+
+def _raised(build: Callable[[], None]) -> BaseException:
+    try:
+        build()
+    except Exception as err:  # noqa: BLE001 - the test inspects any error
+        return err
+    raise AssertionError("nothing was raised")
+
+
+def test_exception_chain_follows_what_a_traceback_shows() -> None:
+    """
+    A context the code suppressed is not part of the chain, as in a traceback.
+
+    json raises its decode error ``from None`` over an internal StopIteration,
+    so following every context ended the chain there.
+    """
+
+    def unreadable() -> None:
+        try:
+            json.loads(b"<html>maintenance</html>")
+        except ValueError as err:
+            raise MeridianConnectionError("unreadable") from err
+
+    def replaced() -> None:
+        try:
+            raise ValueError("internal")
+        except ValueError:
+            raise MeridianConnectionError("replaced") from None
+
+    def during_handling() -> None:
+        try:
+            raise ValueError("first")
+        except ValueError:
+            raise MeridianConnectionError("second")  # noqa: B904 - the case tested
+
+    chain = exception_chain(_raised(unreadable))
+    assert [type(item) for item in chain] == [
+        MeridianConnectionError,
+        json.JSONDecodeError,
+    ]
+    assert [type(item) for item in exception_chain(_raised(replaced))] == [
+        MeridianConnectionError
+    ]
+    assert [type(item) for item in exception_chain(_raised(during_handling))] == [
+        MeridianConnectionError,
+        ValueError,
+    ]

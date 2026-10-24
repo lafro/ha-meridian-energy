@@ -74,8 +74,8 @@ rules:
   icon-translations: done
   reconfiguration-flow: done
   repair-issues:
-    status: exempt
-    comment: Authentication failures use reauthentication and transient cloud failures recover through the coordinator.
+    status: todo
+    comment: Authentication failures use reauthentication and transient cloud failures recover through the coordinator. An import refused because older statistics have no running total it could continue (statistics_refused), which needs the user to delete those statistics, is not yet raised as a repair issue; it is reported by one log warning per statistic, in diagnostics and in the setup form.
   stale-devices: done
 
   # Platinum

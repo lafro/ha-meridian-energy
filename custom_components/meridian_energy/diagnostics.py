@@ -8,6 +8,14 @@ from homeassistant.core import HomeAssistant
 
 from . import MeridianConfigEntry
 
+_WALK_FIELDS = (
+    "requested_days",
+    "windows_requested",
+    "continuation_pages",
+    "rows_before_window",
+    "stopped_at_gap",
+)
+
 
 async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: MeridianConfigEntry
@@ -29,12 +37,18 @@ async def async_get_config_entry_diagnostics(
         ),
         "first_sync_pending": data is None,
     }
+    # Each (property, direction)'s status, kept across updates: whether it
+    # is failing or degraded, the reconciliation it still owes, how long it
+    # waits before it is tried again, and its last failure's reason, error
+    # class, HTTP status and age. Places are positions, never identifiers.
+    units = coordinator.unit_diagnostics()
     if data is None:
         return {
             "config_entry": config_entry,
             "coordinator": {
                 **status,
                 "account_count": len(coordinator.accounts),
+                "units": units,
             },
         }
     return {
@@ -56,8 +70,18 @@ async def async_get_config_entry_diagnostics(
             "property_results": [
                 {
                     "sync_mode": result.sync_mode,
-                    "requested_window_start": result.requested_since,
-                    "requested_window_end": data.synced_at,
+                    # What the measurement windows sent asked for, per
+                    # direction: New Zealand dates and windows requested,
+                    # pages after a window's first, rows older than their
+                    # window, and whether the walk stopped at a gap over
+                    # stored rows.
+                    **{
+                        name: {
+                            "consumption": getattr(result.consumption_walk, name),
+                            "generation": getattr(result.generation_walk, name),
+                        }
+                        for name in _WALK_FIELDS
+                    },
                     "api_pages": {
                         "consumption": result.consumption_pages,
                         "generation": result.generation_pages,
@@ -111,5 +135,6 @@ async def async_get_config_entry_diagnostics(
                 for result in data.account_results
             ],
             "synced_at": data.synced_at,
+            "units": units,
         },
     }
