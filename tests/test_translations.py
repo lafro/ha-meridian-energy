@@ -267,9 +267,11 @@ def test_the_setup_time_limit_is_5_minutes_wherever_it_is_stated() -> None:
     the README naming the old limit. Each also says that the time Home
     Assistant takes to save an import is not counted, since setup's limit
     moves on by it (the coordinator's ``_async_uncounted``): the 5 minutes
-    are not the longest setup can take. And each names the import's own 4
-    minutes (``SETUP_IMPORT_BUDGET_SECONDS``), which end it with what it
-    imported, as the 5 minutes, a backstop, do not.
+    are not the longest setup can take. The progress text names the
+    import's own 4 minutes too (``SETUP_IMPORT_BUDGET_SECONDS``), which end
+    it with what it imported, as the 5 minutes, a backstop, do not; an
+    import they end with nothing fails as Meridian not answering in time,
+    not with ``import_timeout``.
     """
     assert SETUP_IMPORT_TIMEOUT_SECONDS == 300
     assert SETUP_IMPORT_BUDGET_SECONDS == 240
@@ -282,8 +284,8 @@ def test_the_setup_time_limit_is_5_minutes_wherever_it_is_stated() -> None:
         config["progress"]["initial_import"],
     ):
         assert uncounted in text
-        assert budget in text
         assert "the longest it waits" not in text
+    assert budget in config["progress"]["initial_import"]
     readme = (_INTEGRATION_DIR.parents[1] / "README.md").read_text()
     assert f"still running {uncounted}" in readme
     assert f"The import has {budget}" in readme

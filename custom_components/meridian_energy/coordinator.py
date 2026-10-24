@@ -1056,12 +1056,11 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         A sync with no units at all, an account without properties say,
         succeeds. A setup import that fails because its time budget ran out
         after its size ladder went on past a gateway timeout fails with
-        that timeout: it is what cost the time, and the failure form then
-        offers to continue without history, as after any timeout of
-        Meridian's. In setup, each unit that started failing logs its one
-        WARNING here, once the import is known to go on, since a setup
-        attempt that fails logs its own; an hourly update has logged it
-        already (``_report_failing``).
+        that timeout: it is what cost the time, so the failure form and its
+        warning describe that timeout rather than the budget. In setup, each
+        unit that started failing logs its one WARNING here, once the import
+        is known to go on, since a setup attempt that fails logs its own; an
+        hourly update has logged it already (``_report_failing``).
         """
         units = self._run_units
         imported = [
@@ -1542,23 +1541,23 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         """
         Fetch every unit's newest window, then walk each on and import it.
 
-        The newest windows go first, those of units the last syncs' time
-        budget did not reach before the others (``UnitState.not_reached``),
-        so no unit waits behind the same others every time. A unit whose
-        property is cooling down after a gateway timeout waits behind the
-        units that can send at once, in both passes, rather than hold up
-        their requests for the cooldown. The walks then go on in the order
-        ``_next_walk`` gives, and before each window a walk lets a unit that
-        comes before it go first (``_comes_first``): so a newest window that
-        waited for a cooldown is fetched once it has passed, before the
-        older windows of its property, and a property with nothing new, as
-        one whose supply ended, goes last.
+        The newest windows go first, in the order ``_next_newest`` gives:
+        those of units the last syncs' time budget did not reach before the
+        others (``UnitState.not_reached``), so no unit waits behind the same
+        others every time, and a property with nothing new, as one whose
+        supply ended, costs the others one request before their newest
+        windows. A unit whose property is cooling down after a gateway
+        timeout waits behind the units that can send at once, in both
+        passes, rather than hold up their requests for the cooldown. The
+        walks then go on in the order ``_next_walk`` gives, and before each
+        window a walk lets a unit that comes before it go first
+        (``_comes_first``): so a newest window that waited for a cooldown is
+        fetched once it has passed, before the older windows of its
+        property, and a property with nothing new goes last.
         """
         walking = [unit for unit in units if unit.walk is not None]
         newest = sorted(walking, key=lambda unit: -unit.state.not_reached)
-        while ready := next(
-            (unit for unit in newest if not self._cooldown_left(unit)), None
-        ):
+        while ready := self._next_newest(walking, newest):
             newest.remove(ready)
             assert ready.walk is not None  # noqa: S101 - only walking units
             await self._async_walk_unit(ready.walk, newest_only=True)
@@ -1572,6 +1571,43 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             if walk.done:
                 walking.remove(unit)
                 await self._async_finish_unit(unit, now)
+
+    def _next_newest(self, walking: list[_Unit], newest: list[_Unit]) -> _Unit | None:
+        """
+        Return the unit whose newest window is fetched next, if one can send.
+
+        Of the units in ``newest`` that can send at once, those the time
+        budget did not reach in the most syncs in a row first
+        (``UnitState.not_reached``); among them, the units of a property
+        whose newest windows returned readings in this sync, then those of a
+        property none of whose newest windows was fetched yet, then the
+        rest, each in the order ``newest`` holds. So a property whose newest
+        window came back empty, as one whose supply ended, lets the other
+        properties' newest windows go before its other direction's. That
+        holds in setup too, where every count is 0, as each attempt builds a
+        new coordinator: there the time budget can allow only a few
+        requests, and a property counts only once all its directions have
+        their newest windows (``_settle_run``).
+        """
+        at = monotonic()
+        ready = [unit for unit in newest if not self._cooldown_left(unit, at)]
+        with_readings = self._properties_with_readings()
+        fetched = {unit.cache_key[0] for unit in walking if unit not in newest}
+
+        def order(unit: _Unit) -> tuple[int, int]:
+            key = unit.cache_key[0]
+            rank = 0 if key in with_readings else 1 if key not in fetched else 2
+            return (-unit.state.not_reached, rank)
+
+        return min(ready, key=order, default=None)
+
+    def _properties_with_readings(self) -> set[str]:
+        """Return the properties whose walks returned readings in this sync."""
+        return {
+            unit.cache_key[0]
+            for unit in self._run_units
+            if unit.walk is not None and unit.walk.walk.oldest_seen is not None
+        }
 
     def _next_walk(self, walking: list[_Unit]) -> _Unit:
         """
@@ -1591,11 +1627,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         # One reading of the clock for every unit: those of one property
         # then wait exactly as long.
         at = monotonic()
-        with_readings = {
-            unit.cache_key[0]
-            for unit in self._run_units
-            if unit.walk is not None and unit.walk.walk.oldest_seen is not None
-        }
+        with_readings = self._properties_with_readings()
 
         def order(unit: _Unit) -> tuple[float, bool, bool, bool, bool, int]:
             walk = unit.walk

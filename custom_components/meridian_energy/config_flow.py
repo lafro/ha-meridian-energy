@@ -139,7 +139,12 @@ type _SubmissionEnd = ConfigFlowResult | AbortFlow | None
 
 
 class SetupTimeLimitError(TimeoutError):
-    """An attempt at the setup import was still running at its time limit."""
+    """
+    An attempt at the setup import ran out of time.
+
+    It was still running at its time limit, or, raised from
+    ``RunBudgetError``, its budget left too little time for another request.
+    """
 
 
 class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -700,7 +705,14 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
                 self._retry_after = float(err.retry_after or 0)
             self._record_import_failure(err, reason=self._import_error)
         except SetupTimeLimitError as err:
-            self._import_error = "import_timeout"
+            # An import whose budget left too little time for another request
+            # failed because Meridian did not answer in time, as the hourly
+            # updates take it too; only the backstop is setup's own failure.
+            self._import_error = (
+                "upstream_timeout"
+                if isinstance(err.__cause__, RunBudgetError)
+                else "import_timeout"
+            )
             self._record_import_failure(err, reason=self._import_error)
         except Exception as err:  # noqa: BLE001 - every failure must reach the form
             self._import_error = "unknown"
@@ -811,11 +823,13 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
         """
         Return whether the failure form offers to go on without history.
 
-        Only after Meridian's service failed or did not answer in time: the
-        entry's updates then ask for the history in the background, a few
-        weeks at a time, and may get past what stopped setup. After any
-        other failure, as data Home Assistant could not use or a rate limit,
-        they would most likely fail the same way, with no form to say why.
+        Only after Meridian's service failed or did not answer in time, as
+        when its answers were too slow for any property's newest windows in
+        the import's 4 minutes: the entry's updates then ask for the history
+        in the background, with 15 minutes for an initial walk, and may get
+        past what stopped setup. After any other failure, as data Home
+        Assistant could not use or a rate limit, they would most likely fail
+        the same way, with no form to say why.
         """
         return self._import_error in _WITHOUT_HISTORY_FAILURES
 
@@ -1173,8 +1187,9 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
                 saved = await async_confirm_visible(self.hass, self._imported_newest)
         except RunBudgetError as err:
             # Too little of the import's own budget was left to start another
-            # request, and no property had its newest week: it fails as the
-            # time limit, the backstop, does.
+            # request, and no property had its newest week: it is raised as
+            # the time limit, the backstop, is, and the form takes it for
+            # Meridian not answering in time (``async_step_initial_import``).
             raise SetupTimeLimitError from err
         except TimeoutError as err:
             if not time_limit.expired():

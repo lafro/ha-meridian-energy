@@ -234,6 +234,69 @@ async def test_the_units_the_budget_did_not_reach_go_first_next_time(
 
 
 @pytest.mark.asyncio
+async def test_an_ended_property_costs_a_slow_update_one_request_first(hass) -> None:
+    """
+    An ended property listed first lets the active one's newest weeks go next.
+
+    At 55 s a request, 3 requests start in an hourly update's 4 minutes.
+    The ended property's grid import comes back empty, so the active
+    property's two newest weeks follow it, and the ended property's grid
+    export is not reached. At the next update that one goes first, as a
+    unit the budget did not reach, and the active property's newest weeks
+    go before the ended property's grid import again. Had the budget left
+    out both of the ended property's directions, both would go first: the
+    units it did not reach come before the order of the properties.
+    """
+    clock = _Clock()
+    now = {"value": NOW}
+    service = _service(clock, ACTIVE, ENDED)
+    service.krakens[ENDED].withdrawn_from = NOW - 120 * DAY
+    coordinator = MeridianDataCoordinator(
+        hass, _client(service, _account(ENDED, ACTIVE, feed_in=True))
+    )
+    ended = property_key(ACCOUNT, ENDED)
+
+    asked: list[list[tuple[str, str]]] = []
+    with _running(clock, lambda: now["value"], latest=NOW - 2 * HOUR):
+        await coordinator.async_fetch_and_import(time_budget=POLL_BUDGET_SECONDS)
+        service.latency = 55.0
+        for hours in (1, 2, 3):
+            if hours == 3:
+                for direction in ("CONSUMPTION", "GENERATION"):
+                    coordinator._unit_states[(ended, direction)].not_reached = 1
+            now["value"] = NOW + hours * HOUR
+            before = len(service.requests)
+            data = await coordinator.async_fetch_and_import(
+                time_budget=POLL_BUDGET_SECONDS
+            )
+            assert data.units_deferred == 1
+            asked.append(
+                [
+                    (request.property_id, request.direction)
+                    for request in service.requests[before:]
+                ]
+            )
+
+    assert asked == [
+        [
+            (ENDED, "CONSUMPTION"),
+            (ACTIVE, "CONSUMPTION"),
+            (ACTIVE, "GENERATION"),
+        ],
+        [
+            (ENDED, "GENERATION"),
+            (ACTIVE, "CONSUMPTION"),
+            (ACTIVE, "GENERATION"),
+        ],
+        [
+            (ENDED, "CONSUMPTION"),
+            (ENDED, "GENERATION"),
+            (ACTIVE, "CONSUMPTION"),
+        ],
+    ]
+
+
+@pytest.mark.asyncio
 async def test_a_unit_the_budget_did_not_reach_owes_the_weekly_reconciliation(
     hass,
 ) -> None:

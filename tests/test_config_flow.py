@@ -5068,8 +5068,8 @@ async def test_too_little_time_left_for_the_next_request_ends_the_attempt(
     Each page here takes 200 s, and pages of 100 rows make the newest week
     two. Once less than 80 s of the import's 4 minutes would be left, the
     next request does not start: with no week of history imported, the
-    attempt ends with the time-limit failure, and says which request came
-    last.
+    attempt ends, and the form says that Meridian did not answer in time,
+    why, and which request came last, and offers to go on without history.
     """
 
     def slow_windows(_direction: str, _before: str | None) -> None:
@@ -5083,7 +5083,8 @@ async def test_too_little_time_left_for_the_next_request_ends_the_attempt(
         result = await _submit_login(hass)
         result = await _finish_import(hass, result["flow_id"])
 
-    assert result["errors"] == {"base": "import_timeout"}
+    assert result["errors"] == {"base": "upstream_timeout"}
+    assert _schema_fields(result) == ["continue_without_history"]
     assert result["description_placeholders"]["detail"] == (
         "too little of the import's 4 minutes was left for another request after "
         "requesting grid import history, window 1 of 13, page 1 (account 1 of 1, "
@@ -6317,6 +6318,155 @@ async def test_a_property_without_readings_does_not_finish_setup_alone(
     assert first == datetime.combine(
         bad_day + timedelta(days=1), datetime.min.time(), tzinfo=NZ
     )
+
+
+def _active_after_ended(ended: int) -> MeridianAccount:
+    """Return an account whose ended properties come before the active one."""
+    return MeridianAccount(
+        number=_TEST_ACCOUNT,
+        status="ACTIVE",
+        properties=(
+            *(
+                MeridianProperty(
+                    id=f"synthetic-ended-{index}",
+                    address=f"{index + 2} Synthetic Street",
+                    meter_points=(
+                        MeridianMeterPoint(
+                            f"synthetic-meter-{index + 2}",
+                            f"synthetic-icp-{index + 2}",
+                            True,
+                        ),
+                    ),
+                )
+                for index in range(ended)
+            ),
+            _test_account(feed_in=True).properties[0],
+        ),
+    )
+
+
+def _slow_answers(
+    meridian: _FakeMeridian, clock: _Clock, seconds: float
+) -> list[tuple[str, str]]:
+    """
+    Make every measurements request take ``seconds``; ended ones answer empty.
+
+    Returns the property and direction of each request, in order.
+    """
+    asked: list[tuple[str, str]] = []
+    real = meridian.async_get_measurements
+
+    async def measurements(**kwargs: Any) -> MeasurementPage:
+        clock.now += seconds
+        asked.append((str(kwargs["property_id"]), str(kwargs["direction"])))
+        if kwargs["property_id"] != _TEST_PROPERTY:
+            await asyncio.sleep(0)
+            return MeasurementPage((), False, None)
+        return await real(**kwargs)
+
+    meridian.async_get_measurements = measurements  # type: ignore[method-assign]
+    return asked
+
+
+@pytest.mark.asyncio
+async def test_an_ended_property_listed_first_leaves_a_slow_setup_its_time(
+    hass: HomeAssistant, meridian: _FakeMeridian, clock: _Clock
+) -> None:
+    """
+    An ended property listed first costs a slow setup one request, not two.
+
+    Each answer takes 55 s, so 3 requests start in the import's 4 minutes.
+    The ended property's grid import comes back empty, so the active
+    property's newest weeks go before the ended property's grid export,
+    and setup finishes with them at its first attempt. Asked for in
+    topology order, the ended property's two empty weeks and the active
+    property's grid import would use up the time, and every attempt would
+    fail the same way, since each one builds a new coordinator.
+    """
+    meridian.account = _active_after_ended(1)
+    asked = _slow_answers(meridian, clock, 55.0)
+
+    async def wait(delay: float) -> None:
+        clock.now += delay
+
+    with (
+        patch.object(coordinator_module, "monotonic", side_effect=clock),
+        patch.object(coordinator_module, "_async_wait", side_effect=wait),
+    ):
+        result = await _submit_login(hass)
+        result = await _finish_import(hass, result["flow_id"])
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["description"] == "partial"
+    assert asked == [
+        ("synthetic-ended-0", "CONSUMPTION"),
+        (_TEST_PROPERTY, "CONSUMPTION"),
+        (_TEST_PROPERTY, "GENERATION"),
+    ]
+    key = property_key(_TEST_ACCOUNT, _TEST_PROPERTY)
+    for statistic_id in (*consumption_ids(key), *generation_ids(key)):
+        assert await _rows(hass, statistic_id), statistic_id
+
+
+@pytest.mark.asyncio
+async def test_answers_too_slow_for_setup_offer_to_go_on_without_history(
+    hass: HomeAssistant, meridian: _FakeMeridian, clock: _Clock
+) -> None:
+    """
+    Answers too slow for any property's newest weeks: setup can still finish.
+
+    Two ended properties come before the active one, and each answer takes
+    55 s: their grid imports and the active property's use up the import's
+    4 minutes, and the active property's grid export is never asked for.
+    No gateway timeout was met, but Meridian did not answer in time all
+    the same, so the form offers to go on without history, as the hourly
+    updates take an update that ran out of time for a timeout. Chosen, it
+    creates the entry, whose first sync has 15 minutes for its initial
+    walks: at the same speed, it imports the newest weeks of both of the
+    active property's directions, and weeks more of its grid import.
+    """
+    meridian.account = _active_after_ended(2)
+    asked = _slow_answers(meridian, clock, 55.0)
+
+    async def wait(delay: float) -> None:
+        clock.now += delay
+
+    key = property_key(_TEST_ACCOUNT, _TEST_PROPERTY)
+    with (
+        _entry_setup(hass, meridian),
+        patch.object(coordinator_module, "monotonic", side_effect=clock),
+        patch.object(coordinator_module, "_async_wait", side_effect=wait),
+    ):
+        result = await _submit_login(hass)
+        flow_id = result["flow_id"]
+        result = await _finish_import(hass, flow_id)
+        assert result["step_id"] == "import_failed"
+        assert result["errors"] == {"base": "upstream_timeout"}
+        assert _schema_fields(result) == ["continue_without_history"]
+        assert result["description_placeholders"]["detail"].startswith(
+            "too little of the import's 4 minutes was left for another request"
+        )
+        assert (_TEST_PROPERTY, "GENERATION") not in asked
+
+        clock.now += 121
+        result = await hass.config_entries.flow.async_configure(
+            flow_id, {"continue_without_history": True}
+        )
+        assert result["type"] is FlowResultType.CREATE_ENTRY
+        assert result["description"] == "partial"
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    (entry,) = hass.config_entries.async_entries(DOMAIN)
+    coordinator = entry.runtime_data.coordinator
+    assert coordinator.last_update_success
+    rows = {
+        statistic_id: await _rows(hass, statistic_id)
+        for statistic_id in (*consumption_ids(key), *generation_ids(key))
+    }
+    assert all(rows.values())
+    assert all(_running_sum_breaks(found) == [] for found in rows.values())
+    # Far more than the 3 requests setup's 4 minutes allowed at 55 s.
+    assert len(rows[consumption_ids(key)[0]]) > 30 * 24
 
 
 @pytest.mark.asyncio
