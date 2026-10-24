@@ -48,6 +48,6 @@ Fuller, public notes are in [`docs/`](docs/README.md).
 
 - Branches: `<type>/<slug>` (`fix/`, `feat/`, `chore/`, `docs/`, `release/`). `main` is squash-only with required checks `python`, `hassfest`, `hacs`, `dependency-review`, `Analyze Python`, `secrets` and `private-terms`.
 - A shippable change bumps `version` in `manifest.json` and `pyproject.toml` together and adds a `## X.Y.Z` section to `CHANGELOG.md`; `check_versions.py` fails without it. HACS only offers an update when the version string changes, so never cut a release for CI-only changes.
-- Release (maintainer only): after the PR is merged, run the **Release** workflow from `main` with tag `vX.Y.Z`. The workflow re-runs the gates, creates the immutable tag and publishes the release with that version's CHANGELOG section as its notes. Never create or move tags by hand.
+- Release (maintainer only): after the PR is merged, run the **Release** workflow from `main` with tag `vX.Y.Z` (`vX.Y.ZbN` publishes a beta pre-release; see `docs/releasing.md`). The workflow re-runs the gates, creates the immutable tag and publishes the release with that version's CHANGELOG section as its notes. Never create or move tags by hand.
 - Users install a GitHub release through HACS. Never copy files into `/config/custom_components` by hand.
 - A defect found after release is fixed forward with a new patch version; existing releases are never replaced.

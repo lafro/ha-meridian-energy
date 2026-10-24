@@ -4,20 +4,29 @@ Verify project, integration, release-tag and CHANGELOG versions agree.
 Usage: ``check_versions.py [REF] [--release-notes PATH]``
 
 - ``manifest.json`` and ``pyproject.toml`` must carry the same version.
-- When ``REF`` is a tag (``vX.Y.Z``), it must name that version.
-- ``CHANGELOG.md`` must have a non-empty ``## X.Y.Z`` section for it.
+- When ``REF`` is a tag (``vX.Y.Z`` or ``vX.Y.ZbN``), it must name that version.
+- ``CHANGELOG.md`` must have a non-empty ``## X.Y.Z`` section for it. A beta
+  version ``X.Y.ZbN`` uses the section of the release it previews, ``X.Y.Z``.
 - ``--release-notes PATH`` writes that section to ``PATH`` for the release.
 """
 
 from __future__ import annotations
 
 import json
+import re
 import sys
 import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 NOTES_OPTION = "--release-notes"
+BETA_VERSION = re.compile(r"(\d+\.\d+\.\d+)b\d+")
+
+
+def changelog_version(version: str) -> str:
+    """Return the version whose CHANGELOG section describes ``version``."""
+    beta = BETA_VERSION.fullmatch(version)
+    return beta.group(1) if beta else version
 
 
 def changelog_section(version: str, text: str) -> str:
@@ -78,9 +87,15 @@ def main(argv: list[str] | None = None, root: Path = ROOT) -> None:
             f"Tag mismatch: tag={ref_name}, integration={manifest_version}"
         )
 
+    notes_version = changelog_version(manifest_version)
     notes = changelog_section(
-        manifest_version, (root / "CHANGELOG.md").read_text(encoding="utf-8")
+        notes_version, (root / "CHANGELOG.md").read_text(encoding="utf-8")
     )
+    if notes_version != manifest_version:
+        notes = (
+            f"Beta of {notes_version} for testing. HACS offers it only to "
+            "installations that turn on beta versions for this repository.\n\n" + notes
+        )
     if notes_path is not None:
         notes_path.write_text(notes, encoding="utf-8")
 

@@ -245,12 +245,58 @@ def test_check_versions_requires_a_changelog_section(tmp_path: Path) -> None:
         check_versions.main(["--release-notes"], root)
 
 
+def test_check_versions_reads_a_beta_from_its_release_section(tmp_path: Path) -> None:
+    root = tmp_path
+    (root / "custom_components/meridian_energy").mkdir(parents=True)
+    (root / "custom_components/meridian_energy/manifest.json").write_text(
+        '{"version": "9.8.7b2"}'
+    )
+    (root / "pyproject.toml").write_text('[project]\nversion = "9.8.7b2"\n')
+    (root / "CHANGELOG.md").write_text(
+        "# Changelog\n\n## 9.8.7\n\n### Fixed\n\n- New.\n\n## 9.8.6\n\n- Older.\n"
+    )
+    notes = tmp_path / "notes.md"
+
+    check_versions.main(["v9.8.7b2", "--release-notes", str(notes)], root)
+
+    text = notes.read_text()
+    assert text.startswith("Beta of 9.8.7 for testing.")
+    assert text.endswith("### Fixed\n\n- New.\n")
+    with pytest.raises(SystemExit, match="Tag mismatch"):
+        check_versions.main(["v9.8.7"], root)
+    with pytest.raises(SystemExit, match="Tag mismatch"):
+        check_versions.main(["v9.8.7b1"], root)
+    assert check_versions.changelog_version("9.8.7rc1") == "9.8.7rc1"
+
+
+def test_release_workflow_marks_only_beta_tags_as_pre_releases() -> None:
+    workflow = yaml.safe_load(Path(".github/workflows/release.yml").read_text())
+    tag_pattern = r"^v[0-9]+\.[0-9]+\.[0-9]+(b[0-9]+)?$"
+    versions = next(
+        step
+        for step in workflow["jobs"]["python"]["steps"]
+        if step.get("id") == "versions"
+    )
+    publish = workflow["jobs"]["release"]["steps"]
+    create_tag, release = publish[0], publish[-1]
+
+    assert tag_pattern in versions["run"]
+    assert tag_pattern in create_tag["run"]
+    assert "=~ b[0-9]+$ ]]" in release["run"]
+    assert "--prerelease --latest=false" in release["run"]
+    for tag in ("v0.3.0", "v0.3.0b1", "v10.20.30b4"):
+        assert re.fullmatch(tag_pattern.strip("^$"), tag)
+    for tag in ("v0.3.0rc1", "v0.3.0-b1", "0.3.0", "v0.3"):
+        assert not re.fullmatch(tag_pattern.strip("^$"), tag)
+
+
 def test_repository_versions_and_changelog_agree(tmp_path: Path) -> None:
     notes = tmp_path / "notes.md"
     check_versions.main(["--release-notes=" + str(notes)])
     project = tomllib.loads(Path("pyproject.toml").read_text())
+    version = project["project"]["version"]
     section = check_versions.changelog_section(
-        project["project"]["version"], Path("CHANGELOG.md").read_text()
+        check_versions.changelog_version(version), Path("CHANGELOG.md").read_text()
     )
-    assert notes.read_text() == section
+    assert notes.read_text().endswith(section)
     assert section.strip()
