@@ -1210,7 +1210,7 @@ async def test_rollback_compatibility_an_earlier_release_continues_the_sums(
 async def _legacy_import(
     hass: HomeAssistant, statistic_id: str, states: dict[datetime, float]
 ) -> None:
-    """Import rows as releases before 0.4.0 did: anchored on the newest rows."""
+    """Import rows as releases before 0.3.0 did: anchored on the newest rows."""
     first = min(states)
     result = await get_instance(hass).async_add_executor_job(
         get_last_statistics, hass, 90 * 24 + 72, statistic_id, False, {"sum"}
@@ -1422,7 +1422,7 @@ async def test_bill_totals_do_not_wait_without_end_for_a_busy_recorder(
     The wait before the totals read has a time limit, then reads anyway.
 
     The recorder is held with other work queued behind it, as a backlog
-    would be: a wait for its queue to empty, as before 0.4.0, would last
+    would be: a wait for its queue to empty, as before 0.3.0, would last
     until the hold ends. The totals come back long before that, from the
     rows already saved.
     """

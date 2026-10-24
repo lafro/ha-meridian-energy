@@ -314,7 +314,7 @@ async def _import_hours(hass: HomeAssistant, key: str, hours: int) -> str:
     """
     Queue a first import's rows on the recorder thread, without confirming them.
 
-    As releases before 0.4.0 imported, and as any writer may leave rows
+    As releases before 0.3.0 imported, and as any writer may leave rows
     queued: the waits tested here must cover rows still in the queue.
     """
     energy_id, cost_id = consumption_ids(key)

@@ -1552,7 +1552,7 @@ def _log_discovery_failure(err: Exception) -> None:
     Log why account discovery failed, without identifiers.
 
     Data Home Assistant cannot use is a defect worth reporting, so it gets a
-    warning with its traceback; until now it left no trace at any level. A
+    warning with its traceback; before 0.3.0 it left no trace at any level. A
     connection failure or rate limit is already on the form, and the
     transport's debug lines describe the answer, so it gets a debug line.
     """

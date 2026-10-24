@@ -424,8 +424,8 @@ async def test_an_update_with_a_first_import_has_the_deep_walk_budget(
     Its 13 weeks, after the grid import's hourly update, fit no 4-minute
     budget once a request takes more than about 13 s. A walk cut short
     imports the weeks it fetched, but one that never completes would never
-    show that a supply has ended. With the deep walk's budget, the 15
-    minutes setup had until 0.4.1, it completes.
+    show that a supply has ended. With the deep walk's budget of 15
+    minutes, it completes.
     """
     clock = _Clock()
     service = _service(clock)
@@ -460,7 +460,7 @@ async def test_setup_keeps_the_weeks_each_property_fetched_in_its_time(
     At 10 s a request, the two properties' 26 weeks do not fit setup's 4
     minutes: the first is imported whole, and the second, cut short, keeps
     the weeks it fetched, newest first. The entry's updates fill in the
-    rest. Until 0.4.1 the second imported nothing.
+    rest. Imported all or nothing, the second would have imported nothing.
     """
     clock = _Clock()
     service = _service(clock, ACTIVE, ENDED)

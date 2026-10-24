@@ -1040,7 +1040,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         readings in its 90 days, as one whose supply ended, imported no
         history: counted, it would create the entry with none while the
         active property failed. Otherwise the first unit's failure fails
-        it, as one failure failed every sync until now, and
+        it, as any failure failed every sync before 0.3.0, and
         ``last_request`` names that unit's failed request, not a later
         unit's; or, when every unit waited after an earlier failure, that
         failure. A refused replay (``StatisticsAnchorError``) fails it only
@@ -1529,12 +1529,11 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         imports what it fetched all the same, and the days it did not reach
         are filled in later, but a search that never completes never shows
         that a supply has ended (``_quiet``): it would walk back again at
-        every update. So it has the time setup had until 0.4.1. It is known
-        before the first request (``_Unit.deep``), except for a quiet
-        direction, whose walk goes back only once its newest window has
-        readings again (``_async_walk_step``). The setup import has its own
-        budget. The time imports took before is still not counted
-        (``_async_uncounted``).
+        every update. So it has 900 s instead. It is known before the first
+        request (``_Unit.deep``), except for a quiet direction, whose walk
+        goes back only once its newest window has readings again
+        (``_async_walk_step``). The setup import has its own budget. The
+        time imports took before is still not counted (``_async_uncounted``).
         """
         if self._deadline is not None and not self._setup_import:
             self._deadline = max(

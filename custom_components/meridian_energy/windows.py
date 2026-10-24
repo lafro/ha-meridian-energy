@@ -363,11 +363,10 @@ def importable(
     suggests Meridian no longer returns the history around it as before, and
     so does a stored hour newer than every row fetched. So rows up to the
     newest such hole are left out, and when stored hours lie after what is
-    left, nothing is imported. Until 0.4.0 this was also what kept the
-    running sums consistent, since an import rewrote only the hours it was
-    given; the replay now does that on its own. A hole with nothing stored
-    in it leaves nothing behind: without stored rows, both sides of a gap
-    are imported.
+    left, nothing is imported. The replay keeps the running sums consistent
+    on its own, so these rules decide only what is imported, not how the
+    sums join. A hole with nothing stored in it leaves nothing behind:
+    without stored rows, both sides of a gap are imported.
     """
     if not stored.energy or not measurements:
         return ImportPlan(measurements)

@@ -5383,7 +5383,7 @@ async def test_first_sync_waits_for_a_recorder_still_saving_the_setup_import(
     the first sync read no history, started a second 90-day import with its
     sums from zero and queued it behind setup's unsaved rows. An hour
     boundary between the two left the stored running sum an hour's usage
-    short, for good. Since 0.4.0 the import's own replay confirms its rows
+    short, for good. The import's own replay now confirms its rows
     before it returns, so the recorder is held here once they are saved,
     as other work would hold it. On MySQL or MariaDB, setup's energy rows
     can also meet a lock error (a lock-wait timeout or a deadlock, say): the

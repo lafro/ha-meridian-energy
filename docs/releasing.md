@@ -16,7 +16,7 @@ Tags and releases are immutable by repository ruleset. A tag is never created, m
 
 ## After release
 
-Users update through HACS and restart Home Assistant. A problem found after release is fixed forward with a new patch version. To return to earlier code, either install the previous release from HACS, or release the earlier code again as a new patch version. Config-entry minor versions stay backward compatible so either route loads existing entries (see [architecture](architecture.md#config-entries)). Running totals stay consistent either way, but a history that 0.4.1 or later is still completing stays incomplete under earlier code, which asks only for the hours after the newest one stored and for the last 14 days: let it fill in first (diagnostics show `reaches_target` for each grid import and export).
+Users update through HACS and restart Home Assistant. A problem found after release is fixed forward with a new patch version. To return to earlier code, either install the previous release from HACS, or release the earlier code again as a new patch version. Config-entry minor versions stay backward compatible so either route loads existing entries (see [architecture](architecture.md#config-entries)). Running totals stay consistent either way, but a history that 0.3.0 or later is still completing stays incomplete under earlier code, which asks only for the hours after the newest one stored and for the last 14 days: let it fill in first (diagnostics show `reaches_target` for each grid import and export).
 
 ## Compatibility runs
 

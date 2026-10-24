@@ -358,8 +358,7 @@ async def test_one_gateway_timeout_leaves_setup_less_time_for_the_newest_week(
     cannot come back: setup fails with the gateway timeout, not with its
     time budget, as the timeout cost the time, and the failure form offers
     to go on without history. The timeout is raised as it came, its cause
-    kept, as the failure warning names it. In 0.4.0, with 15 minutes, it
-    completed.
+    kept, as the failure warning names it.
     """
     clock = _Clock()
     service = _service(clock)
@@ -813,8 +812,8 @@ async def test_a_newest_week_that_waited_for_a_cooldown_still_comes_first(
     newest week goes, then the rest of the grid import's week by day, and
     only then the older weeks. At 3 s a request, setup's 4 minutes then
     stop the walks after one older week, and setup keeps the weeks each
-    fetched. Until 0.3.1 the grid import walked all its weeks first: the
-    grid export never sent a request.
+    fetched. Had the grid import walked all its weeks first, the grid
+    export would never have sent a request.
     """
     clock = _Clock()
     service = _service(clock)

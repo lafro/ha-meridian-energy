@@ -48,7 +48,7 @@ Each selected account is represented by one service device.
 | **Current bill export** | Grid export in the current period; feed-in accounts only. |
 | **Current bill export credit** | Retailer credit for that export; feed-in accounts only. |
 
-**Billing period start**, **Billing period end** and **Next billing date** are disabled by default. Current-bill values remain unavailable until Home Assistant has complete data from the start of the period; missing cost is never treated as zero.
+**Billing period start**, **Billing period end** and **Next billing date** are disabled by default. Current-bill values stay unknown until Home Assistant has complete data from the start of the period; missing cost is never treated as zero.
 
 The **Current bill** sensors are running totals for the current period, with the period dates as attributes. They have no state class, so Home Assistant keeps no long-term statistics for them and does not offer them in the Energy dashboard; the statistics below are the long-term record.
 

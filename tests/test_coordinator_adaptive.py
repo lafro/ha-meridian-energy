@@ -607,7 +607,7 @@ def test_merge_takes_the_latest_channels_of_an_hour(
     """
     The rows fetched for an hour replace its cached rows, whatever their channels.
 
-    Until 0.4.0 a change in an hour's channels failed every sync with
+    Until 0.3.0 a change in an hour's channels failed every sync with
     unusable data until the cached rows aged out. Joined instead, the
     hour would count the readings of both fetches.
     """
