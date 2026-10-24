@@ -59,6 +59,7 @@ from custom_components.meridian_energy.statistics import (
 from custom_components.meridian_energy.windows import NZ, local_midnight
 
 from .kraken_fake import FakeKraken
+from .walks import fetch_since
 
 # 16:30 on Friday 16 October 2026 in New Zealand.
 NOW = datetime(2026, 10, 16, 3, 30, tzinfo=UTC)
@@ -206,7 +207,8 @@ async def test_windowed_imports_store_what_an_unbounded_request_would(
     kraken = FakeKraken(NOW, channels=channels, value=_alternating)
     coordinator, _client = _coordinator(hass, "A-TEST-1", kraken)
     with patch.object(coordinator_module, "_utcnow", return_value=NOW):
-        windowed = await coordinator._async_fetch_since(
+        windowed = await fetch_since(
+            coordinator,
             account_number="A-TEST-1",
             property_id=PROPERTY,
             direction="CONSUMPTION",

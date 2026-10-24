@@ -37,6 +37,7 @@ from custom_components.meridian_energy.models import (
 )
 
 from .kraken_fake import FakeKraken
+from .walks import fetch_since
 
 TEST_HOUR = datetime(2026, 7, 16, 0, 0, tzinfo=UTC)
 
@@ -325,7 +326,8 @@ async def test_fetch_since_prefers_actual_for_same_channel(hass) -> None:
     )
     coordinator = MeridianDataCoordinator(hass, client)
 
-    result = await coordinator._async_fetch_since(
+    result = await fetch_since(
+        coordinator,
         account_number="A-SYNTHETIC",
         property_id="property",
         direction="CONSUMPTION",
@@ -355,7 +357,8 @@ async def test_fetch_since_rejects_conflicting_anonymous_rows(hass) -> None:
     coordinator = MeridianDataCoordinator(hass, client)
 
     with pytest.raises(ValueError, match="ambiguous"):
-        await coordinator._async_fetch_since(
+        await fetch_since(
+            coordinator,
             account_number="A-SYNTHETIC",
             property_id="property",
             direction="CONSUMPTION",
@@ -398,7 +401,8 @@ async def test_fetch_since_rejects_indistinguishable_anonymous_rows(
         ),
         pytest.raises(ValueError, match="ambiguous"),
     ):
-        await coordinator._async_fetch_since(
+        await fetch_since(
+            coordinator,
             account_number="A-SYNTHETIC",
             property_id="property",
             direction="CONSUMPTION",
@@ -425,7 +429,8 @@ async def test_fetch_since_rejects_mixed_anonymous_and_identified_rows(hass) -> 
     coordinator = MeridianDataCoordinator(hass, client)
 
     with pytest.raises(ValueError, match="ambiguous"):
-        await coordinator._async_fetch_since(
+        await fetch_since(
+            coordinator,
             account_number="A-SYNTHETIC",
             property_id="property",
             direction="CONSUMPTION",
@@ -447,7 +452,8 @@ async def test_fetch_since_paginates_backwards(hass) -> None:
     )
     coordinator = MeridianDataCoordinator(hass, client)
 
-    result = await coordinator._async_fetch_since(
+    result = await fetch_since(
+        coordinator,
         account_number="A-SYNTHETIC",
         property_id="property",
         direction="CONSUMPTION",
@@ -477,7 +483,8 @@ async def test_fetch_since_rejects_stalled_cursor(hass) -> None:
     coordinator = MeridianDataCoordinator(hass, client)
 
     with pytest.raises(ValueError, match="cursor did not advance"):
-        await coordinator._async_fetch_since(
+        await fetch_since(
+            coordinator,
             account_number="A-SYNTHETIC",
             property_id="property",
             direction="CONSUMPTION",
@@ -496,13 +503,15 @@ async def test_fetch_since_stops_on_empty_or_older_page(hass) -> None:
         ]
     )
     coordinator = MeridianDataCoordinator(hass, client)
-    empty = await coordinator._async_fetch_since(
+    empty = await fetch_since(
+        coordinator,
         account_number="A-SYNTHETIC",
         property_id="property",
         direction="CONSUMPTION",
         since=now - timedelta(days=1),
     )
-    older = await coordinator._async_fetch_since(
+    older = await fetch_since(
+        coordinator,
         account_number="A-SYNTHETIC",
         property_id="property",
         direction="CONSUMPTION",
@@ -540,7 +549,8 @@ async def test_a_window_holds_at_most_16_pages_of_744_rows(hass, days: int) -> N
     client.async_get_measurements = AsyncMock(side_effect=page)
     coordinator = MeridianDataCoordinator(hass, client)
     with pytest.raises(ValueError, match="per-window page limit"):
-        await coordinator._async_fetch_since(
+        await fetch_since(
+            coordinator,
             account_number="A-SYNTHETIC",
             property_id="property",
             direction="CONSUMPTION",
@@ -568,7 +578,8 @@ async def test_fetch_since_ignores_incomplete_and_future_intervals(hass) -> None
     )
     coordinator = MeridianDataCoordinator(hass, client)
 
-    result = await coordinator._async_fetch_since(
+    result = await fetch_since(
+        coordinator,
         account_number="A-SYNTHETIC",
         property_id="property",
         direction="CONSUMPTION",

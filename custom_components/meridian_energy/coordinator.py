@@ -3484,71 +3484,6 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             )
         )
 
-    async def _async_fetch_since(
-        self,
-        *,
-        account_number: str,
-        property_id: str,
-        direction: str,
-        since: datetime,
-        mode: SyncMode | None = None,
-        position: _Position | None = None,
-        stored_energy: frozenset[datetime] = frozenset(),
-        has_statistics: bool = False,
-        now: datetime | None = None,
-    ) -> MeasurementFetchResult:
-        """
-        Fetch one direction's windows, newest first, back to the cutoff.
-
-        A sync passes the ``now`` its cutoff and its progress were planned
-        from, so the windows sent are those counted, even after New Zealand
-        midnight has passed since it started. A failure that stopped the walk
-        is raised once it has stopped; a sync instead records it as its
-        unit's (``_async_walk_unit``).
-
-        Each window is fetched whole into its own rows before they join the
-        direction's, so a failure leaves nothing half-read; each complete
-        window is checked against the rows the newer windows returned from
-        before their own start (``_Walk.check``). The page size of a window
-        follows the rows an hour holds, learned from the first window that
-        returns readings. A window with no readings stops the walk when Home
-        Assistant has stored hours inside it (Meridian no longer returns the
-        readings stored there, which the import leaves as stored); otherwise
-        two in a row after a reading mark
-        the start of the history. Empty windows mark no such start while
-        hours are stored older than them, nor before any reading: the walk
-        goes on to the stored hours, or to the cutoff, as one request for the
-        whole span would, since a supply that ended weeks ago has empty
-        newest weeks, and a meter may send nothing for weeks. Rows still to
-        come are no reading. A window older than every reading returned so
-        far that Meridian refuses before it returned any reading of its own
-        can mark the start too (``_async_fetch_or_refused``), or show that
-        there is no history yet, for a direction with no statistics
-        (``has_statistics``: whether its energy statistic has stored rows,
-        inside the span or not).
-
-        Each page logs one debug line, and a failed page one line naming the
-        failure, with times as offsets from now and no identifiers.
-        """
-        walk = self._unit_walk(
-            account_number=account_number,
-            property_id=property_id,
-            direction=direction,
-            since=since,
-            mode=mode,
-            position=position,
-            stored_energy=stored_energy,
-            has_statistics=has_statistics,
-            now=_utcnow() if now is None else now,
-        )
-        await self._async_walk_unit(walk)
-        result = self._walk_result(walk)
-        if walk.error is not None:
-            # The failure names its own request, as a sync's does.
-            self.last_request = walk.call or self.last_request
-            raise walk.error
-        return result
-
     def _unit_walk(
         self,
         *,
@@ -3564,7 +3499,13 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         state: UnitState | None = None,
         quiet: bool = False,
     ) -> _UnitWalk:
-        """Plan one direction's walk: its windows, its page log and its ladder."""
+        """
+        Plan one direction's walk: its windows, its page log and its ladder.
+
+        A sync passes the ``now`` its cutoff and its progress were planned
+        from, so the windows sent are those counted, even after New Zealand
+        midnight has passed since it started.
+        """
         cache_key = (property_key(account_number, property_id), direction)
         walk = _Walk(
             self._row_density.get(cache_key, 1.0),
@@ -3613,13 +3554,38 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         """
         Fetch a direction's windows until its walk ends, or only its next one.
 
-        ``pause`` is asked after each window: when it says so, the walk
-        stops where it is, to go on later in the same sync. A failure stops
-        this walk alone, and is recorded as its error, as is the end of the
-        sync's time budget: the sync goes on with its other units. A rejected
-        session and a rate limit stop the whole sync, and so does a missing
-        account or property while the topology has not been refreshed in
-        this sync, which refreshes it and tries again.
+        Newest first, back to the cutoff. ``pause`` is asked after each
+        window: when it says so, the walk stops where it is, to go on later
+        in the same sync. A failure stops this walk alone, and is recorded
+        as its error, as is the end of the sync's time budget: the sync goes
+        on with its other units. A rejected session and a rate limit stop
+        the whole sync, and so does a missing account or property while the
+        topology has not been refreshed in this sync, which refreshes it and
+        tries again.
+
+        Each window is fetched whole into its own rows before they join the
+        direction's, so a failure leaves nothing half-read; each complete
+        window is checked against the rows the newer windows returned from
+        before their own start (``_Walk.check``). The page size of a window
+        follows the rows an hour holds, learned from the first window that
+        returns readings. A window with no readings stops the walk when Home
+        Assistant has stored hours inside it (Meridian no longer returns the
+        readings stored there, which the import leaves as stored); otherwise
+        two in a row after a reading mark the start of the history. Empty
+        windows mark no such start while hours are stored older than them,
+        nor before any reading: the walk goes on to the stored hours, or to
+        the cutoff, as one request for the whole span would, since a supply
+        that ended weeks ago has empty newest weeks, and a meter may send
+        nothing for weeks. Rows still to come are no reading. A window older
+        than every reading returned so far that Meridian refuses before it
+        returned any reading of its own can mark the start too
+        (``_async_fetch_or_refused``), or show that there is no history yet,
+        for a direction with no statistics (``_Walk.has_statistics``:
+        whether its energy statistic has stored rows, inside the span or
+        not).
+
+        Each page logs one debug line, and a failed page one line naming the
+        failure, with times as offsets from now and no identifiers.
         """
         try:
             while not walk.done:

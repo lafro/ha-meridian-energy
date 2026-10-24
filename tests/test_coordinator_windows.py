@@ -54,6 +54,7 @@ from custom_components.meridian_energy.windows import NZ, local_midnight
 
 from .kraken_fake import FakeKraken
 from .meridian_http import FakeMeridianSession, Response, json_response
+from .walks import fetch_since
 
 # 16:30 on Friday 16 October 2026 in New Zealand.
 NOW = datetime(2026, 10, 16, 3, 30, tzinfo=UTC)
@@ -130,7 +131,8 @@ async def _fetch(
     stored_energy: frozenset[datetime] = frozenset(),
     has_statistics: bool = False,
 ) -> Any:
-    return await coordinator._async_fetch_since(
+    return await fetch_since(
+        coordinator,
         account_number=ACCOUNT,
         property_id=PROPERTY,
         direction="CONSUMPTION",

@@ -43,6 +43,7 @@ from custom_components.meridian_energy.transport import MeridianHttpError
 from . import meridian_http
 from .kraken_fake import FakeKraken
 from .meridian_http import FakeMeridianSession, Response, json_response
+from .walks import fetch_since
 
 # 12:30 UTC is 00:30 on 17 July in New Zealand, so the NZ date and the UTC
 # date differ, and a log that leaked either would show it.
@@ -237,7 +238,8 @@ async def test_each_measurements_page_is_logged_with_relative_offsets(
         patch.object(coordinator_module, "_utcnow", return_value=_NOW),
         patch.object(coordinator_module, "monotonic", side_effect=_Clock(1.5)),
     ):
-        result = await coordinator._async_fetch_since(
+        result = await fetch_since(
+            coordinator,
             account_number=_ACCOUNT,
             property_id=_PROPERTY,
             direction="CONSUMPTION",
@@ -285,7 +287,8 @@ async def test_an_empty_page_is_logged_without_offsets(
     coordinator = MeridianDataCoordinator(hass, client)
 
     with patch.object(coordinator_module, "_utcnow", return_value=_NOW):
-        await coordinator._async_fetch_since(
+        await fetch_since(
+            coordinator,
             account_number=_ACCOUNT,
             property_id=_PROPERTY,
             direction="GENERATION",
@@ -329,7 +332,8 @@ async def test_a_failed_page_is_logged_with_its_kind_and_status(
         patch.object(coordinator_module, "monotonic", side_effect=_Clock(30.0)),
         pytest.raises(type(error)),
     ):
-        await coordinator._async_fetch_since(
+        await fetch_since(
+            coordinator,
             account_number=_ACCOUNT,
             property_id=_PROPERTY,
             direction="CONSUMPTION",
@@ -368,7 +372,8 @@ async def test_a_page_with_ambiguous_rows_is_logged_as_failed(
         patch.object(coordinator_module, "_utcnow", return_value=_NOW),
         pytest.raises(ValueError, match="ambiguous"),
     ):
-        await coordinator._async_fetch_since(
+        await fetch_since(
+            coordinator,
             account_number=_ACCOUNT,
             property_id=_PROPERTY,
             direction="CONSUMPTION",
@@ -399,7 +404,8 @@ async def test_failed_page_status_is_read_from_the_cause(
         patch.object(coordinator_module, "_utcnow", return_value=_NOW),
         pytest.raises(MeridianConnectionError),
     ):
-        await coordinator._async_fetch_since(
+        await fetch_since(
+            coordinator,
             account_number=_ACCOUNT,
             property_id=_PROPERTY,
             direction="CONSUMPTION",

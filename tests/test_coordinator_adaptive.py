@@ -40,6 +40,8 @@ from custom_components.meridian_energy.models import (
 )
 from custom_components.meridian_energy.statistics import consumption_ids, property_key
 
+from .walks import fetch_since
+
 NOW = datetime(2026, 7, 14, 0, 0, tzinfo=UTC)
 CACHE_KEY = ("property-key", READING_CONSUMPTION)
 
@@ -998,7 +1000,8 @@ async def test_tip_window_uses_new_zealand_dates_across_dst(
     with patch(
         "custom_components.meridian_energy.coordinator._utcnow", return_value=now
     ):
-        await coordinator._async_fetch_since(
+        await fetch_since(
+            coordinator,
             account_number="synthetic-account",
             property_id="synthetic-property",
             direction=READING_CONSUMPTION,
