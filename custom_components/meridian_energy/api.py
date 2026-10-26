@@ -15,14 +15,16 @@ from .const import (
     AUTH_OTP_URL,
     BRAND,
     CLIENT_PLATFORM,
+    DEFAULT_RETRY_AFTER_SECONDS,
     FIREBASE_API_KEY,
     FIREBASE_CUSTOM_TOKEN_URL,
     FIREBASE_REFRESH_URL,
     GRAPHQL_URL,
-    PAGE_SIZE,
+    MEASUREMENTS_TIMEOUT_SECONDS,
     READING_FREQUENCY_HOUR,
     READING_QUALITY_COMBINED,
     REDIRECT_URL,
+    REQUEST_TIMEOUT_SECONDS,
 )
 from .graphql import (
     ACCOUNT_QUERY as _ACCOUNT_QUERY,
@@ -37,7 +39,9 @@ from .graphql import (
     BILLING_PERIODS_QUERY as _BILLING_PERIODS_QUERY,
 )
 from .graphql import (
-    MEASUREMENTS_QUERY as _MEASUREMENTS_QUERY,
+    RATE_LIMIT_CODE,
+    measurements_operation,
+    measurements_query,
 )
 from .graphql import (
     graphql_error_code as _graphql_error_code,
@@ -76,6 +80,7 @@ from .transport import (
     MeridianHttpError as _MeridianHttpError,
 )
 from .transport import (
+    MeridianTimeoutError,
     MeridianTransport,
     MeridianTransportError,
 )
@@ -91,6 +96,8 @@ __all__ = [
     "MeridianGraphQLError",
     "MeridianOtpError",
     "MeridianRateLimitError",
+    "MeridianRejectedError",
+    "MeridianUpstreamError",
     "_MeridianHttpError",
     "_graphql_error_code",
     "_optional_string",
@@ -99,14 +106,27 @@ __all__ = [
     "_parse_measurement",
     "_parse_retry_after",
     "_required_string",
+    "exception_chain",
+    "http_status",
 ]
 
 _LAST_DAY_OF_LONG_MONTH = 31
+_MAX_CAUSE_DEPTH = 10
+_HTTP_CLIENT_ERROR = 400
 _HTTP_REQUEST_TIMEOUT = 408
 _HTTP_TOO_MANY_REQUESTS = 429
 _HTTP_SERVER_ERROR = 500
+# Statuses a gateway in front of Meridian's API sends when the origin did not
+# answer in time: its own 504, and Cloudflare's 524.
+_GATEWAY_TIMEOUT_STATUSES = frozenset({504, 524})
 _LOGGER = logging.getLogger(__name__)
 _NZ = ZoneInfo("Pacific/Auckland")
+# The measurements query goes out under the web app's name and URL (see
+# MEASUREMENTS_WEB_APP_NAME); logs, timings and errors keep calling it
+# "measurements", the integration's own label for it.
+_MEASUREMENTS = "measurements"
+_MEASUREMENTS_NAME, _MEASUREMENTS_URL = measurements_operation(GRAPHQL_URL)
+_MEASUREMENTS_QUERY = measurements_query(_MEASUREMENTS_NAME)
 
 TokenUpdateCallback = Callable[[MeridianTokenSet], Awaitable[None]]
 
@@ -133,6 +153,47 @@ class MeridianConnectionError(MeridianError):
     """The Meridian service could not be reached."""
 
 
+class MeridianUpstreamError(MeridianConnectionError):
+    """
+    Meridian's service, or a gateway in front of it, failed or did not answer.
+
+    ``status`` is the HTTP status, or None when no answer came within the
+    request's time limit. ``gateway`` marks a gateway timeout (HTTP 504 or
+    524, or no answer at all), as opposed to a service that answered with an
+    error.
+    """
+
+    def __init__(self, status: int | None, *, gateway: bool) -> None:
+        super().__init__(
+            "Meridian did not answer in time"
+            if status is None
+            else f"Meridian service returned HTTP {status}"
+        )
+        self.status = status
+        self.gateway = gateway
+
+    @property
+    def detail(self) -> str:
+        """Describe the failure without identifiers, as in ``HTTP 503``."""
+        if self.status is None:
+            return "no answer within the time limit"
+        return f"HTTP {self.status}"
+
+
+class MeridianRejectedError(MeridianConnectionError):
+    """
+    Meridian's service refused a request with a client error (HTTP 4xx).
+
+    Not a timeout (408), a rate limit (429) or a rejected session (401 or
+    403), each handled on its own, and never a failure of Google's session
+    service: so the request itself, and what it asked for, was refused.
+    """
+
+    def __init__(self, status: int) -> None:
+        super().__init__(f"Meridian service returned HTTP {status}")
+        self.status = status
+
+
 class MeridianAuthenticationError(MeridianError):
     """The Meridian session is invalid and requires reauthentication."""
 
@@ -154,10 +215,17 @@ class MeridianOtpError(MeridianAuthenticationError):
 
 
 class MeridianGraphQLError(MeridianError):
-    """Meridian returned a GraphQL error."""
+    """
+    Meridian returned a GraphQL error.
+
+    The message names the operation and its upstream error codes, which are
+    validated and carry no identifiers (``graphql_error_code``); the free-text
+    messages that came with them are never kept.
+    """
 
     def __init__(self, operation: str, codes: tuple[str, ...]) -> None:
-        super().__init__(f"Meridian GraphQL operation {operation} failed")
+        detail = f" ({', '.join(codes)})" if codes else ""
+        super().__init__(f"Meridian GraphQL operation {operation} failed{detail}")
         self.operation = operation
         self.codes = codes
 
@@ -201,6 +269,7 @@ class MeridianApiClient:
         try:
             response = await self._async_json_request(
                 AUTH_EMAIL_URL,
+                operation="send_code",
                 json=payload,
                 headers={"X-Client-Platform": CLIENT_PLATFORM},
                 authenticated=False,
@@ -225,6 +294,7 @@ class MeridianApiClient:
         try:
             response = await self._async_json_request(
                 AUTH_OTP_URL,
+                operation="check_code",
                 json={
                     "email": email,
                     "otp": otp,
@@ -251,14 +321,16 @@ class MeridianApiClient:
         try:
             firebase = await self._async_json_request(
                 f"{FIREBASE_CUSTOM_TOKEN_URL}?key={FIREBASE_API_KEY}",
+                operation="session_sign_in",
                 json={"token": custom_token, "returnSecureToken": True},
                 authenticated=False,
+                meridian_service=False,
             )
         except _MeridianHttpError as err:
             if err.status == _HTTP_TOO_MANY_REQUESTS:
                 raise MeridianRateLimitError(err.retry_after) from err
             if err.status == _HTTP_REQUEST_TIMEOUT or err.status >= _HTTP_SERVER_ERROR:
-                raise _connection_error(err) from err
+                raise _connection_error(err, meridian_service=False) from err
             raise MeridianAuthenticationError(
                 "Meridian authentication exchange was rejected"
             ) from err
@@ -278,11 +350,13 @@ class MeridianApiClient:
         try:
             response = await self._async_json_request(
                 f"{FIREBASE_REFRESH_URL}?key={FIREBASE_API_KEY}",
+                operation="session_refresh",
                 data={
                     "grant_type": "refresh_token",
                     "refresh_token": self._tokens.refresh_token,
                 },
                 authenticated=False,
+                meridian_service=False,
             )
         except _MeridianHttpError as err:
             if err.status == _HTTP_TOO_MANY_REQUESTS:
@@ -291,7 +365,7 @@ class MeridianApiClient:
                 raise MeridianAuthenticationError(
                     "Meridian session refresh was rejected"
                 ) from err
-            raise _connection_error(err) from err
+            raise _connection_error(err, meridian_service=False) from err
 
         normalized = {
             "idToken": response.get("id_token"),
@@ -382,25 +456,42 @@ class MeridianApiClient:
         account_number: str,
         property_id: str,
         direction: str,
-        end_on: str,
+        start_on: date,
+        end_on: date,
+        last: int,
         before: str | None = None,
-        page_size: int = PAGE_SIZE,
     ) -> MeasurementPage:
-        """Return a backwards page of hourly measurements."""
+        """
+        Return one backwards page of hourly measurements inside a window.
+
+        The window is ``start_on`` to ``end_on``, New Zealand dates, both
+        included. Every page of a window sends both bounds and ``last``; a
+        continuation page adds ``before``, the previous page's start cursor,
+        and differs from the first page in nothing else.
+        """
+        if start_on > end_on or last < 1:
+            raise ValueError("Invalid Meridian measurements window")
         variables: dict[str, Any] = {
             "accountNumber": account_number,
             "propertyId": property_id,
-            "last": page_size,
+            "last": last,
+            "startOn": start_on.isoformat(),
+            "endOn": end_on.isoformat(),
             "readingFrequencyType": READING_FREQUENCY_HOUR,
             "readingDirectionType": direction,
             "readingQualityType": READING_QUALITY_COMBINED,
         }
-        if before is None:
-            variables["endOn"] = end_on
-        else:
+        if before is not None:
             variables["before"] = before
 
-        data = await self._async_graphql("measurements", _MEASUREMENTS_QUERY, variables)
+        data = await self._async_graphql(
+            _MEASUREMENTS,
+            _MEASUREMENTS_QUERY,
+            variables,
+            time_limit=MEASUREMENTS_TIMEOUT_SECONDS,
+            operation_name=_MEASUREMENTS_NAME,
+            url=_MEASUREMENTS_URL,
+        )
         account = require_mapping(data.get("account"), "measurement account")
         property_data = require_mapping(account.get("property"), "measurement property")
         connection = require_mapping(property_data.get("measurements"), "measurements")
@@ -460,15 +551,33 @@ class MeridianApiClient:
         )
 
     async def _async_graphql(
-        self, operation: str, query: str, variables: dict[str, Any]
+        self,
+        operation: str,
+        query: str,
+        variables: dict[str, Any],
+        *,
+        time_limit: float = REQUEST_TIMEOUT_SECONDS,
+        operation_name: str | None = None,
+        url: str = GRAPHQL_URL,
     ) -> dict[str, Any]:
+        """
+        Send one GraphQL query, renewing the session once if it is rejected.
+
+        ``operation`` labels the query in logs and errors; ``operation_name``,
+        when given, is the name the document and the request carry instead.
+        Kraken's rate limit (KT-CT-1199) arrives as a GraphQL error and is
+        raised as a rate limit with an hour's delay: Kraken's limits grow
+        stricter while they are being hit, so the sync stops.
+        """
         for attempt in range(2):
             tokens = await self.async_refresh_tokens(force=attempt == 1)
             try:
                 response = await self._async_json_request(
-                    GRAPHQL_URL,
+                    url,
+                    operation=operation,
+                    time_limit=time_limit,
                     json={
-                        "operationName": operation,
+                        "operationName": operation_name or operation,
                         "query": query,
                         "variables": variables,
                     },
@@ -504,6 +613,8 @@ class MeridianApiClient:
                     operation,
                     ",".join(codes),
                 )
+                if RATE_LIMIT_CODE in codes:
+                    raise MeridianRateLimitError(DEFAULT_RETRY_AFTER_SECONDS)
                 raise MeridianGraphQLError(operation, codes)
             return require_mapping(response.get("data"), f"GraphQL {operation} data")
 
@@ -518,25 +629,83 @@ class MeridianApiClient:
         self,
         url: str,
         *,
+        operation: str,
+        time_limit: float = REQUEST_TIMEOUT_SECONDS,
         json: dict[str, Any] | None = None,
         data: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
         authenticated: bool,
+        meridian_service: bool = True,
     ) -> dict[str, Any]:
+        """
+        Send one request through the transport and translate its failures.
+
+        ``meridian_service`` is False for Google's session service (Firebase),
+        which the login uses: its failures are never Meridian's service, or a
+        gateway in front of it, failing to answer.
+        """
         del authenticated  # Documents intent at each call site; never log the request.
         try:
             return await self._transport.async_json_request(
                 url,
+                operation=operation,
+                time_limit=time_limit,
                 json=json,
                 data=data,
                 headers=headers,
             )
         except _MeridianHttpError:
             raise
+        except MeridianTimeoutError as err:
+            if not meridian_service:
+                raise MeridianConnectionError(str(err)) from err
+            raise MeridianUpstreamError(None, gateway=True) from err
         except MeridianTransportError as err:
             raise MeridianConnectionError(str(err)) from err
 
 
-def _connection_error(err: _MeridianHttpError) -> MeridianConnectionError:
-    """Return a privacy-safe connection error for an upstream HTTP failure."""
-    return MeridianConnectionError(f"Meridian service returned HTTP {err.status}")
+def exception_chain(err: BaseException | None) -> list[BaseException]:
+    """
+    Return an exception and the chain of causes behind it, outermost first.
+
+    The chain is the one a traceback shows: an exception's context counts only
+    when it was not suppressed (``raise ... from None``, or an explicit cause).
+    """
+    chain: list[BaseException] = []
+    while err is not None and err not in chain and len(chain) < _MAX_CAUSE_DEPTH:
+        chain.append(err)
+        err = err.__cause__ or (None if err.__suppress_context__ else err.__context__)
+    return chain
+
+
+def http_status(err: BaseException | None) -> int | None:
+    """Return the first HTTP status found in an exception chain."""
+    for item in exception_chain(err):
+        status = getattr(item, "status", None)
+        if isinstance(status, int) and not isinstance(status, bool):
+            return status
+    return None
+
+
+def _connection_error(
+    err: _MeridianHttpError, *, meridian_service: bool = True
+) -> MeridianConnectionError:
+    """
+    Return a privacy-safe connection error for an unsuccessful HTTP status.
+
+    A request timeout or a server error from Meridian's service, or a gateway
+    in front of it, is that service failing; another client error from it is
+    the request being refused (``MeridianRejectedError``). Any other status,
+    and any status from Google's session service (``meridian_service=False``),
+    stays a plain connection error.
+    """
+    if meridian_service and (
+        err.status == _HTTP_REQUEST_TIMEOUT or err.status >= _HTTP_SERVER_ERROR
+    ):
+        return MeridianUpstreamError(
+            err.status, gateway=err.status in _GATEWAY_TIMEOUT_STATUSES
+        )
+    if meridian_service and err.status >= _HTTP_CLIENT_ERROR:
+        return MeridianRejectedError(err.status)
+    service = "Meridian" if meridian_service else "Meridian's session"
+    return MeridianConnectionError(f"{service} service returned HTTP {err.status}")

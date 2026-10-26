@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -38,6 +39,8 @@ from custom_components.meridian_energy.models import (
     SyncMode,
 )
 from custom_components.meridian_energy.statistics import consumption_ids, property_key
+
+from .walks import fetch_since
 
 NOW = datetime(2026, 7, 14, 0, 0, tzinfo=UTC)
 CACHE_KEY = ("property-key", READING_CONSUMPTION)
@@ -78,20 +81,6 @@ def _account(*, feed_in: bool = False) -> MeridianAccount:
                 ),
             ),
         ),
-    )
-
-
-def _two_property_account() -> MeridianAccount:
-    first = _account().properties[0]
-    second = MeridianProperty(
-        id="second-property",
-        address="Second synthetic address",
-        meter_points=first.meter_points,
-    )
-    return MeridianAccount(
-        number="synthetic-account",
-        status="ACTIVE",
-        properties=(first, second),
     )
 
 
@@ -234,7 +223,13 @@ async def test_topology_refresh_prunes_removed_account_runtime_state(hass) -> No
     client.async_get_accounts = AsyncMock(
         side_effect=[(remaining, removed), (remaining,)]
     )
-    coordinator = MeridianDataCoordinator(hass, client)
+    # The owner's mappings, of unconfirmed deep replays and of unconfirmed
+    # coverage dates, are pruned in place.
+    unconfirmed: dict[tuple[str, str], datetime] = {}
+    unsaved: dict[tuple[str, str], dict[date, datetime]] = {}
+    coordinator = MeridianDataCoordinator(
+        hass, client, unconfirmed=unconfirmed, unsaved=unsaved
+    )
 
     await coordinator._async_get_topology(NOW)
     coordinator._billing_periods[removed.number] = _billing_period()
@@ -248,6 +243,13 @@ async def test_topology_refresh_prunes_removed_account_runtime_state(hass) -> No
     coordinator._row_density[removed_key] = 1.0
     removed_statistic_id = consumption_ids(removed_key[0])[0]
     coordinator._known_statistics[removed_statistic_id] = True
+    remaining_key = (
+        property_key(remaining.number, remaining.properties[0].id),
+        READING_CONSUMPTION,
+    )
+    unconfirmed.update({removed_key: NOW, remaining_key: NOW})
+    retries = {NOW.date(): NOW}
+    unsaved.update({removed_key: retries, remaining_key: retries})
 
     await coordinator._async_get_topology(NOW + timedelta(days=1))
 
@@ -257,6 +259,8 @@ async def test_topology_refresh_prunes_removed_account_runtime_state(hass) -> No
     assert removed_key not in coordinator._measurement_cache
     assert removed_key not in coordinator._row_density
     assert removed_statistic_id not in coordinator._known_statistics
+    assert unconfirmed == {remaining_key: NOW}
+    assert unsaved == {remaining_key: retries}
 
 
 @pytest.mark.asyncio
@@ -529,24 +533,6 @@ async def test_startup_distinguishes_install_restart_and_solar(hass) -> None:
         assert await coordinator._async_startup_mode((_account(),)) is SyncMode.INITIAL
 
 
-@pytest.mark.asyncio
-async def test_multiple_properties_are_processed_serially(hass) -> None:
-    coordinator = MeridianDataCoordinator(hass, MagicMock())
-    coordinator._async_sync_property = AsyncMock(side_effect=[MagicMock(), MagicMock()])
-
-    results = await coordinator._async_sync_accounts(
-        (_two_property_account(),), SyncMode.TIP, NOW
-    )
-
-    assert len(results) == 2
-    assert [
-        call.args[1].id for call in coordinator._async_sync_property.await_args_list
-    ] == [
-        "synthetic-property",
-        "second-property",
-    ]
-
-
 def test_requested_windows_include_provisional_safety_and_cap(hass) -> None:
     coordinator = MeridianDataCoordinator(hass, MagicMock())
     assert coordinator._requested_since(CACHE_KEY, SyncMode.INITIAL, NOW) == NOW - (
@@ -576,15 +562,6 @@ def test_requested_windows_include_provisional_safety_and_cap(hass) -> None:
         coordinator._requested_since(CACHE_KEY, SyncMode.TARGETED_RECONCILIATION, NOW)
         == NOW - REVISION_OVERLAP
     )
-
-
-def test_page_size_uses_density_headroom_and_bounds(hass) -> None:
-    coordinator = MeridianDataCoordinator(hass, MagicMock())
-    assert coordinator._page_size(CACHE_KEY, NOW - timedelta(hours=1), NOW) == 24
-    assert coordinator._page_size(CACHE_KEY, NOW - timedelta(days=365), NOW) == 744
-
-    coordinator._row_density[CACHE_KEY] = 2.0
-    assert coordinator._page_size(CACHE_KEY, NOW - timedelta(hours=24), NOW) == 64
 
 
 def test_merge_replays_from_change_and_protects_actual(hass) -> None:
@@ -618,26 +595,65 @@ def test_merge_replays_from_change_and_protects_actual(hass) -> None:
 
 
 @pytest.mark.parametrize(
-    ("cached_channel", "incoming_channel"),
+    ("cached_channels", "incoming_channels"),
     [
-        ("aggregate", "identified-channel"),
-        ("identified-channel", "different-identified-channel"),
+        (("aggregate",), ("identified-channel",)),
+        (("identified-channel",), ("different-identified-channel",)),
+        (("first-channel", "second-channel"), ("first-channel",)),
+        (("first-channel",), ("first-channel", "second-channel")),
     ],
 )
-def test_merge_rejects_channel_identity_drift(
-    hass, cached_channel: str, incoming_channel: str
+def test_merge_takes_the_latest_channels_of_an_hour(
+    hass, cached_channels: tuple[str, ...], incoming_channels: tuple[str, ...]
 ) -> None:
-    coordinator = MeridianDataCoordinator(hass, MagicMock())
-    start = NOW - timedelta(hours=1)
-    cached = _measurement(start, channel=cached_channel)
-    coordinator._merge_measurements(CACHE_KEY, (cached,), NOW, initial_import=True)
+    """
+    The rows fetched for an hour replace its cached rows, whatever their channels.
 
-    with pytest.raises(ValueError, match="identity changed"):
-        coordinator._merge_measurements(
-            CACHE_KEY,
-            (_measurement(start, channel=incoming_channel),),
-            NOW,
-        )
+    Until 0.3.0 a change in an hour's channels failed every sync with
+    unusable data until the cached rows aged out. Joined instead, the
+    hour would count the readings of both fetches.
+    """
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    start = NOW - timedelta(hours=2)
+    later = NOW - timedelta(hours=1)
+    cached = tuple(
+        _measurement(hour, channel=channel)
+        for hour in (start, later)
+        for channel in cached_channels
+    )
+    coordinator._merge_measurements(CACHE_KEY, cached, NOW, initial_import=True)
+
+    incoming = tuple(
+        _measurement(start, channel=channel) for channel in incoming_channels
+    )
+    merged = coordinator._merge_measurements(CACHE_KEY, incoming, NOW)
+
+    assert merged == (
+        *sorted(incoming, key=lambda item: item.channel_id),
+        *sorted(
+            (item for item in cached if item.start == later),
+            key=lambda item: item.channel_id,
+        ),
+    )
+    assert {
+        channel
+        for hour, channel in coordinator._measurement_cache[CACHE_KEY]
+        if hour == start
+    } == set(incoming_channels)
+
+
+def test_merge_of_the_weekly_reconciliation_replays_its_whole_window(hass) -> None:
+    """Unchanged rows are still replayed, from the oldest hour fetched."""
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    rows = tuple(_measurement(NOW - timedelta(hours=offset)) for offset in (3, 2, 1))
+    coordinator._merge_measurements(CACHE_KEY, rows, NOW, initial_import=True)
+
+    assert coordinator._merge_measurements(CACHE_KEY, rows, NOW) == ()
+    assert (
+        coordinator._merge_measurements(CACHE_KEY, rows[1:], NOW, whole_window=True)
+        == rows[1:]
+    )
+    assert coordinator._merge_measurements(CACHE_KEY, (), NOW, whole_window=True) == ()
 
 
 @pytest.mark.asyncio
@@ -959,14 +975,20 @@ async def test_rate_limit_delay_is_passed_to_home_assistant(hass) -> None:
 
 
 @pytest.mark.parametrize(
-    "now",
+    ("now", "hours"),
     [
-        datetime(2026, 4, 4, 13, 30, tzinfo=UTC),
-        datetime(2026, 9, 26, 14, 30, tzinfo=UTC),
+        # 00:30 and 03:30 on 5 April 2026 in New Zealand: the day the clocks
+        # go back, so yesterday and today hold 49 hours.
+        (datetime(2026, 4, 4, 11, 30, tzinfo=UTC), 49),
+        # 03:30 on 27 September 2026, the day the clocks go forward: 47 hours.
+        (datetime(2026, 9, 26, 14, 30, tzinfo=UTC), 47),
     ],
 )
 @pytest.mark.asyncio
-async def test_api_end_date_uses_new_zealand_date_across_dst(hass, now) -> None:
+async def test_tip_window_uses_new_zealand_dates_across_dst(
+    hass, now: datetime, hours: int
+) -> None:
+    """The newest window ends on today's NZ date and is sized by its NZ hours."""
     client = MagicMock()
     client.async_get_measurements = AsyncMock(
         return_value=MagicMock(
@@ -978,13 +1000,17 @@ async def test_api_end_date_uses_new_zealand_date_across_dst(hass, now) -> None:
     with patch(
         "custom_components.meridian_energy.coordinator._utcnow", return_value=now
     ):
-        await coordinator._async_fetch_since(
+        await fetch_since(
+            coordinator,
             account_number="synthetic-account",
             property_id="synthetic-property",
             direction=READING_CONSUMPTION,
             since=now - timedelta(hours=24),
         )
 
-    assert client.async_get_measurements.await_args.kwargs["end_on"] == (
-        now.astimezone(ZoneInfo("Pacific/Auckland")).date().isoformat()
-    )
+    today = now.astimezone(ZoneInfo("Pacific/Auckland")).date()
+    client.async_get_measurements.assert_awaited_once()
+    arguments = client.async_get_measurements.await_args.kwargs
+    assert arguments["start_on"] == today - timedelta(days=1)
+    assert arguments["end_on"] == today
+    assert arguments["last"] == math.ceil(hours * 1.25) + 4
