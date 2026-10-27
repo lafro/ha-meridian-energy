@@ -15,8 +15,9 @@ contained:
 - It listens on 127.0.0.1 only, so nothing but this computer can reach it.
   The web server's settings are written to its store as already confirmed:
   in current releases, settings from YAML are a five-minute trial
-  that falls back to the defaults, which listen on every address. If a check
-  fails at any point, ``start`` stops the instance at once.
+  that falls back to the defaults, which listen on every address. A release
+  that stores them in another form is refused. If a check fails at any point,
+  ``start`` stops the instance at once.
 - Its configuration is not ``default_config``: it loads only what a live test
   needs (the frontend, history, Energy and the integration) on top of the
   integrations Home Assistant always loads. Nothing that discovers or
@@ -25,7 +26,9 @@ contained:
 - Onboarding creates the owner through the API, with a random password that
   is not kept, and skips the step that adds the weather, radio and shopping
   list integrations. A browser on this computer is signed in without a
-  password (the ``trusted_networks`` provider, for 127.0.0.1 only).
+  password (the ``trusted_networks`` provider, for 127.0.0.1 only). So can any
+  other program on this computer, and in principle a web page open in its
+  browser, act as the owner while the instance runs: stop it when done.
 - ``start`` checks all of this, the config entries and what the process
   listens on, before it reports the instance ready.
 - The integration logs at debug level to the instance's own log.
@@ -39,6 +42,7 @@ sign-in. Only uv's package cache outlives it, so the next ``start`` is quick.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import io
 import json
 import os
@@ -55,7 +59,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 ROOT = Path(__file__).resolve().parents[1]
 HOST = "127.0.0.1"
@@ -65,6 +72,9 @@ MARKER = ".live-ha"
 # The first start installs the frontend and the recorder's requirements.
 START_TIMEOUT_S = 900
 STOP_TIMEOUT_S = 60
+# The form of the web-server store this script writes. A release that keeps
+# its settings any other way would ignore it and listen on every address.
+HTTP_STORE_VERSION = (2, 2)
 # Integrations that discover or announce devices, or reach past this
 # computer. None of them may load. (Home Assistant always loads analytics,
 # which sends nothing unless someone opts in, and network, which only lists
@@ -85,6 +95,7 @@ NOT_ALLOWED = frozenset(
         "mobile_app",
         "otbr",
         "radio_browser",
+        "shopping_list",
         "ssdp",
         "thread",
         "usb",
@@ -167,14 +178,18 @@ logger:
 
 
 def run(*args: str | Path, cwd: Path | None = None) -> str:
-    """Run a command, failing on a non-zero exit, and return its output."""
-    result = subprocess.run(  # noqa: S603
-        [str(arg) for arg in args],
-        cwd=cwd,
-        check=True,
-        capture_output=True,
-        text=True,
-    )
+    """Run a command and return its output; stop with its error if it fails."""
+    try:
+        result = subprocess.run(  # noqa: S603
+            [str(arg) for arg in args],
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError as err:
+        command = " ".join(str(arg) for arg in args)
+        raise SystemExit(f"{command} failed: {err.stderr.strip()}") from None
     return result.stdout.strip()
 
 
@@ -185,13 +200,24 @@ def port_in_use(port: int) -> bool:
         return probe.connect_ex((HOST, port)) == 0
 
 
-def alive(pid: int) -> bool:
-    """Return whether process ``pid`` is still running."""
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    return True
+def is_instance(pid: int, state: Path) -> bool:
+    """Return whether ``pid`` is still this instance's Home Assistant."""
+    # A process ID is reused once its process ends, so it is checked against
+    # the command line ``start`` used, never trusted on its own.
+    result = subprocess.run(  # noqa: S603
+        ["ps", "-o", "command=", "-p", str(pid)],  # noqa: S607
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    return str(state / "venv" / "bin" / "hass") in result.stdout
+
+
+def signal_group(pid: int, signum: signal.Signals) -> None:
+    """Signal the process group ``pid`` leads, unless it has already gone."""
+    # macOS refuses to signal a group whose leader has exited.
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pid, signum)
 
 
 def call(
@@ -240,7 +266,14 @@ def install_integration(state: Path, domain: str, ref: str | None) -> str:
         commit = run("git", "rev-parse", "--short", "HEAD", cwd=ROOT)
         dirty = run("git", "status", "--porcelain", "custom_components", cwd=ROOT)
         return f"the working tree at {commit}" + (", with changes" if dirty else "")
-    commit = run("git", "rev-parse", "--short", f"{ref}^{{commit}}", cwd=ROOT)
+    commit = run(
+        "git",
+        "rev-parse",
+        "--verify",
+        "--end-of-options",
+        f"{ref}^{{commit}}",
+        cwd=ROOT,
+    )
     archive = subprocess.run(  # noqa: S603
         ["git", "archive", "--format=tar", commit, f"custom_components/{domain}"],  # noqa: S607
         cwd=ROOT,
@@ -249,7 +282,29 @@ def install_integration(state: Path, domain: str, ref: str | None) -> str:
     ).stdout
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
         tar.extractall(state / "config", filter="data")
-    return f"{ref} ({commit})"
+    return f"{ref} ({commit[:7]})"
+
+
+def http_store_version(python: Path) -> tuple[int, int] | None:
+    """Return the web-server store version of the Home Assistant ``python`` runs."""
+    result = subprocess.run(  # noqa: S603
+        [
+            python,
+            "-c",
+            (
+                "from homeassistant.components.http import config; "
+                "print(config.STORAGE_VERSION, config.STORAGE_MINOR_VERSION)"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    try:
+        major, minor = (int(part) for part in result.stdout.split())
+    except ValueError:
+        return None
+    return major, minor
 
 
 def install_home_assistant(state: Path, version: str | None) -> str:
@@ -261,24 +316,32 @@ def install_home_assistant(state: Path, version: str | None) -> str:
     spec = f"homeassistant=={version}" if version else "homeassistant"
     python = venv / "bin" / "python"
     run("uv", "pip", "install", "--quiet", "--no-config", "--python", python, spec)
-    return run(
+    installed = run(
         python,
         "-c",
         "from homeassistant.const import __version__; print(__version__)",
     )
+    if (stored := http_store_version(python)) != HTTP_STORE_VERSION:
+        raise SystemExit(
+            f"Home Assistant {installed} stores its web-server settings in another "
+            f"form ({stored}), so this script cannot keep it to {HOST}"
+        )
+    return installed
 
 
-def wait_for(pid: int, state: Path, ready: Any, what: str) -> Any:
+def wait_for(
+    running: Callable[[], bool], pid: int, state: Path, ready: Any, what: str
+) -> Any:
     """Poll ``ready`` until it returns a value, while Home Assistant runs."""
     port = int((state / "port").read_text())
     deadline = time.monotonic() + START_TIMEOUT_S
     while time.monotonic() < deadline:
-        if not alive(pid):
+        if not running():
             raise SystemExit(
                 f"Home Assistant stopped while waiting for {what}; "
                 f"see {state / 'hass.out'}"
             )
-        if problems := listening_problems(pid, port):
+        if problems := listening_problems(sockets(pid), port):
             raise SystemExit(f"The instance listens beyond {HOST}:{port}: {problems}")
         try:
             value = ready()
@@ -286,7 +349,7 @@ def wait_for(pid: int, state: Path, ready: Any, what: str) -> Any:
             value = None
         if value:
             return value
-        time.sleep(2)
+        time.sleep(1)
     raise SystemExit(f"Timed out waiting for {what}; see {state / 'hass.out'}")
 
 
@@ -351,11 +414,12 @@ def http_settings(port: int) -> dict[str, Any]:
 
 def write_http_store(config: Path, port: int) -> None:
     """Store the web-server settings as confirmed, so nothing can revert them."""
+    major, minor = HTTP_STORE_VERSION
     (config / ".storage" / "http").write_text(
         json.dumps(
             {
-                "version": 2,
-                "minor_version": 2,
+                "version": major,
+                "minor_version": minor,
                 "key": "http",
                 "data": {
                     "stable": http_settings(port),
@@ -409,8 +473,8 @@ def access_token(state: Path, port: int) -> str:
     return str(tokens["access_token"])
 
 
-def listening_problems(pid: int, port: int) -> list[str]:
-    """Return every socket that listens beyond ``HOST:port`` or for discovery."""
+def sockets(pid: int) -> list[str]:
+    """Return ``lsof``'s lines for the internet sockets ``pid`` has open."""
     lsof = shutil.which("lsof")
     if lsof is None:
         raise SystemExit("lsof is needed to check what the instance listens on")
@@ -420,12 +484,25 @@ def listening_problems(pid: int, port: int) -> list[str]:
         capture_output=True,
         text=True,
     )
+    # lsof exits 1, with no output, when the process has no socket open yet.
+    if result.returncode not in {0, 1}:
+        raise SystemExit(f"lsof failed: {result.stderr.strip()}")
+    return result.stdout.splitlines()[1:]
+
+
+def _socket_fields(line: str) -> tuple[str, str, str]:
+    """Return the protocol, the name and the local address of one lsof line."""
+    fields = line.split()
+    protocol = fields[7] if len(fields) > 7 else ""  # noqa: PLR2004
+    name = " ".join(fields[8:])
+    return protocol, name, name.split("->", 1)[0].split(" ", 1)[0]
+
+
+def listening_problems(lines: list[str], port: int) -> list[str]:
+    """Return every socket that listens beyond ``HOST:port`` or for discovery."""
     problems = []
-    for line in result.stdout.splitlines()[1:]:
-        fields = line.split()
-        protocol = fields[7] if len(fields) > 7 else ""  # noqa: PLR2004
-        name = " ".join(fields[8:])
-        local = name.split("->", 1)[0].split(" ", 1)[0]
+    for line in lines:
+        protocol, name, local = _socket_fields(line)
         if "(LISTEN)" in name and local != f"{HOST}:{port}":
             problems.append(name)
         elif protocol == "UDP" and local.rsplit(":", 1)[-1] in DISCOVERY_PORTS:
@@ -433,10 +510,21 @@ def listening_problems(pid: int, port: int) -> list[str]:
     return problems
 
 
-def check_contained(state: Path, pid: int, port: int, domain: str) -> str:
+def listens_on(lines: list[str], port: int) -> bool:
+    """Return whether the lines show the web server listening on ``HOST:port``."""
+    return any(
+        protocol == "TCP" and name == f"{HOST}:{port} (LISTEN)"
+        for protocol, name, _ in map(_socket_fields, lines)
+    )
+
+
+def check_contained(
+    state: Path, running: Callable[[], bool], pid: int, port: int, domain: str
+) -> str:
     """Fail unless the instance is running, contained and offers the domain."""
     token = access_token(state, port)
     config = wait_for(
+        running,
         pid,
         state,
         lambda: (
@@ -445,6 +533,8 @@ def check_contained(state: Path, pid: int, port: int, domain: str) -> str:
         ),
         "Home Assistant to finish starting",
     )
+    if config.get("recovery_mode"):
+        raise SystemExit("Home Assistant started in recovery mode")
     loaded = {component.split(".", 1)[0] for component in config["components"]}
     if forbidden := sorted(loaded & NOT_ALLOWED):
         raise SystemExit(f"Integrations that must not load are loaded: {forbidden}")
@@ -463,9 +553,27 @@ def check_contained(state: Path, pid: int, port: int, domain: str) -> str:
     )
     if domain not in handlers:
         raise SystemExit(f"{domain} is not offered in Add integration")
-    if problems := listening_problems(pid, port):
+    lines = sockets(pid)
+    if problems := listening_problems(lines, port):
         raise SystemExit(f"The instance listens beyond {HOST}:{port}: {problems}")
+    if not listens_on(lines, port):
+        raise SystemExit(
+            f"lsof does not show the instance listening on {HOST}:{port}, "
+            "so it cannot be shown to be contained"
+        )
     return str(config["version"])
+
+
+def build(state: Path, domain: str, ref: str | None, version: str | None) -> str:
+    """Write the whole instance into ``state``; return the version installed."""
+    source = install_integration(state, domain, ref)
+    say(f"Integration {domain}: {source}")
+    say("Installing Home Assistant (the first run downloads it)...")
+    installed = install_home_assistant(state, version)
+    (state / "config" / "configuration.yaml").write_text(configuration_yaml(domain))
+    write_onboarding_store(state / "config")
+    write_http_store(state / "config", int((state / "port").read_text()))
+    return installed
 
 
 def start(ref: str | None, version: str | None, port: int) -> None:
@@ -481,13 +589,15 @@ def start(ref: str | None, version: str | None, port: int) -> None:
     state.mkdir(mode=0o700)
     (state / MARKER).write_text("Made by scripts/live_ha.py; 'stop' deletes it.\n")
     (state / "port").write_text(str(port))
-    source = install_integration(state, domain, ref)
-    say(f"Integration {domain}: {source}")
-    say("Installing Home Assistant (the first run downloads it)...")
-    installed = install_home_assistant(state, version)
-    (state / "config" / "configuration.yaml").write_text(configuration_yaml(domain))
-    write_onboarding_store(state / "config")
-    write_http_store(state / "config", port)
+    try:
+        installed = build(state, domain, ref, version)
+        # The install can take minutes: if the port was taken meanwhile, Home
+        # Assistant would fall back to its defaults, every address included.
+        if port_in_use(port):
+            raise SystemExit(f"Something started listening on {HOST}:{port}")
+    except BaseException:
+        shutil.rmtree(state)
+        raise
     with (state / "hass.out").open("wb") as out:
         process = subprocess.Popen(  # noqa: S603
             [state / "venv" / "bin" / "hass", "--config", state / "config"],
@@ -497,8 +607,15 @@ def start(ref: str | None, version: str | None, port: int) -> None:
         )
     (state / "hass.pid").write_text(str(process.pid))
     say(f"Starting Home Assistant {installed} (pid {process.pid})...")
+
+    def running() -> bool:
+        # poll() also collects an exited Home Assistant, which a signal-0
+        # probe would still find.
+        return process.poll() is None
+
     try:
         wait_for(
+            running,
             process.pid,
             state,
             lambda: call(port, "GET", "/api/onboarding") is not None,
@@ -507,28 +624,32 @@ def start(ref: str | None, version: str | None, port: int) -> None:
         auth = state / "auth.json"
         auth.write_text(json.dumps({"refresh_token": onboard(port)}))
         auth.chmod(0o600)
-        running = check_contained(state, process.pid, port, domain)
+        running_version = check_contained(state, running, process.pid, port, domain)
     except BaseException:
-        terminate(process.pid)
-        say("Stopped Home Assistant; 'stop' deletes the folder")
+        terminate(process.pid, running)
+        say(f"Stopped Home Assistant; its output is in {state / 'hass.out'}")
+        say("'stop' deletes the folder")
         raise
     url = f"http://{HOST}:{port}"
-    say(f"Home Assistant {running} is running at {url}, reachable from here only.")
+    say(
+        f"Home Assistant {running_version} is running at {url}, "
+        "reachable from here only."
+    )
     say(f"Add the integration: {url}/config/integrations/dashboard/add?domain={domain}")
     say(f"Log: {state / 'config' / 'home-assistant.log'}")
     say("Stop it and delete everything: uv run python scripts/live_ha.py stop")
 
 
-def terminate(pid: int) -> None:
+def terminate(pid: int, running: Callable[[], bool]) -> None:
     """Stop Home Assistant's process group, forcibly if it does not stop."""
-    if not alive(pid):
+    if not running():
         return
-    os.killpg(pid, signal.SIGTERM)
+    signal_group(pid, signal.SIGTERM)
     deadline = time.monotonic() + STOP_TIMEOUT_S
-    while alive(pid) and time.monotonic() < deadline:
-        time.sleep(1)
-    if alive(pid):
-        os.killpg(pid, signal.SIGKILL)
+    while running() and time.monotonic() < deadline:
+        time.sleep(0.5)
+    if running():
+        signal_group(pid, signal.SIGKILL)
 
 
 def remove_entries(state: Path, port: int, domain: str) -> int:
@@ -559,13 +680,15 @@ def stop() -> None:
     port = int((state / "port").read_text())
     pid_file = state / "hass.pid"
     pid = int(pid_file.read_text()) if pid_file.is_file() else None
-    if pid is not None and alive(pid):
+    if pid is not None and is_instance(pid, state):
         try:
             say(f"Removed {remove_entries(state, port, domain)} {domain} entries")
         except (OSError, urllib.error.URLError, KeyError, ValueError) as err:
             say(f"Could not remove the {domain} entries ({err}); deleting anyway")
-        terminate(pid)
+        terminate(pid, lambda: is_instance(pid, state))
         say(f"Stopped Home Assistant (pid {pid})")
+    elif pid is not None:
+        say(f"Home Assistant is not running (pid {pid} is not this instance)")
     if port_in_use(port):
         raise SystemExit(f"Something still listens on {HOST}:{port}; not deleting")
     shutil.rmtree(state)
