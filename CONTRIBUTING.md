@@ -4,7 +4,7 @@
 
 - Python 3.14.2 or newer
 - `uv`
-- A disposable Home Assistant development instance for manual testing
+- `lsof`, for the live test's checks (macOS and most Linux systems have it)
 
 Never use production credentials in automated tests or commit captured Meridian responses. Fixtures must be synthetic and must not contain real account numbers, ICPs, addresses, tokens or usage.
 
@@ -23,6 +23,18 @@ uv run python scripts/check_versions.py
 `uv sync --locked` fails when `uv.lock` is out of date; update it with `uv lock` (or `uv lock --upgrade-package <name>`) rather than editing it. The exact `pytest-homeassistant-custom-component` pin selects the Home Assistant version under test.
 
 Run Hassfest and HACS validation through the GitHub Actions workflow before releasing. The weekly **Compatibility** workflow tests against the newest Home Assistant release and beta.
+
+## Live test
+
+The tests use a fake Meridian. To try the integration against the real service, run a disposable Home Assistant:
+
+```bash
+uv run python scripts/live_ha.py start                 # the working tree
+uv run python scripts/live_ha.py start --ref v0.3.0b1  # or a release tag or commit
+uv run python scripts/live_ha.py stop                  # remove it all
+```
+
+`start` builds a new Home Assistant (the newest release, or `--ha-version`) in a folder of its own in the system's temporary directory, completes onboarding, and checks before it reports ready that the instance listens on 127.0.0.1 only and loads nothing that discovers or announces devices (no `default_config`). Open the printed link, add the integration and sign in with your own MyMeridian email: the browser on the same computer is signed in to the instance without a password, as is any other program on it, so run `stop` as soon as you are done. The integration logs at debug level to the instance's log. `stop` removes the integration's entries, stops Home Assistant and deletes the folder with its database, log and stored session. Never commit anything from a live test.
 
 ## Pull requests
 
