@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import signal
 import subprocess
 import sys
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -96,6 +98,14 @@ def test_the_integration_logs_at_debug_level() -> None:
 
 def test_the_domain_is_the_repositorys_integration() -> None:
     assert live_ha.integration_domain() == DOMAIN
+
+
+def test_the_working_tree_installs_by_default(tmp_path: Path) -> None:
+    source = live_ha.install_integration(tmp_path, DOMAIN, None)
+    assert source.startswith("the working tree at ")
+    manifest = tmp_path / "config" / "custom_components" / DOMAIN / "manifest.json"
+    assert json.loads(manifest.read_text())["domain"] == DOMAIN
+    assert not list(tmp_path.rglob("__pycache__"))
 
 
 def test_a_ref_installs_that_commits_integration(tmp_path: Path) -> None:
@@ -210,10 +220,33 @@ def test_terminate_stops_a_running_group_and_ignores_a_finished_one(
     assert time.monotonic() - started < 5
     # An exited group leader not yet collected: macOS refuses the signal.
     finished = _child(0)
-    time.sleep(0.5)
+    os.waitid(os.P_PID, finished.pid, os.WEXITED | os.WNOWAIT)
     live_ha.signal_group(finished.pid, signal.SIGKILL)
     live_ha.terminate(finished.pid, lambda: finished.poll() is None)
     assert finished.returncode == 0
+
+
+def test_terminate_kills_a_group_that_ignores_sigterm_and_waits_for_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(live_ha, "STOP_TIMEOUT_S", 1)
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "print('ready', flush=True); time.sleep(60)"
+            ),
+        ],
+        stdout=subprocess.PIPE,
+        start_new_session=True,
+    )
+    assert child.stdout is not None
+    assert child.stdout.readline() == b"ready\n"
+    live_ha.terminate(child.pid, lambda: child.poll() is None)
+    assert child.returncode == -signal.SIGKILL
+    child.stdout.close()
 
 
 def test_the_instance_is_recognised_by_its_command_line(tmp_path: Path) -> None:
@@ -222,7 +255,12 @@ def test_the_instance_is_recognised_by_its_command_line(tmp_path: Path) -> None:
     hass.write_text("import time\ntime.sleep(60)\n")
     process = subprocess.Popen([sys.executable, hass], start_new_session=True)
     try:
-        assert live_ha.is_instance(process.pid, tmp_path)
+        assert live_ha.is_instance(process.pid, tmp_path), subprocess.run(
+            ["ps", "-ww", "-o", "command=", "-p", str(process.pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+        ).stdout
         assert not live_ha.is_instance(process.pid, tmp_path / "other")
         assert not live_ha.is_instance(os.getpid(), tmp_path)
     finally:
@@ -317,3 +355,27 @@ def test_a_release_with_another_store_form_is_refused(
     monkeypatch.setattr(live_ha, "http_store_version", lambda _python: None)
     with pytest.raises(SystemExit, match=r"cannot keep it to 127\.0\.0\.1"):
         live_ha.install_home_assistant(tmp_path, "2026.7.2")
+
+
+def test_only_an_unprivileged_port_is_accepted() -> None:
+    assert live_ha.port_number("8124") == 8124
+    for port in ("80", "1023", "65536"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            live_ha.port_number(port)
+    with pytest.raises(SystemExit):
+        live_ha.main(["start", "--port", "80"])
+
+
+def test_requests_to_the_instance_never_use_a_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("http_proxy", "http://proxy.invalid:3128")
+
+    def proxied(opener: urllib.request.OpenerDirector) -> bool:
+        return any(
+            isinstance(handler, urllib.request.ProxyHandler)
+            for handler in opener.handlers
+        )
+
+    assert proxied(urllib.request.build_opener())
+    assert not proxied(live_ha.opener())

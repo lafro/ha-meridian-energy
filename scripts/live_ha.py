@@ -72,6 +72,10 @@ MARKER = ".live-ha"
 # The first start installs the frontend and the recorder's requirements.
 START_TIMEOUT_S = 900
 STOP_TIMEOUT_S = 60
+KILL_TIMEOUT_S = 10
+# Unprivileged ports only: a port Home Assistant cannot bind sends it into
+# recovery mode, whose defaults listen on every address.
+PORTS = range(1024, 65536)
 # The form of the web-server store this script writes. A release that keeps
 # its settings any other way would ignore it and listen on every address.
 HTTP_STORE_VERSION = (2, 2)
@@ -177,20 +181,22 @@ logger:
 """
 
 
-def run(*args: str | Path, cwd: Path | None = None) -> str:
+def run_bytes(*args: str | Path, cwd: Path | None = None) -> bytes:
     """Run a command and return its output; stop with its error if it fails."""
     try:
         result = subprocess.run(  # noqa: S603
-            [str(arg) for arg in args],
-            cwd=cwd,
-            check=True,
-            capture_output=True,
-            text=True,
+            [str(arg) for arg in args], cwd=cwd, check=True, capture_output=True
         )
     except subprocess.CalledProcessError as err:
         command = " ".join(str(arg) for arg in args)
-        raise SystemExit(f"{command} failed: {err.stderr.strip()}") from None
-    return result.stdout.strip()
+        error = err.stderr.decode(errors="replace").strip()
+        raise SystemExit(f"{command} failed: {error}") from None
+    return result.stdout
+
+
+def run(*args: str | Path, cwd: Path | None = None) -> str:
+    """Run a command and return its output as text."""
+    return run_bytes(*args, cwd=cwd).decode().strip()
 
 
 def port_in_use(port: int) -> bool:
@@ -203,9 +209,11 @@ def port_in_use(port: int) -> bool:
 def is_instance(pid: int, state: Path) -> bool:
     """Return whether ``pid`` is still this instance's Home Assistant."""
     # A process ID is reused once its process ends, so it is checked against
-    # the command line ``start`` used, never trusted on its own.
+    # the command line ``start`` used, never trusted on its own. -ww: the
+    # whole command line, which Linux's ps otherwise cuts to 80 columns when
+    # its output is not a terminal.
     result = subprocess.run(  # noqa: S603
-        ["ps", "-o", "command=", "-p", str(pid)],  # noqa: S607
+        ["ps", "-ww", "-o", "command=", "-p", str(pid)],  # noqa: S607
         check=False,
         capture_output=True,
         text=True,
@@ -243,9 +251,16 @@ def call(
     request = urllib.request.Request(
         f"http://{HOST}:{port}{path}", data=body, headers=headers, method=method
     )
-    with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
+    with opener().open(request, timeout=30) as response:
         raw = response.read()
     return json.loads(raw) if raw else None
+
+
+def opener() -> urllib.request.OpenerDirector:
+    """Return an opener that ignores proxy settings."""
+    # Requests to the instance carry the owner's password and tokens, so they
+    # never go through a proxy.
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def client_id(port: int) -> str:
@@ -274,12 +289,14 @@ def install_integration(state: Path, domain: str, ref: str | None) -> str:
         f"{ref}^{{commit}}",
         cwd=ROOT,
     )
-    archive = subprocess.run(  # noqa: S603
-        ["git", "archive", "--format=tar", commit, f"custom_components/{domain}"],  # noqa: S607
+    archive = run_bytes(
+        "git",
+        "archive",
+        "--format=tar",
+        commit,
+        f"custom_components/{domain}",
         cwd=ROOT,
-        check=True,
-        capture_output=True,
-    ).stdout
+    )
     with tarfile.open(fileobj=io.BytesIO(archive)) as tar:
         tar.extractall(state / "config", filter="data")
     return f"{ref} ({commit[:7]})"
@@ -640,16 +657,25 @@ def start(ref: str | None, version: str | None, port: int) -> None:
     say("Stop it and delete everything: uv run python scripts/live_ha.py stop")
 
 
+def gone_within(running: Callable[[], bool], seconds: float) -> bool:
+    """Wait up to ``seconds`` for ``running`` to turn false; return whether it did."""
+    deadline = time.monotonic() + seconds
+    while running():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.5)
+    return True
+
+
 def terminate(pid: int, running: Callable[[], bool]) -> None:
     """Stop Home Assistant's process group, forcibly if it does not stop."""
     if not running():
         return
     signal_group(pid, signal.SIGTERM)
-    deadline = time.monotonic() + STOP_TIMEOUT_S
-    while running() and time.monotonic() < deadline:
-        time.sleep(0.5)
-    if running():
+    if not gone_within(running, STOP_TIMEOUT_S):
         signal_group(pid, signal.SIGKILL)
+        # So that stop sees the port closed once Home Assistant has gone.
+        gone_within(running, KILL_TIMEOUT_S)
 
 
 def remove_entries(state: Path, port: int, domain: str) -> int:
@@ -695,6 +721,15 @@ def stop() -> None:
     say(f"Deleted {state}")
 
 
+def port_number(value: str) -> int:
+    """Return ``value`` as an unprivileged port, or reject it."""
+    port = int(value)
+    if port not in PORTS:
+        message = f"use a port from {PORTS.start} to {PORTS.stop - 1}"
+        raise argparse.ArgumentTypeError(message)
+    return port
+
+
 def main(argv: list[str] | None = None) -> None:
     """Parse the command line and run ``start`` or ``stop``."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0].strip())
@@ -702,7 +737,7 @@ def main(argv: list[str] | None = None) -> None:
     start_parser = commands.add_parser("start", help="build and start an instance")
     start_parser.add_argument("--ref", help="a release tag or commit to test")
     start_parser.add_argument("--ha-version", help="default: the newest release")
-    start_parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    start_parser.add_argument("--port", type=port_number, default=DEFAULT_PORT)
     commands.add_parser("stop", help="stop the instance and delete it")
     args = parser.parse_args(argv)
     if args.command == "start":
