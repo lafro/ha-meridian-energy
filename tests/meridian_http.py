@@ -20,7 +20,7 @@ import asyncio
 import base64
 import json
 import socket
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Self
@@ -156,6 +156,10 @@ def json_response(payload: object, *, status: int = 200) -> Response:
 # A hook may replace the answer to a GraphQL request: it gets the operation
 # name and the request's variables, and returns a response or None.
 Hook = Callable[[str, dict[str, Any]], Response | StalledConnection | None]
+# An auth hook may replace the answer to a request that is not GraphQL: it
+# gets the transport's name for it (``send_code``, ``check_code``,
+# ``session_sign_in`` or ``session_refresh``) and returns a response or None.
+AuthHook = Callable[[str], Response | None]
 
 
 class FakeMeridianSession:
@@ -165,13 +169,29 @@ class FakeMeridianSession:
     ``kraken`` answers the measurements requests; its options shape the
     history. ``posts`` records the URL and operation name of every GraphQL
     request, so a test can check the measurements query's name and URL.
+
+    ``accounts`` are the login's account numbers, each with one property
+    (``account_data``); those in ``feed_in`` also have an active feed-in
+    register, so they have a generation direction. Every account's
+    measurements come from the same ``kraken``. Both may be changed between
+    requests. ``hook`` may replace a GraphQL answer, ``auth_hook`` the
+    answer to a login or session request.
     """
 
     def __init__(
-        self, now: datetime, *, days: int = 100, kraken: FakeKraken | None = None
+        self,
+        now: datetime,
+        *,
+        days: int = 100,
+        kraken: FakeKraken | None = None,
+        accounts: Iterable[str] = (ACCOUNT_NUMBER,),
+        feed_in: Iterable[str] = (),
     ) -> None:
         self.kraken = kraken if kraken is not None else FakeKraken(now, days=days)
+        self.accounts = tuple(accounts)
+        self.feed_in = frozenset(feed_in)
         self.hook: Hook = lambda _operation, _variables: None
+        self.auth_hook: AuthHook = lambda _operation: None
         self.operations: list[str] = []
         self.posts: list[tuple[str, str]] = []
 
@@ -183,28 +203,10 @@ class FakeMeridianSession:
     def post(self, url: str, **kwargs: Any) -> Any:
         """Return the response to one POST."""
         body = kwargs.get("json") or {}
-        if url == AUTH_EMAIL_URL:
-            return json_response({"success": True})
-        if url == AUTH_OTP_URL:
-            return json_response({"customToken": CUSTOM_TOKEN})
-        if url.startswith(FIREBASE_CUSTOM_TOKEN_URL):
-            return json_response(
-                {
-                    "idToken": ID_TOKEN,
-                    "refreshToken": REFRESH_TOKEN,
-                    "expiresIn": "3600",
-                    "localId": "synthetic-user-0123",
-                }
-            )
-        if url.startswith(FIREBASE_REFRESH_URL):
-            return json_response(
-                {
-                    "id_token": ID_TOKEN,
-                    "refresh_token": REFRESH_TOKEN,
-                    "expires_in": "3600",
-                    "user_id": "synthetic-user-0123",
-                }
-            )
+        if (operation := auth_operation(url)) is not None:
+            if (override := self.auth_hook(operation)) is not None:
+                return override
+            return json_response(_AUTH_ANSWERS[operation])
         if url not in {GRAPHQL_URL, MEASUREMENTS_URL}:
             raise AssertionError("unexpected URL")
         return self._graphql(url, body, kwargs)
@@ -226,19 +228,23 @@ class FakeMeridianSession:
             return override
         if operation == "measurements":
             return json_response(self.kraken.graphql(variables))
-        return json_response({"data": self._data(operation)})
+        return json_response({"data": self._data(operation, variables)})
 
-    def _data(self, operation: str) -> dict[str, Any]:
+    def _data(self, operation: str, variables: dict[str, Any]) -> dict[str, Any]:
         if operation == "accountsList":
             return {
                 "viewer": {
                     "accounts": [
-                        {"number": ACCOUNT_NUMBER, "status": "ACTIVE", "id": "1"}
+                        {"number": number, "status": "ACTIVE", "id": str(position)}
+                        for position, number in enumerate(self.accounts, start=1)
                     ]
                 }
             }
         if operation == "account":
-            return {"account": account_data()}
+            number = str(variables["accountNumber"])
+            if number not in self.accounts:
+                raise AssertionError("an account the login does not have")
+            return {"account": account_data(number, feed_in=number in self.feed_in)}
         if operation == "billingPeriods":
             return {"account": billing_data()}
         raise AssertionError(f"unexpected operation {operation}")
@@ -248,32 +254,93 @@ class FakeMeridianSession:
         return self.kraken.payload_dates()
 
 
-def account_data() -> dict[str, Any]:
-    """Return the synthetic account, its property and its meter."""
+def property_id(number: str) -> str:
+    """Return the synthetic property ID of an account."""
+    return PROPERTY_ID if number == ACCOUNT_NUMBER else f"{PROPERTY_ID}-{number}"
+
+
+def property_address(number: str) -> str:
+    """Return the synthetic street address of an account's property."""
+    if number == ACCOUNT_NUMBER:
+        return "1 Synthetic Street"
+    return f"1 Synthetic Street, unit {number}"
+
+
+def account_data(
+    number: str = ACCOUNT_NUMBER, *, feed_in: bool = False
+) -> dict[str, Any]:
+    """
+    Return a synthetic account, its property and its meter.
+
+    With ``feed_in``, the meter also has an active feed-in register, so the
+    property has a generation direction.
+    """
+    registers: list[dict[str, Any]] = [
+        {
+            "identifier": "synthetic-register",
+            "activeFrom": "2020-01-01",
+            "activeTo": None,
+            "isFeedIn": False,
+        }
+    ]
+    if feed_in:
+        registers.append(
+            {
+                "identifier": "synthetic-feed-in-register",
+                "activeFrom": "2020-01-01",
+                "activeTo": None,
+                "isFeedIn": True,
+            }
+        )
     return {
-        "number": ACCOUNT_NUMBER,
+        "number": number,
         "status": "ACTIVE",
         "properties": [
             {
-                "id": PROPERTY_ID,
-                "address": "1 Synthetic Street",
+                "id": property_id(number),
+                "address": property_address(number),
                 "meterPoints": [
                     {
                         "id": "synthetic-meter",
                         "marketIdentifier": "0000000001SYN00",
-                        "registers": [
-                            {
-                                "identifier": "synthetic-register",
-                                "activeFrom": "2020-01-01",
-                                "activeTo": None,
-                                "isFeedIn": False,
-                            }
-                        ],
+                        "registers": registers,
                     }
                 ],
             }
         ],
     }
+
+
+# The answers to the login and session requests, by the transport's name.
+_AUTH_ANSWERS: dict[str, dict[str, Any]] = {
+    "send_code": {"success": True},
+    "check_code": {"customToken": CUSTOM_TOKEN},
+    "session_sign_in": {
+        "idToken": ID_TOKEN,
+        "refreshToken": REFRESH_TOKEN,
+        "expiresIn": "3600",
+        "localId": "synthetic-user-0123",
+    },
+    "session_refresh": {
+        "id_token": ID_TOKEN,
+        "refresh_token": REFRESH_TOKEN,
+        "expires_in": "3600",
+        "user_id": "synthetic-user-0123",
+    },
+}
+
+
+def auth_operation(url: str) -> str | None:
+    """Return the transport's name for a login or session request, or None."""
+    if url == AUTH_EMAIL_URL:
+        return "send_code"
+    if url == AUTH_OTP_URL:
+        return "check_code"
+    if url.startswith(FIREBASE_CUSTOM_TOKEN_URL):
+        return "session_sign_in"
+    if url.startswith(FIREBASE_REFRESH_URL):
+        return "session_refresh"
+    return None
 
 
 def billing_data() -> dict[str, Any]:

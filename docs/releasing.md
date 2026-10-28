@@ -8,9 +8,10 @@
 
 ## Cutting a release (maintainer)
 
-1. Merge the pull request that bumps the version and adds the CHANGELOG section. `main` is squash-only and requires `python`, `hassfest`, `hacs`, `dependency-review`, `Analyze Python`, `secrets` and `private-terms`.
-2. Run the **Release** workflow from `main` with the tag `vX.Y.Z` (or `vX.Y.ZbN` for a beta, below). After the gates pass, the publishing job waits in the `release` environment until the maintainer approves it (the run's **Review deployments** button).
-3. The workflow re-runs every gate without a dependency cache, checks the tag against the committed version and the CHANGELOG, creates the tag on the exact commit it tested, and publishes the release. The release notes are the version's CHANGELOG section, followed by GitHub's generated list of pull requests.
+1. Run the [journeys](../CONTRIBUTING.md#journeys) on the pull request's branch, for a beta and a stable release alike; all six must pass.
+2. Merge the pull request that bumps the version and adds the CHANGELOG section. `main` is squash-only and requires `python`, `hassfest`, `hacs`, `dependency-review`, `Analyze Python`, `secrets` and `private-terms`.
+3. Run the **Release** workflow from `main` with the tag `vX.Y.Z` (or `vX.Y.ZbN` for a beta, below). After the gates pass, the publishing job waits in the `release` environment until the maintainer approves it (the run's **Review deployments** button).
+4. The workflow re-runs every gate without a dependency cache, checks the tag against the committed version and the CHANGELOG, creates the tag on the exact commit it tested, and publishes the release. The release notes are the version's CHANGELOG section, followed by GitHub's generated list of pull requests.
 
 ## Beta pre-releases (maintainer)
 

@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -277,11 +278,13 @@ def test_stop_never_signals_a_process_that_is_not_the_instance(
     (folder / "port").write_text("8124")
     other = _child(60)
     (folder / "hass.pid").write_text(str(other.pid))
-    monkeypatch.setattr(live_ha, "state_dir", lambda _domain: folder)
+    monkeypatch.setattr(live_ha, "state_dir", lambda *_args: folder)
     monkeypatch.setattr(live_ha, "port_in_use", lambda _port: False)
+    seen: list[Path] = []
     try:
-        live_ha.stop()
+        live_ha.stop(before_delete=seen.append)
         assert other.poll() is None
+        assert seen == [folder]
         assert not folder.exists()
     finally:
         os.killpg(other.pid, signal.SIGKILL)
@@ -294,7 +297,7 @@ def test_stop_never_deletes_a_folder_it_did_not_make(
     folder = tmp_path / f"live-ha-{DOMAIN}"
     folder.mkdir()
     (folder / "keep.txt").write_text("not ours")
-    monkeypatch.setattr(live_ha, "state_dir", lambda _domain: folder)
+    monkeypatch.setattr(live_ha, "state_dir", lambda *_args: folder)
     with pytest.raises(SystemExit, match="not made by this script"):
         live_ha.stop()
     assert (folder / "keep.txt").is_file()
@@ -303,7 +306,7 @@ def test_stop_never_deletes_a_folder_it_did_not_make(
 def test_stop_without_an_instance_does_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.setattr(live_ha, "state_dir", lambda _domain: tmp_path / "absent")
+    monkeypatch.setattr(live_ha, "state_dir", lambda *_args: tmp_path / "absent")
     live_ha.stop()
     assert not (tmp_path / "absent").exists()
 
@@ -379,3 +382,196 @@ def test_requests_to_the_instance_never_use_a_proxy(
 
     assert proxied(urllib.request.build_opener())
     assert not proxied(live_ha.opener())
+
+
+def test_the_folder_name_defaults_to_the_live_tests() -> None:
+    assert live_ha.state_dir(DOMAIN).name == f"live-ha-{DOMAIN}"
+    other = live_ha.state_dir(DOMAIN, "journeys")
+    assert other.name == f"journeys-{DOMAIN}"
+    assert other.parent == live_ha.state_dir(DOMAIN).parent
+    assert live_ha.venv_dir(other) == other / "venv"
+    assert live_ha.config_dir(other) == other / "config"
+
+
+def test_the_site_packages_folder_is_the_environments_own() -> None:
+    found = live_ha.site_packages_of(Path(sys.executable))
+    assert found.is_dir()
+    assert found.name == "site-packages"
+
+
+def test_site_files_land_inside_site_packages_only(tmp_path: Path) -> None:
+    live_ha.install_site_files(
+        tmp_path, {"extra.pth": b"import extra\n", "extra/__init__.py": b"X = 1\n"}
+    )
+    assert (tmp_path / "extra.pth").read_bytes() == b"import extra\n"
+    assert (tmp_path / "extra" / "__init__.py").read_bytes() == b"X = 1\n"
+    for escaping in ("/etc/extra.pth", "../extra.pth", "a/../../extra.pth", ""):
+        with pytest.raises(SystemExit, match="Not a path inside"):
+            live_ha.install_site_files(tmp_path / "site", {escaping: b""})
+    assert not (tmp_path / "site").exists()
+
+
+def test_the_integrations_own_entries_can_be_allowed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _instance(tmp_path, monkeypatch, entries=("analytics", "backup", DOMAIN))
+    with pytest.raises(SystemExit, match="Unexpected config entries"):
+        _check(tmp_path)
+    assert (
+        live_ha.check_contained(
+            tmp_path,
+            lambda: True,
+            4242,
+            8124,
+            DOMAIN,
+            allowed_entries=live_ha.SYSTEM_ENTRIES | {DOMAIN},
+        )
+        == "1.0.0"
+    )
+
+
+def _launchable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, events: list[str]
+) -> Path:
+    """Make ``launch`` build nothing and start a sleeping child as Home Assistant."""
+    folder = tmp_path / f"journeys-{DOMAIN}"
+    site = tmp_path / "site-packages"
+    site.mkdir()
+
+    def build(state: Path, _domain: str, _ref: str | None, _version: str | None) -> str:
+        events.append("build")
+        (state / "venv").mkdir()
+        return "1.0.0"
+
+    def spawn(state: Path) -> subprocess.Popen[bytes]:
+        events.append(f"spawn site={sorted(p.name for p in site.iterdir())}")
+        process = _child(60)
+        (state / "hass.pid").write_text(str(process.pid))
+        return process
+
+    def check(
+        *_args: Any, allowed_entries: frozenset[str] = live_ha.SYSTEM_ENTRIES
+    ) -> str:
+        events.append(f"check {sorted(allowed_entries)}")
+        return "1.0.0"
+
+    monkeypatch.setattr(
+        live_ha, "state_dir", lambda _domain, name: tmp_path / f"{name}-{DOMAIN}"
+    )
+    monkeypatch.setattr(live_ha, "build", build)
+    monkeypatch.setattr(live_ha, "site_packages", lambda _state: site)
+    monkeypatch.setattr(live_ha, "spawn", spawn)
+    monkeypatch.setattr(live_ha, "port_in_use", lambda _port: False)
+    monkeypatch.setattr(live_ha, "wait_for", lambda *_args: True)
+    monkeypatch.setattr(live_ha, "onboard", lambda _port: "refresh")
+    monkeypatch.setattr(live_ha, "check_contained", check)
+    return folder
+
+
+def test_launch_writes_site_files_before_home_assistant_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    folder = _launchable(tmp_path, monkeypatch, events)
+    instance = live_ha.launch(
+        None, None, 8125, name="journeys", site_files={"standin.pth": b"import x\n"}
+    )
+    try:
+        assert instance.state == folder
+        assert instance.port == 8125
+        assert instance.running()
+        assert (folder / "port").read_text() == "8125"
+        assert events == [
+            "build",
+            "spawn site=['standin.pth']",
+            "check ['analytics', 'backup']",
+        ]
+        assert json.loads((folder / "auth.json").read_text()) == {
+            "refresh_token": "refresh"
+        }
+    finally:
+        live_ha.terminate(instance.pid, instance.running)
+
+
+def _answering(status: int) -> Any:
+    def call(port: int, method: str, path: str, **_kwargs: Any) -> Any:
+        url = f"http://127.0.0.1:{port}{path}"
+        if status == 0:
+            raise urllib.error.URLError(f"{method} {url}: connection refused")
+        raise urllib.error.HTTPError(url, status, "status", None, None)  # type: ignore[arg-type]
+
+    return call
+
+
+@pytest.mark.parametrize("status", [401, 404])
+def test_any_http_answer_means_the_web_server_is_up(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    monkeypatch.setattr(live_ha, "call", _answering(status))
+    assert live_ha.answers(8125) is True
+
+
+def test_a_refused_connection_is_not_an_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(live_ha, "call", _answering(0))
+    with pytest.raises(urllib.error.URLError, match="refused"):
+        live_ha.answers(8125)
+
+
+def test_relaunch_stops_the_instance_and_starts_it_again_on_its_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(live_ha, "STOP_TIMEOUT_S", 5)
+    _launchable(tmp_path, monkeypatch, events)
+    first = live_ha.launch(None, None, 8125, name="journeys")
+    events.clear()
+    readiness: list[Any] = []
+    monkeypatch.setattr(
+        live_ha, "wait_for", lambda *args: readiness.append(args[3]) or True
+    )
+    again = live_ha.relaunch(first, DOMAIN, live_ha.SYSTEM_ENTRIES | {DOMAIN})
+    try:
+        # Onboarding's API is gone once it is done: any answer will do.
+        monkeypatch.setattr(live_ha, "call", _answering(404))
+        (ready,) = readiness
+        assert ready() is True
+        assert not first.running()
+        assert first.process.returncode == -signal.SIGTERM
+        assert again.running()
+        assert again.state == first.state
+        assert (again.state / "hass.pid").read_text() == str(again.pid)
+        assert events == [
+            "spawn site=[]",
+            f"check ['analytics', 'backup', '{DOMAIN}']",
+        ]
+    finally:
+        live_ha.terminate(again.pid, again.running)
+
+
+def test_relaunch_refuses_while_the_port_stays_taken(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    monkeypatch.setattr(live_ha, "STOP_TIMEOUT_S", 1)
+    _launchable(tmp_path, monkeypatch, events)
+    first = live_ha.launch(None, None, 8125, name="journeys")
+    monkeypatch.setattr(live_ha, "port_in_use", lambda _port: True)
+    with pytest.raises(SystemExit, match="still listens"):
+        live_ha.relaunch(first, DOMAIN)
+    assert not first.running()
+    assert events[-1].startswith("check")
+
+
+def test_stop_finds_an_instance_by_its_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    folders: list[str] = []
+
+    def state_dir(_domain: str, name: str = live_ha.DEFAULT_NAME) -> Path:
+        folders.append(name)
+        return tmp_path / "absent"
+
+    monkeypatch.setattr(live_ha, "state_dir", state_dir)
+    live_ha.stop("journeys")
+    live_ha.stop()
+    assert folders == ["journeys", "live-ha"]

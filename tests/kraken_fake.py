@@ -8,8 +8,10 @@ out of range. So does this fake: a cursor means something only under the
 arguments that issued it. It checks every request the way the integration
 must send it: ``startOn``, ``endOn`` and ``last`` present, a continuation
 page's arguments identical to those of the page that issued its cursor, and
-no cursor sent twice under the same arguments. A breach is recorded in
-``violations`` and raised as an ``AssertionError``.
+no cursor sent twice under the same arguments (unless ``repeat_cursors``,
+for a fake that outlives one sync, as Kraken does: a later sync may page
+through the same window again). A breach is recorded in ``violations`` and
+raised as an ``AssertionError``.
 
 ``startOn`` and ``endOn`` are New Zealand dates, both included: a window's
 rows run from New Zealand midnight at the start of ``startOn`` to midnight
@@ -117,6 +119,7 @@ class FakeKraken:
         pre_supply_start_on: bool = False,
         codes: dict[date, str] | None = None,
         week_codes: dict[date, str] | None = None,
+        repeat_cursors: bool = False,
     ) -> None:
         self.now = now
         if history_start is None:
@@ -142,6 +145,7 @@ class FakeKraken:
         self.pre_supply_start_on = pre_supply_start_on
         self.codes = dict(codes or {})
         self.week_codes = dict(week_codes or {})
+        self.repeat_cursors = repeat_cursors
         # Each request's arguments, without identifiers, and the rows its
         # list held: what Kraken had to build to answer it.
         self.requests: list[dict[str, Any]] = []
@@ -274,7 +278,7 @@ class FakeKraken:
                     "a continuation page whose arguments differ from those of "
                     "the page that issued its cursor"
                 )
-            if (before, arguments) in self._consumed:
+            if (before, arguments) in self._consumed and not self.repeat_cursors:
                 self._violation("a cursor sent twice under the same arguments")
             self._consumed.add((before, arguments))
         return arguments
@@ -325,13 +329,13 @@ class FakeKraken:
             if issued is not None:
                 self.cursors.add(issued)
                 self._issued.add((issued, arguments))
-        self.cursors.update(edge["cursor"] for edge in edges)
+        self.cursors.update(str(edge["cursor"]) for edge in edges)
         return {
             "data": {
                 "account": {
                     "id": "1",
                     "property": {
-                        "id": PROPERTY_ID,
+                        "id": variables.get("propertyId", PROPERTY_ID),
                         "measurements": {
                             "pageInfo": {
                                 "hasNextPage": False,
@@ -369,9 +373,10 @@ class FakeKraken:
                 if RATE_LIMIT_CODE in codes:
                     raise MeridianRateLimitError(DEFAULT_RETRY_AFTER_SECONDS)
                 raise MeridianGraphQLError(operation, codes)
-            return body["data"]
+            data: dict[str, Any] = body["data"]
+            return data
 
-        client._async_graphql = answer  # type: ignore[method-assign]
+        client._async_graphql = answer  # type: ignore[method-assign,assignment]
         return await client.async_get_measurements(**kwargs)
 
     def payload_dates(self) -> set[str]:
