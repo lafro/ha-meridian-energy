@@ -197,6 +197,10 @@ def test_compat_failures_open_a_labelled_tracking_issue() -> None:
     ) in commands
     assert "|| true" not in script
     assert 'gh issue create --title "$title" --body "$body" --label compat' in script
+    # Anyone can open an issue with the title, so the tracking issue is found
+    # by its label and by the bot that opened it, never by title alone.
+    assert "issues?state=open&labels=compat&creator=github-actions%5Bbot%5D" in script
+    assert "--search" not in script
 
 
 def test_workflow_actions_are_pinned_to_commit_shas() -> None:
