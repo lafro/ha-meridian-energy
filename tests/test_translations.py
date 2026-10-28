@@ -258,34 +258,41 @@ def test_flow_form_steps_have_strings_and_methods() -> None:
     assert steps.keys() <= step_methods
 
 
-def test_the_setup_time_limit_is_5_minutes_wherever_it_is_stated() -> None:
-    """
-    The setup cap is 300 s, and the dialog and README say 5 minutes.
+def _texts(value: Any) -> list[str]:
+    if isinstance(value, dict):
+        return [text for item in value.values() for text in _texts(item)]
+    return [value] if isinstance(value, str) else []
 
-    Every test of the cap patches it to a moment, so without this a change to
-    the constant would leave the progress text, the import_timeout error and
-    the README naming the old limit. Each also says that the time Home
-    Assistant takes to save an import is not counted, since setup's limit
-    moves on by it (the coordinator's ``_async_uncounted``): the 5 minutes
-    are not the longest setup can take. The progress text names the
-    import's own 4 minutes too (``SETUP_IMPORT_BUDGET_SECONDS``), which end
-    it with what it imported, as the 5 minutes, a backstop, do not; an
-    import they end with nothing fails as Meridian not answering in time,
-    not with ``import_timeout``.
+
+def test_the_setup_time_limits_are_stated_in_the_readme_not_the_dialog() -> None:
+    """
+    The setup cap is 300 s and the import's own budget 240 s: the README says so.
+
+    The setup dialog says what is happening and what to do, in a sentence or
+    two; the detail is in the README, which the dialog's help link opens. So
+    no dialog text names either limit, and a change to a constant leaves none
+    stating the old one. The README also says that the time Home Assistant
+    takes to save an import is not counted, since setup's limit moves on by it
+    (the coordinator's ``_async_uncounted``): the 5 minutes are not the
+    longest setup can take. It names the import's own 4 minutes too
+    (``SETUP_IMPORT_BUDGET_SECONDS``), which end it with what it imported, as
+    the 5 minutes, a backstop, do not.
     """
     assert SETUP_IMPORT_TIMEOUT_SECONDS == 300
     assert SETUP_IMPORT_BUDGET_SECONDS == 240
-    stated = f"after {SETUP_IMPORT_TIMEOUT_SECONDS // 60} minutes"
-    uncounted = f"{stated}, not counting the time Home Assistant takes to save it"
+    limit = f"{SETUP_IMPORT_TIMEOUT_SECONDS // 60} minutes"
     budget = f"{SETUP_IMPORT_BUDGET_SECONDS // 60} minutes"
-    config = _source_strings()["config"]
-    for text in (
-        config["error"]["import_timeout"],
-        config["progress"]["initial_import"],
-    ):
-        assert uncounted in text
-        assert "the longest it waits" not in text
-    assert budget in config["progress"]["initial_import"]
+    for text in _texts(_source_strings()["config"]):
+        assert limit not in text
+        assert budget not in text
+    uncounted = f"after {limit}, not counting the time Home Assistant takes to save it"
     readme = (_INTEGRATION_DIR.parents[1] / "README.md").read_text()
     assert f"still running {uncounted}" in readme
     assert f"The import has {budget}" in readme
+
+
+def test_the_setup_dialog_is_brief() -> None:
+    """Each setup text is a sentence or two: the README has the detail."""
+    config = _source_strings()["config"]
+    for text in _texts(config):
+        assert len(text) <= 250, text
