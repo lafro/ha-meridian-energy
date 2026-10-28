@@ -16,7 +16,7 @@ dev = [
   # The test harness pins Home Assistant exactly, so this one pin selects the
   # Home Assistant version under test. Bump it rather than adding a separate
   # homeassistant pin, which the harness pin would contradict.
-  "pytest-homeassistant-custom-component==0.13.370",
+  "pytest-homeassistant-custom-component==0.13.375",
   "ruff>=0.12.0",
   "syrupy>=6.1.1"
 ]
