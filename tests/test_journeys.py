@@ -287,7 +287,15 @@ def test_progress_abort_and_entry_screens_are_rendered() -> None:
         _TRANSLATIONS,
     )
     assert form.fields == ("otp",)
-    assert form.missing == ("step.otp.title", "step.otp.data.otp")
+    assert form.missing == ("component.meridian_energy.title", "step.otp.data.otp")
+
+
+def test_a_form_without_its_own_title_shows_the_integrations() -> None:
+    words = {**_TRANSLATIONS, "component.meridian_energy.title": "Meridian Energy"}
+    form = journeys.render(
+        {"type": "form", "handler": "meridian_energy", "step_id": "untitled"}, words
+    )
+    assert (form.title, form.missing) == ("Meridian Energy", ())
 
 
 def test_a_screen_with_an_unfilled_placeholder_lacks_its_words() -> None:
@@ -320,7 +328,7 @@ def test_field_labels_come_from_the_handlers_words() -> None:
     )
     assert screen.fields == ("Continue without history",)
     assert screen.missing == (
-        "step.import_failed.title",
+        "component.meridian_energy.title",
         "error.retry_too_soon",
     )
 
@@ -420,7 +428,7 @@ class _Client:
     def __init__(self, answers: dict[str, Any] | None = None) -> None:
         self.answers = answers or {}
         self.sent: list[str] = []
-        self.translated: list[str] = []
+        self.translated: list[tuple[str, str]] = []
 
     def rest(self, method: str, path: str, data: dict[str, Any] | None = None) -> Any:
         del data
@@ -433,8 +441,9 @@ class _Client:
     def ws(self, *messages: dict[str, Any]) -> list[Any]:
         assert messages[0]["type"] == "frontend/get_translations"
         (domain,) = messages[0]["integration"]
-        self.translated.append(domain)
-        prefix = f"component.{domain}."
+        category = messages[0]["category"]
+        self.translated.append((domain, category))
+        prefix = f"component.{domain}.{category}."
         return [
             {
                 "resources": {
@@ -544,7 +553,11 @@ def test_a_screen_from_another_translation_domain_uses_its_words(
             "translation_domain": "homeassistant",
         }
     )
-    assert client.translated == ["meridian_energy", "homeassistant"]
+    assert client.translated == [
+        ("meridian_energy", "config"),
+        ("meridian_energy", "title"),
+        ("homeassistant", "config"),
+    ]
 
 
 def test_a_screen_without_its_words_fails_the_journey(tmp_path: Path) -> None:
@@ -709,6 +722,28 @@ def test_a_journey_that_crashes_fails_and_the_next_one_runs(
     assert journeys.summary(run.results, 2) == "1 of 2 journeys passed"
 
 
+def test_a_journey_whose_clean_up_fails_fails_and_the_next_one_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(_self: Journey) -> None:
+        raise ValueError("Expecting value: line 1 column 1 (char 0)")
+
+    monkeypatch.setattr(journeys, "first_setup", lambda j: j.check("ok", ok=True))
+    monkeypatch.setattr(journeys, "two_accounts", lambda j: j.check("ok", ok=True))
+    monkeypatch.setattr(Journey, "remove_entries", broken)
+    run = journeys.Run(live_ha.Instance(tmp_path, 8125, None, "1"), tmp_path)  # type: ignore[arg-type]
+    failed = run.run("first_setup")
+    assert not failed.ok
+    assert failed.error == (
+        "the clean-up failed: ValueError: Expecting value: line 1 column 1 (char 0)"
+    )
+    monkeypatch.setattr(Journey, "remove_entries", lambda _self: None)
+    assert run.run("two_accounts").ok
+    assert journeys.summary(run.results, 2, 1) == (
+        "1 of 2 journeys passed; FAIL: the stand-in refused 1"
+    )
+
+
 def test_an_interrupted_journey_fails_and_stops_the_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -794,10 +829,29 @@ def test_a_run_never_takes_over_an_existing_instance(
     (tmp_path / "state").mkdir()
     monkeypatch.setattr(live_ha, "state_dir", lambda *_args: tmp_path / "state")
     monkeypatch.setattr(live_ha, "stop", _stop(stopped, tmp_path / "state"))
-    with pytest.raises(SystemExit, match="another run may be using it"):
+    with pytest.raises(SystemExit, match="left by a run that was killed"):
         journeys.main([])
     assert stopped == []
     assert (tmp_path / "state").is_dir()
+
+
+def test_nothing_starts_while_another_run_holds_the_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stopped: list[str] = []
+    launched: list[bool] = []
+    monkeypatch.setattr(live_ha, "state_dir", lambda *_args: tmp_path / "state")
+    monkeypatch.setattr(live_ha, "stop", _stop(stopped, tmp_path / "state"))
+    monkeypatch.setattr(live_ha, "launch", lambda *_a, **_k: launched.append(True))
+    with journeys.only_run(tmp_path / "state"):
+        for argv in ([], ["--clean-up"]):
+            with pytest.raises(SystemExit, match="Another run is using"):
+                journeys.main(argv)
+    assert stopped == []
+    assert launched == []
+    # Released with the run: a clean-up can go ahead.
+    assert journeys.main(["--clean-up"]) == 0
+    assert stopped == ["journeys"]
 
 
 def test_a_run_reports_and_exits_non_zero_when_a_journey_fails(
@@ -874,8 +928,10 @@ def test_a_refusal_after_the_last_check_fails_the_run(
     assert journeys.main(["--only", "first_setup"]) == 1
     out = capsys.readouterr().out
     assert "FAIL the stand-in refused 1: t connection 192.0.2.1" in out
+    assert "1 of 1 journeys passed; FAIL: the stand-in refused 1" in out
     (report,) = tmp_path.glob("meridian-journeys-*.md")
     assert "Refused by the stand-in: 1: t connection 192.0.2.1" in report.read_text()
+    assert "Result: 1 of 1 journeys passed; FAIL" in report.read_text()
 
 
 def test_the_journeys_refuse_another_integration(

@@ -6,6 +6,8 @@ import errno
 import json
 import os
 import socket
+import subprocess
+import sys
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -349,4 +351,30 @@ def test_the_interpreter_exits_when_the_stand_in_cannot_be_installed(
     exits: list[int] = []
     meridian_standin.install_or_exit(exits.append)
     assert exits == [meridian_standin.EXIT_NOT_INSTALLED]
-    assert meridian_standin.PTH_LINE.startswith("import meridian_standin;")
+
+
+def _start_with_pth(site: Path, module: str) -> subprocess.CompletedProcess[str]:
+    """Start an interpreter that reads the .pth line from ``site``."""
+    (site / f"{meridian_standin.PACKAGE}.py").write_text(module)
+    (site / f"{meridian_standin.PACKAGE}.pth").write_text(meridian_standin.PTH_LINE)
+    code = f"import site; site.addsitedir({str(site)!r}); print('started')"
+    return subprocess.run(
+        [sys.executable, "-I", "-c", code],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+
+def test_the_pth_line_installs_the_stand_in(tmp_path: Path) -> None:
+    done = _start_with_pth(tmp_path, "def install_or_exit():\n    print('installed')\n")
+    assert (done.returncode, done.stdout) == (0, "installed\nstarted\n")
+
+
+def test_the_interpreter_exits_when_the_stand_in_cannot_be_imported(
+    tmp_path: Path,
+) -> None:
+    done = _start_with_pth(tmp_path, "raise ImportError('broken')\n")
+    assert done.returncode == meridian_standin.EXIT_NOT_INSTALLED
+    assert "started" not in done.stdout
