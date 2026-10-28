@@ -515,6 +515,7 @@ class Journey:
     folder: Path
     result: JourneyResult
     translations: dict[str, str] = field(default_factory=dict)
+    translated: set[str] = field(default_factory=set)
     entries: list[str] = field(default_factory=list)
     flows: list[str] = field(default_factory=list)
 
@@ -535,16 +536,20 @@ class Journey:
 
     def screen(self, result: dict[str, Any]) -> Screen:
         """Record a screen the journey met."""
-        if not self.translations:
-            (loaded,) = self.client.ws(
-                {
-                    "type": "frontend/get_translations",
-                    "language": "en",
-                    "category": "config",
-                    "integration": [DOMAIN],
-                }
-            )
-            self.translations = dict(loaded["resources"])
+        # Like the dialog: the integration's texts, plus those of any translation_domain
+        # a step names (Home Assistant's own for "reauth_successful", for example).
+        for domain in (DOMAIN, result.get("translation_domain")):
+            if domain and domain not in self.translated:
+                (loaded,) = self.client.ws(
+                    {
+                        "type": "frontend/get_translations",
+                        "language": "en",
+                        "category": "config",
+                        "integration": [domain],
+                    }
+                )
+                self.translations.update(loaded["resources"])
+                self.translated.add(domain)
         shown = render(result, self.translations)
         self.result.screens.append(shown)
         say(

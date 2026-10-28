@@ -204,6 +204,7 @@ _TRANSLATIONS = {
     "component.meridian_energy.config.progress.initial_import": "Importing.",
     "component.meridian_energy.config.create_entry.partial": "In the background.",
     "component.meridian_energy.config.abort.login_expired": "Expired.",
+    "component.homeassistant.config.abort.reauth_successful": "Signed in again.",
 }
 
 
@@ -368,6 +369,7 @@ class _Client:
     def __init__(self, answers: dict[str, Any] | None = None) -> None:
         self.answers = answers or {}
         self.sent: list[str] = []
+        self.translated: list[str] = []
 
     def rest(self, method: str, path: str, data: dict[str, Any] | None = None) -> Any:
         del data
@@ -379,7 +381,16 @@ class _Client:
 
     def ws(self, *messages: dict[str, Any]) -> list[Any]:
         assert messages[0]["type"] == "frontend/get_translations"
-        return [{"resources": _TRANSLATIONS}]
+        (domain,) = messages[0]["integration"]
+        self.translated.append(domain)
+        prefix = f"component.{domain}."
+        return [
+            {
+                "resources": {
+                    k: v for k, v in _TRANSLATIONS.items() if k.startswith(prefix)
+                }
+            }
+        ]
 
 
 def _journey(folder: Path, client: Any = None) -> Journey:
@@ -442,6 +453,35 @@ def test_screens_are_rendered_with_the_instances_translations(tmp_path: Path) ->
     )
     assert shown.text == "Expired."
     assert journey.result.screens == [shown]
+
+
+def test_a_screen_from_another_translation_domain_uses_its_words(
+    tmp_path: Path,
+) -> None:
+    client = _Client()
+    journey = _journey(tmp_path, client)
+    journey.screen(
+        {"type": "abort", "handler": "meridian_energy", "reason": "login_expired"}
+    )
+    shown = journey.screen(
+        {
+            "type": "abort",
+            "handler": "meridian_energy",
+            "reason": "reauth_successful",
+            "translation_domain": "homeassistant",
+        }
+    )
+    assert shown.text == "Signed in again."
+    assert not shown.missing
+    journey.screen(
+        {
+            "type": "abort",
+            "handler": "meridian_energy",
+            "reason": "reauth_successful",
+            "translation_domain": "homeassistant",
+        }
+    )
+    assert client.translated == ["meridian_energy", "homeassistant"]
 
 
 def test_a_screen_without_its_words_fails_the_journey(tmp_path: Path) -> None:
