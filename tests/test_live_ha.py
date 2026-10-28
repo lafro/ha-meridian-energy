@@ -9,6 +9,7 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -490,6 +491,30 @@ def test_launch_writes_site_files_before_home_assistant_starts(
         live_ha.terminate(instance.pid, instance.running)
 
 
+def _answering(status: int) -> Any:
+    def call(port: int, method: str, path: str, **_kwargs: Any) -> Any:
+        url = f"http://127.0.0.1:{port}{path}"
+        if status == 0:
+            raise urllib.error.URLError(f"{method} {url}: connection refused")
+        raise urllib.error.HTTPError(url, status, "status", None, None)  # type: ignore[arg-type]
+
+    return call
+
+
+@pytest.mark.parametrize("status", [401, 404])
+def test_any_http_answer_means_the_web_server_is_up(
+    monkeypatch: pytest.MonkeyPatch, status: int
+) -> None:
+    monkeypatch.setattr(live_ha, "call", _answering(status))
+    assert live_ha.answers(8125) is True
+
+
+def test_a_refused_connection_is_not_an_answer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(live_ha, "call", _answering(0))
+    with pytest.raises(urllib.error.URLError, match="refused"):
+        live_ha.answers(8125)
+
+
 def test_relaunch_stops_the_instance_and_starts_it_again_on_its_folder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -498,8 +523,16 @@ def test_relaunch_stops_the_instance_and_starts_it_again_on_its_folder(
     _launchable(tmp_path, monkeypatch, events)
     first = live_ha.launch(None, None, 8125, name="journeys")
     events.clear()
+    readiness: list[Any] = []
+    monkeypatch.setattr(
+        live_ha, "wait_for", lambda *args: readiness.append(args[3]) or True
+    )
     again = live_ha.relaunch(first, DOMAIN, live_ha.SYSTEM_ENTRIES | {DOMAIN})
     try:
+        # Onboarding's API is gone once it is done: any answer will do.
+        monkeypatch.setattr(live_ha, "call", _answering(404))
+        (ready,) = readiness
+        assert ready() is True
         assert not first.running()
         assert first.process.returncode == -signal.SIGTERM
         assert again.running()

@@ -307,6 +307,19 @@ def opener() -> urllib.request.OpenerDirector:
     return urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
+def answers(port: int) -> bool:
+    """
+    Return whether the web server answers, whatever the status.
+
+    Once onboarding is done its API is gone (404) and the rest of the API
+    needs a token (401), so any HTTP answer means the server is up; a
+    refused connection raises.
+    """
+    with contextlib.suppress(urllib.error.HTTPError):
+        call(port, "GET", "/api/")
+    return True
+
+
 def client_id(port: int) -> str:
     """Return the OAuth client id the instance's own frontend uses."""
     return f"http://{HOST}:{port}/"
@@ -761,11 +774,7 @@ def relaunch(
     say(f"Starting Home Assistant again (pid {again.pid})...")
     try:
         wait_for(
-            again.running,
-            again.pid,
-            state,
-            lambda: call(port, "GET", "/api/onboarding") is not None,
-            "the web server",
+            again.running, again.pid, state, lambda: answers(port), "the web server"
         )
         again.version = check_contained(
             state,
