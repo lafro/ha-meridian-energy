@@ -36,7 +36,7 @@ Requires Home Assistant 2026.10.0 or newer.
 
 ### Changed
 
-- The setup screens are short: each says what is happening and what to do in a sentence or two, and the detail is in [Limitations and troubleshooting](README.md#limitations-and-troubleshooting).
+- The setup screens are short: each says what is happening and what to do in a sentence or two, and the detail is in [Limitations and troubleshooting](https://github.com/lafro/ha-meridian-energy#limitations-and-troubleshooting).
 - Requests for usage history now wait up to 75 seconds for Meridian's answer instead of 30, so a slow answer is no longer cut off before the gateway timeout that Meridian's service has been seen to give after about a minute. Every other request still waits 30 seconds, and making the connection has a limit of its own, 20 seconds. Requests for usage history start at least a second apart, and go out under the same name as those of MyMeridian's web app.
 - Hourly updates now have a time limit of 4 minutes: no request starts once less than 80 seconds of it remain, and what came back before is imported. An update that reaches back more than 14 days, as for a first import or after a long outage, has 15 minutes instead. The time Home Assistant takes to save and confirm an import does not count towards either, or towards setup's limits. The grid imports and exports an update did not reach go first at the next one.
 - When Meridian's service does not answer in time, or answers with a server error (HTTP 408 or 5xx), the setup dialog now says so instead of giving the general message about reaching Meridian, and the history-import failure form and the integration's error messages give the HTTP status. The connection error message no longer suggests checking your internet connection, because the same error also covers errors returned by Meridian's service.
@@ -47,7 +47,7 @@ Requires Home Assistant 2026.10.0 or newer.
 - Diagnostics now show each property's grid import and export: whether it is working, failing or degraded, the reconciliation it still owes, how long it waits before it is tried again, how many updates in a row ran out of time before reaching it, why it last failed (the kind of failure, the error's type, its HTTP status and how long ago), whether its history reaches back as far as the updates complete it (`reaches_target`), and whether Meridian showed where it starts (`history_start_found`), as yes or no, never a number of days. They also report how many days and weeks of history the last update asked for, how many further pages it needed, how many readings came from before their week, and whether it stopped at a gap in stored history, instead of the requested window's start and end.
 - A correction made with **Adjust sum** in **Settings → Tools → Statistics** on hours an import writes again is undone: in the last 14 days at every restart or reload of the integration, as before, and now at the weekly reconciliation too, and from the first hour to the hour after the last of each week the updates fill in or correct. One made on other hours is kept. Running totals an earlier version left inconsistent are not searched for or repaired, but those in the hours an import writes again are written consistently.
 - An import that finds statistics stored before it but no running total to continue in the 800 days before it, as from another tool or an installation long ago, is refused, with a warning, and imports nothing, rather than start the running total again from zero above them. Setup's dialog, the integration's error message and diagnostics (`statistics_refused`) say so, and trying again gives the same result until those statistics are deleted in **Settings → Tools → Statistics**. Diagnostics give `statistics_write` when Home Assistant did not confirm an import.
-- The setup dialog's progress now shows how many weeks of history are done, and says that closing the dialog cancels the import. Closing it still cancels setup and removes the statistics it created, and now logs one warning once that removal has finished or been queued.
+- Closing the setup dialog during the import still cancels setup and removes the statistics it created, and now logs one warning once that removal has finished or been queued.
 - The account selection during setup now points to **Reconfigure** for changing it later; it named a **Configure** button the integration does not have.
 - Session tokens are left out of the integration's internal text representation of a login, so they cannot reach a log by accident.
 - Rolling back to an earlier version keeps the running totals consistent, but leaves an incomplete history as it is: earlier versions ask only for the hours after the newest one stored and for the last 14 days, so a gap before those stays, and the **Current bill** sensors stay unknown for a billing period with a gap. Let the history fill in first (diagnostics show `reaches_target` for each grid import and export), then roll back.
@@ -56,6 +56,8 @@ Requires Home Assistant 2026.10.0 or newer.
 
 - Tests run the integration against a synthetic Meridian service, at the HTTP level and on a real recorder, and check that no log line holds an identifier, a cursor or a date, and that every translation key the code uses exists.
 - CI also scans the repository for secrets and checks its content, and the release job waits for the maintainer's approval.
+- Tests run against Home Assistant 2026.10.4 (pytest-homeassistant-custom-component 0.13.375).
+- Before each release, end-to-end journeys run setup and the entry's lifecycle in a disposable Home Assistant against a stand-in Meridian, and a new installation can be tried there with a real sign-in, as `CONTRIBUTING.md` describes.
 
 ## 0.2.6
 
@@ -77,7 +79,7 @@ Requires Home Assistant 2026.10.0 or newer.
 
 ### Maintenance
 
-- Tests run against Home Assistant 2026.10.4 (pytest-homeassistant-custom-component 0.13.375), plus a weekly compatibility run against the newest release and beta.
+- Tests run against Home Assistant 2026.10 (pytest-homeassistant-custom-component 0.13.370), plus a weekly compatibility run against the newest release and beta.
 - Dependabot uses the `uv` ecosystem, so updates change `uv.lock` together with `pyproject.toml`, and CI installs with `uv sync --locked`.
 - Development dependencies upgraded; the Pillow and PyJWT overrides were removed because Home Assistant 2026.10 pins patched versions.
 - Release notes are this file's section for the version, and CI fails when the version has no section here.
