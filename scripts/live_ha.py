@@ -843,8 +843,15 @@ def remove_entries(state: Path, port: int, domain: str) -> int:
     return len(entries)
 
 
-def stop(name: str = DEFAULT_NAME) -> None:
-    """Remove the integration, stop the instance and delete its folder."""
+def stop(
+    name: str = DEFAULT_NAME, before_delete: Callable[[Path], None] | None = None
+) -> None:
+    """
+    Remove the integration, stop the instance and delete its folder.
+
+    ``before_delete`` is given the instance's folder once Home Assistant has
+    stopped, before the folder is deleted.
+    """
     domain = integration_domain()
     state = state_dir(domain, name)
     if not state.exists():
@@ -866,6 +873,8 @@ def stop(name: str = DEFAULT_NAME) -> None:
         say(f"Home Assistant is not running (pid {pid} is not this instance)")
     if port_in_use(port):
         raise SystemExit(f"Something still listens on {HOST}:{port}; not deleting")
+    if before_delete is not None:
+        before_delete(state)
     shutil.rmtree(state)
     say(f"Deleted {state}")
 

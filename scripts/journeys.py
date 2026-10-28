@@ -15,9 +15,12 @@ and on its own port (8125 by default), so they never meet a live test.
 
 Meridian is never contacted. A stand-in (``tests/meridian_standin.py``),
 installed in the instance's environment before Home Assistant first starts,
-answers the integration's requests from the tests' own fake, refuses every
-other request that would leave this computer and records it, with its host
-only. Every value is synthetic, and so is the sign-in: there is none.
+answers the integration's requests from the tests' own fake. In Home
+Assistant's process it refuses every other TCP connection and name lookup
+that would leave this computer, and records it with its host only. Every
+value is synthetic, and so is the sign-in: there is none. Building the
+instance, and Home Assistant's first start, download Home Assistant and the
+requirements it pins from PyPI, as for the live test.
 
 Each journey drives Home Assistant through its REST and websocket APIs, as
 the frontend would, with the owner's token, and checks what came of it: the
@@ -38,6 +41,7 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import re
 import sys
 import tempfile
 import time
@@ -75,6 +79,8 @@ RETRY_DELAY = timedelta(seconds=120)
 RETRY_MARGIN = timedelta(seconds=3)
 # The first update after an import asks for the newest day or two: the tip.
 TIP_DAYS = 2
+# A restart's update asks again for the last 14 days (README, "Data timing").
+CORRECTION_DAYS = 14
 TWO_DEVICES = 2
 HTTP_OK = 200
 OTP = "123456"
@@ -263,6 +269,8 @@ def history_problems(
 
 def changed_rows(before: Sequence[Row], after: Sequence[Row]) -> list[str]:
     """Return every hour of ``before`` that ``after`` lost or holds otherwise."""
+    if not before:
+        return ["no hours to compare"]
     now = {row.start: row for row in after}
     changed: list[str] = []
     for row in before:
@@ -320,18 +328,28 @@ def fill(text: str, placeholders: dict[str, Any] | None) -> str:
     return text
 
 
+_PLACEHOLDER = re.compile(r"\{\w+\}")
+
+
 def render(result: dict[str, Any], translations: dict[str, str]) -> Screen:
     """Return a flow result as Home Assistant's dialog shows it."""
-    domain = result.get("translation_domain") or result.get("handler") or DOMAIN
+    handler = result.get("handler") or DOMAIN
+    domain = result.get("translation_domain") or handler
     base = f"component.{domain}.config"
     placeholders = result.get("description_placeholders")
     missing: list[str] = []
 
     def text(key: str, *, required: bool = True) -> str:
+        short = key.removeprefix(f"component.{handler}.config.")
+        short = short.removeprefix(f"{base}.")
         if key in translations:
-            return fill(translations[key], placeholders)
+            filled = fill(translations[key], placeholders)
+            if unfilled := _PLACEHOLDER.findall(filled):
+                # The dialog shows a translation error instead.
+                missing.append(f"{short} (no value for {', '.join(unfilled)})")
+            return filled
         if required:
-            missing.append(key.removeprefix(f"{base}."))
+            missing.append(short)
         return ""
 
     kind = str(result.get("type"))
@@ -343,8 +361,10 @@ def render(result: dict[str, Any], translations: dict[str, str]) -> Screen:
         body = text(f"{base}.step.{step}.description", required=False)
         if base_error := (result.get("errors") or {}).get("base"):
             error = text(f"{base}.error.{base_error}") or str(base_error)
+        # Field labels come from the handler's texts alone, as in the dialog.
         fields = tuple(
-            text(f"{base}.step.{step}.data.{item['name']}") or str(item["name"])
+            text(f"component.{handler}.config.step.{step}.data.{item['name']}")
+            or str(item["name"])
             for item in result.get("data_schema") or []
         )
     elif kind == "progress":
@@ -368,6 +388,15 @@ def offered(result: dict[str, Any], name: str) -> list[str]:
         if item.get("name") == name:
             select = (item.get("selector") or {}).get("select") or {}
             return [str(option["value"]) for option in select.get("options", [])]
+    return []
+
+
+def preselected(result: dict[str, Any], name: str) -> list[str]:
+    """Return the values a form's field starts with."""
+    for item in result.get("data_schema") or []:
+        if item.get("name") == name:
+            default = item.get("default") or []
+            return [str(value) for value in default]
     return []
 
 
@@ -402,12 +431,19 @@ class JourneyResult:
         )
 
 
-def markdown(results: Sequence[JourneyResult], header: dict[str, str]) -> str:
-    """Return the run's report."""
+def summary(results: Sequence[JourneyResult], wanted: int) -> str:
+    """Return the run's result in a line; a journey that never ran did not pass."""
     passed = sum(result.ok for result in results)
+    return f"{passed} of {max(wanted, len(results))} journeys passed"
+
+
+def markdown(
+    results: Sequence[JourneyResult], header: dict[str, str], wanted: int = 0
+) -> str:
+    """Return the run's report."""
     lines = ["# Meridian Energy journeys", ""]
     lines += [f"- {name}: {value}" for name, value in header.items()]
-    lines += [f"- Result: {passed} of {len(results)} journeys passed", ""]
+    lines += [f"- Result: {summary(results, wanted)}", ""]
     for result in results:
         lines.append(
             f"## {'PASS' if result.ok else 'FAIL'}: {result.title} "
@@ -507,6 +543,12 @@ def wait(what: str, ready: Callable[[], Any], timeout: float) -> Any:
 # -------------------------------------------------------------------- journey
 
 
+def read_refused(folder: Path) -> list[str]:
+    """Return the stand-in's record of what it refused in this run, a line each."""
+    path = folder / standin.REFUSED
+    return path.read_text().splitlines() if path.is_file() else []
+
+
 @dataclass(slots=True)
 class Journey:
     """One journey's context: the instance, the stand-in and what it found."""
@@ -575,8 +617,7 @@ class Journey:
         records = [json.loads(line) for line in path.read_text().splitlines() if line]
         if since is None:
             return records
-        moment = since.replace(microsecond=0)
-        return [r for r in records if datetime.fromisoformat(r["at"]) >= moment]
+        return [r for r in records if datetime.fromisoformat(r["at"]) >= since]
 
     # ------------------------------------------------------------------ flows
 
@@ -648,6 +689,13 @@ class Journey:
             "GET", f"/api/config/config_entries/entry?domain={DOMAIN}"
         )
         return next((e for e in entries if e["entry_id"] == entry_id), None)
+
+    def created(self, entry_id: str) -> datetime:
+        """Return when Home Assistant created the entry."""
+        entry = self.entry(entry_id)
+        if entry is None:
+            raise JourneyError(f"entry {entry_id} is gone")
+        return datetime.fromtimestamp(float(entry["created_at"]), UTC)
 
     def diagnostics(self, entry_id: str) -> dict[str, Any]:
         """Return the coordinator's part of the entry's diagnostics."""
@@ -772,8 +820,7 @@ class Journey:
 
     def check_nothing_refused(self) -> None:
         """Check that the stand-in refused nothing and answered every request."""
-        path = self.folder / standin.REFUSED
-        refused = path.read_text().splitlines() if path.is_file() else []
+        refused = read_refused(self.folder)
         self.check(
             "the stand-in refused no outbound request",
             not refused,
@@ -841,16 +888,15 @@ def first_setup(j: Journey) -> None:
         and max(days) <= TIP_DAYS,
         f"mode {coordinator.get('sync_mode')}, days asked {days}",
     )
-    oldest = date.fromisoformat(
-        min(
-            (r["start_on"] for r in j.journal(ended) if r.get("start_on")),
-            default=ended.astimezone(NZ).date().isoformat(),
-        )
-    )
+    # The import ends before Home Assistant creates the entry, and the entry's
+    # first update starts after it.
+    created = j.created(entry_id)
+    windows = sorted(r["start_on"] for r in j.journal(created) if r.get("start_on"))
+    yesterday = created.astimezone(NZ).date() - timedelta(days=1)
     j.check(
         "after the import, no window older than yesterday",
-        oldest >= ended.astimezone(NZ).date() - timedelta(days=1),
-        f"oldest window starts {oldest}",
+        bool(windows) and date.fromisoformat(windows[0]) >= yesterday,
+        f"oldest window starts {windows[0]}" if windows else "no windows asked for",
     )
     rows = j.check_entry(
         entry_id, {account: Expected(started, ended, datetime.now(UTC))}
@@ -899,8 +945,10 @@ def two_accounts(j: Journey) -> None:
     )
     j.check(
         "Reconfigure offers both, the chosen one selected",
-        offered(reconfigure, "selected_accounts") == [first, second],
-        ", ".join(offered(reconfigure, "selected_accounts")),
+        offered(reconfigure, "selected_accounts") == [first, second]
+        and preselected(reconfigure, "selected_accounts") == [first],
+        f"offers {', '.join(offered(reconfigure, 'selected_accounts'))}; "
+        f"selected {', '.join(preselected(reconfigure, 'selected_accounts'))}",
     )
     added = datetime.now(UTC)
     result = j.submit(
@@ -1153,10 +1201,16 @@ def restart(j: Journey, relaunch: Callable[[], None]) -> None:
         else:
             act()
         coordinator = j.wait_synced(entry_id, coordinator.get("synced_at"))
+        days = [
+            r["requested_days"]["consumption"]
+            for r in coordinator.get("property_results", [])
+        ]
         j.check(
-            f"{when}'s update ran",
-            coordinator.get("sync_mode") == "restart",
-            f"mode {coordinator.get('sync_mode')}",
+            f"{when}'s update ran and asked for the correction window",
+            coordinator.get("sync_mode") == "restart"
+            and bool(days)
+            and min(days) >= CORRECTION_DAYS,
+            f"mode {coordinator.get('sync_mode')}, days asked {days}",
         )
         expected = {account: Expected(started, ended, datetime.now(UTC))}
         after = j.check_entry(entry_id, expected)
@@ -1239,12 +1293,16 @@ class Run:
                 restart(journey, relaunch)
             else:
                 globals()[name](journey)
-        except (JourneyError, OSError, KeyError, ValueError) as err:
+        except Exception as err:  # noqa: BLE001
+            # Any failure fails this journey; the next one still runs.
             result.error = f"{type(err).__name__}: {err}"
             say(f"  FAIL  stopped: {result.error}")
-        except SystemExit as err:
-            # Home Assistant failed to start again: the run cannot go on.
-            result.error = f"the run stopped: {err}"
+        except BaseException as err:
+            # Home Assistant failed to start again, or the run was interrupted:
+            # the run cannot go on.
+            result.error = f"the run stopped: {type(err).__name__}" + (
+                f": {err}" if str(err) else ""
+            )
             say(f"  FAIL  {result.error}")
             raise
         finally:
@@ -1257,11 +1315,13 @@ class Run:
         return result
 
 
-def write_report(results: Sequence[JourneyResult], header: dict[str, str]) -> Path:
+def write_report(
+    results: Sequence[JourneyResult], header: dict[str, str], wanted: int
+) -> Path:
     """Write the report to the system's temporary directory; return its path."""
     stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     path = Path(tempfile.gettempdir()) / f"meridian-journeys-{stamp}.md"
-    path.write_text(markdown(results, header))
+    path.write_text(markdown(results, header, wanted))
     return path
 
 
@@ -1302,13 +1362,27 @@ def main(argv: Sequence[str] | None = None) -> int:
     if domain != DOMAIN:
         fail(f"These journeys are for {DOMAIN}, not {domain}")
     names = [name for name in JOURNEYS if not args.only or name in args.only]
-    folder = live_ha.config_dir(live_ha.state_dir(domain, NAME)) / STANDIN_FOLDER
+    state = live_ha.state_dir(domain, NAME)
+    if state.exists():
+        # It may be another run's: deleting it would end that run.
+        fail(
+            f"{state} exists: another run may be using it. "
+            "If none is, delete it with --clean-up"
+        )
+    folder = live_ha.config_dir(state) / STANDIN_FOLDER
     began = time.monotonic()
     header = {
         "Started": datetime.now(UTC).isoformat(timespec="seconds"),
         "Integration": args.ref or "the working tree",
     }
     results: list[JourneyResult] = []
+    # Everything the stand-in refused in the run, up to Home Assistant's
+    # shutdown: the journeys check it only up to their own last checks.
+    refused: list[str] = []
+
+    def read_at_the_end(state: Path) -> None:
+        refused.extend(read_refused(live_ha.config_dir(state) / STANDIN_FOLDER))
+
     try:
         instance = live_ha.launch(
             args.ref,
@@ -1325,13 +1399,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         for name in names:
             run.run(name)
     finally:
-        live_ha.stop(NAME)
+        live_ha.stop(NAME, before_delete=read_at_the_end)
         header["Duration"] = f"{time.monotonic() - began:.0f} s"
         if results:
-            report = write_report(results, header)
-            passed = sum(result.ok for result in results)
-            say(f"{passed} of {len(results)} journeys passed; report: {report}")
-    return 0 if results and all(result.ok for result in results) else 1
+            header["Refused by the stand-in"] = (
+                f"{len(refused)}: {'; '.join(refused[:3])}" if refused else "nothing"
+            )
+            if refused:
+                say(f"FAIL the stand-in refused {len(refused)}: {refused[0]}")
+            report = write_report(results, header, len(names))
+            say(f"{summary(results, len(names))}; report: {report}")
+    ran_all = len(results) == len(names) and all(result.ok for result in results)
+    return 0 if ran_all and not refused else 1
 
 
 if __name__ == "__main__":

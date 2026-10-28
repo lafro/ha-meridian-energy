@@ -47,7 +47,7 @@ uv run python scripts/journeys.py --only retry reauth  # some of them
 uv run python scripts/journeys.py --clean-up           # delete a left-over instance
 ```
 
-It builds a disposable Home Assistant as the live test does (the newest release, or `--ha-version`), but in a folder of its own (`journeys-meridian_energy`) on port 8125, so the two never meet. The stand-in (`tests/meridian_standin.py`, with the fakes the tests use) goes into that instance's Python through a `.pth` file. It answers the integration's Meridian requests from the scenario the journey sets, with synthetic data that depends only on the hour, and refuses and records every other outbound connection or name lookup. Home Assistant does not start without it.
+It builds a disposable Home Assistant as the live test does (the newest release, or `--ha-version`), but in a folder of its own (`journeys-meridian_energy`) on port 8125, so the two never meet. A run does not start while that folder exists, as another run may be using it; `--clean-up` deletes one a killed run left behind. The stand-in (`tests/meridian_standin.py`, with the fakes the tests use) goes into that instance's Python through a `.pth` file. It answers the integration's Meridian requests from the scenario the journey sets, with synthetic data that depends only on the hour. In Home Assistant's process it refuses and records every other aiohttp request, TCP connection and name lookup that would leave the computer; Home Assistant does not start without it. It does not cover UDP or reverse lookups, nor other programs: building the instance, and Home Assistant's first start, download Home Assistant and the requirements it pins from PyPI (through uv), as for the live test.
 
 | Journey | What it does |
 | --- | --- |
@@ -56,9 +56,9 @@ It builds a disposable Home Assistant as the live test does (the newest release,
 | `retry` | The import fails (Meridian answers 503), nothing is kept; a retry after the wait works |
 | `without_history` | Meridian times out; **Continue without history**; the history fills in afterwards |
 | `reauth` | Meridian ends the sign-in; the next update asks to reconnect; email code; history unbroken |
-| `restart` | Reload the entry and restart Home Assistant; each update asks for 14 days; history unbroken |
+| `restart` | Reload the entry and restart Home Assistant; each update asks again for the last 14 days at least; history unbroken |
 
-Every journey also checks that its entry is loaded and its sensors have states; that each statistic has every hour, none zero, each the value the stand-in sent and each sum step equal to its hour; that every screen it met has its words (no raw keys); and that the stand-in refused nothing. The run prints PASS or FAIL for each check and journey, writes a report with every check and every screen as the dialog shows it to the system's temporary directory, deletes the instance whatever happens, and exits non-zero if anything failed. It takes several minutes: two journeys wait out the integration's 120-second retry delay.
+Every journey also checks that its entry is loaded and its sensors have states; that each statistic has every hour, none zero, each the value the stand-in sent and each sum step equal to its hour; that every screen it met has its words (no raw keys); and that the stand-in refused nothing; the run checks that once more after Home Assistant has stopped. The run prints PASS or FAIL for each check and journey, writes a report with every check and every screen as the dialog shows it to the system's temporary directory, deletes the instance whatever happens, and exits non-zero if anything failed. It takes several minutes: two journeys wait out the integration's 120-second retry delay.
 
 Run the journeys before every beta and stable release, and in every pull request that changes sign-in, setup or the import; say in the pull request that they passed. They are not part of CI.
 

@@ -280,9 +280,11 @@ def test_stop_never_signals_a_process_that_is_not_the_instance(
     (folder / "hass.pid").write_text(str(other.pid))
     monkeypatch.setattr(live_ha, "state_dir", lambda *_args: folder)
     monkeypatch.setattr(live_ha, "port_in_use", lambda _port: False)
+    seen: list[Path] = []
     try:
-        live_ha.stop()
+        live_ha.stop(before_delete=seen.append)
         assert other.poll() is None
+        assert seen == [folder]
         assert not folder.exists()
     finally:
         os.killpg(other.pid, signal.SIGKILL)

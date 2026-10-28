@@ -22,6 +22,10 @@ Assistant never runs without it.
   computer's, so a library that does not use aiohttp cannot reach past
   this computer either.
 
+It does not cover UDP, reverse lookups (``gethostbyaddr``, ``getnameinfo``),
+resolvers written in C, or other programs Home Assistant runs, such as the
+uv that installs its pinned requirements at its first start.
+
 A refused request raises a connection error, and appends one line to
 ``refused.log`` in the stand-in's folder naming its kind and host only,
 never its path or query. Every request the fake answers appends one JSON
@@ -298,7 +302,7 @@ def _integration_hosts() -> frozenset[str]:
 
 def _describe(http: Any, url: str, options: dict[str, Any]) -> dict[str, Any]:
     """Return a journal record of a request: synthetic values and dates only."""
-    record: dict[str, Any] = {"at": datetime.now(UTC).isoformat(timespec="seconds")}
+    record: dict[str, Any] = {"at": datetime.now(UTC).isoformat()}
     if (operation := http.auth_operation(url)) is not None:
         record["operation"] = operation
         return record

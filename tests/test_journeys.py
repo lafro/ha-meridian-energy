@@ -189,6 +189,8 @@ def test_changed_rows_names_lost_and_changed_hours() -> None:
     assert len(changed) == 2
     assert "now 9.0/9.0" in changed[0]
     assert changed[1].endswith("is gone")
+    # Nothing before proves nothing.
+    assert journeys.changed_rows([], before) == ["no hours to compare"]
 
 
 # -------------------------------------------------------------------- screens
@@ -288,6 +290,54 @@ def test_progress_abort_and_entry_screens_are_rendered() -> None:
     assert form.missing == ("step.otp.title", "step.otp.data.otp")
 
 
+def test_a_screen_with_an_unfilled_placeholder_lacks_its_words() -> None:
+    screen = journeys.render(
+        {
+            "type": "form",
+            "handler": "meridian_energy",
+            "step_id": "import_failed",
+            "description_placeholders": {},
+            "data_schema": [],
+        },
+        _TRANSLATIONS,
+    )
+    assert screen.text == "Select Submit.\n\nDetails: {detail}."
+    assert screen.missing == ("step.import_failed.description (no value for {detail})",)
+
+
+def test_field_labels_come_from_the_handlers_words() -> None:
+    screen = journeys.render(
+        {
+            "type": "form",
+            "handler": "meridian_energy",
+            "translation_domain": "homeassistant",
+            "step_id": "import_failed",
+            "errors": {"base": "retry_too_soon"},
+            "description_placeholders": {"seconds": "7"},
+            "data_schema": [{"name": "continue_without_history"}],
+        },
+        _TRANSLATIONS,
+    )
+    assert screen.fields == ("Continue without history",)
+    assert screen.missing == (
+        "step.import_failed.title",
+        "error.retry_too_soon",
+    )
+
+
+def test_preselected_reads_a_fields_default() -> None:
+    result = {
+        "data_schema": [
+            {"name": "other", "default": ["X"]},
+            {"name": "selected_accounts", "default": ["A-1"]},
+            {"name": "empty"},
+        ]
+    }
+    assert journeys.preselected(result, "selected_accounts") == ["A-1"]
+    assert journeys.preselected(result, "empty") == []
+    assert journeys.preselected(result, "missing") == []
+
+
 def test_offered_reads_a_select_fields_options() -> None:
     result = {
         "data_schema": [
@@ -354,10 +404,11 @@ def test_the_report_goes_to_the_temporary_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
-    path = journeys.write_report([], {"Started": "now"})
+    path = journeys.write_report([], {"Started": "now"}, 6)
     assert path.parent == tmp_path
     assert path.name.startswith("meridian-journeys-")
     assert "- Started: now" in path.read_text()
+    assert "- Result: 0 of 6 journeys passed" in path.read_text()
 
 
 # ------------------------------------------------------------------- journey
@@ -393,6 +444,17 @@ class _Client:
         ]
 
 
+def _stop(stopped: list[str], state: Path) -> Any:
+    """Return a fake ``live_ha.stop`` that records the name it was given."""
+
+    def stop(name: str = "live-ha", before_delete: Any = None) -> None:
+        stopped.append(name)
+        if before_delete is not None:
+            before_delete(state)
+
+    return stop
+
+
 def _journey(folder: Path, client: Any = None) -> Journey:
     chosen: Any = client or _Client()
     return Journey(chosen, folder, JourneyResult("x", "X"))
@@ -424,10 +486,11 @@ def test_the_scenario_and_journal_are_the_stand_ins(tmp_path: Path) -> None:
     standin = meridian_standin.StandIn(tmp_path)
     assert standin.scenario() == scenario
     assert not list(tmp_path.glob("*.partial"))
-    standin.journal({"at": "2026-07-16T12:00:00+00:00", "operation": "a"})
-    standin.journal({"at": "2026-07-16T12:00:05+00:00", "operation": "b"})
+    standin.journal({"at": "2026-07-16T12:00:00.250000+00:00", "operation": "a"})
+    standin.journal({"at": "2026-07-16T12:00:00.750000+00:00", "operation": "b"})
     assert [r["operation"] for r in journey.journal()] == ["a", "b"]
-    since = datetime(2026, 7, 16, 12, 0, 5, 600000, tzinfo=UTC)
+    # To the microsecond: two requests in the same second are told apart.
+    since = datetime(2026, 7, 16, 12, 0, 0, 500000, tzinfo=UTC)
     assert [r["operation"] for r in journey.journal(since)] == ["b"]
 
 
@@ -628,6 +691,43 @@ def test_a_journey_that_stops_is_recorded_and_cleaned_up(
     assert run.results == [result]
 
 
+def test_a_journey_that_crashes_fails_and_the_next_one_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def crashes(journey: Journey) -> None:
+        journey.check("got this far", ok=True)
+        raise IndexError("list index out of range")
+
+    monkeypatch.setattr(journeys, "first_setup", crashes)
+    monkeypatch.setattr(journeys, "two_accounts", lambda j: j.check("ok", ok=True))
+    monkeypatch.setattr(Journey, "remove_entries", lambda _self: None)
+    run = journeys.Run(live_ha.Instance(tmp_path, 8125, None, "1"), tmp_path)  # type: ignore[arg-type]
+    crashed = run.run("first_setup")
+    assert not crashed.ok
+    assert crashed.error == "IndexError: list index out of range"
+    assert run.run("two_accounts").ok
+    assert journeys.summary(run.results, 2) == "1 of 2 journeys passed"
+
+
+def test_an_interrupted_journey_fails_and_stops_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def interrupted(journey: Journey) -> None:
+        journey.check("got this far", ok=True)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(journeys, "first_setup", interrupted)
+    monkeypatch.setattr(Journey, "remove_entries", lambda _self: None)
+    run = journeys.Run(live_ha.Instance(tmp_path, 8125, None, "1"), tmp_path)  # type: ignore[arg-type]
+    with pytest.raises(KeyboardInterrupt):
+        run.run("first_setup")
+    (result,) = run.results
+    assert not result.ok
+    assert result.error == "the run stopped: KeyboardInterrupt"
+    # Journeys that never ran did not pass.
+    assert journeys.summary(run.results, 6) == "0 of 6 journeys passed"
+
+
 def test_a_failed_restart_stops_the_run_but_keeps_its_report(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -651,7 +751,8 @@ def test_a_failed_restart_stops_the_run_but_keeps_its_report(
     stopped: list[str] = []
     monkeypatch.setattr(live_ha, "launch", launch)
     monkeypatch.setattr(live_ha, "relaunch", relaunch)
-    monkeypatch.setattr(live_ha, "stop", lambda name="live-ha": stopped.append(name))
+    monkeypatch.setattr(live_ha, "state_dir", lambda *_args: tmp_path / "state")
+    monkeypatch.setattr(live_ha, "stop", _stop(stopped, tmp_path / "state"))
     monkeypatch.setattr(live_ha, "config_dir", lambda _state: tmp_path / "config")
     monkeypatch.setattr(journeys, "restart", restart)
     monkeypatch.setattr(Journey, "remove_entries", lambda _self: None)
@@ -660,15 +761,20 @@ def test_a_failed_restart_stops_the_run_but_keeps_its_report(
         journeys.main(["--only", "restart"])
     assert stopped == ["journeys"]
     out = capsys.readouterr().out
-    assert "FAIL  the run stopped: Timed out waiting for the web server" in out
+    assert (
+        "FAIL  the run stopped: SystemExit: Timed out waiting for the web server" in out
+    )
     assert "0 of 1 journeys passed" in out
     (report,) = tmp_path.glob("meridian-journeys-*.md")
-    assert "Stopped: the run stopped: Timed out" in report.read_text()
+    assert "Stopped: the run stopped: SystemExit: Timed out" in report.read_text()
 
 
-def test_the_instance_is_always_deleted(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_the_instance_is_always_deleted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     stopped: list[str] = []
-    monkeypatch.setattr(live_ha, "stop", lambda name="live-ha": stopped.append(name))
+    monkeypatch.setattr(live_ha, "state_dir", lambda *_args: tmp_path / "state")
+    monkeypatch.setattr(live_ha, "stop", _stop(stopped, tmp_path / "state"))
 
     def broken(*_args: Any, **_kwargs: Any) -> live_ha.Instance:
         raise SystemExit("install failed")
@@ -679,6 +785,19 @@ def test_the_instance_is_always_deleted(monkeypatch: pytest.MonkeyPatch) -> None
     assert stopped == ["journeys"]
     assert journeys.main(["--clean-up"]) == 0
     assert stopped == ["journeys", "journeys"]
+
+
+def test_a_run_never_takes_over_an_existing_instance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    stopped: list[str] = []
+    (tmp_path / "state").mkdir()
+    monkeypatch.setattr(live_ha, "state_dir", lambda *_args: tmp_path / "state")
+    monkeypatch.setattr(live_ha, "stop", _stop(stopped, tmp_path / "state"))
+    with pytest.raises(SystemExit, match="another run may be using it"):
+        journeys.main([])
+    assert stopped == []
+    assert (tmp_path / "state").is_dir()
 
 
 def test_a_run_reports_and_exits_non_zero_when_a_journey_fails(
@@ -703,7 +822,8 @@ def test_a_run_reports_and_exits_non_zero_when_a_journey_fails(
 
     stopped: list[str] = []
     monkeypatch.setattr(live_ha, "launch", launch)
-    monkeypatch.setattr(live_ha, "stop", lambda name="live-ha": stopped.append(name))
+    monkeypatch.setattr(live_ha, "state_dir", lambda *_args: tmp_path / "state")
+    monkeypatch.setattr(live_ha, "stop", _stop(stopped, tmp_path / "state"))
     monkeypatch.setattr(live_ha, "config_dir", lambda _state: tmp_path / "config")
     monkeypatch.setattr(journeys.Run, "run", run)
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
@@ -718,6 +838,44 @@ def test_a_run_reports_and_exits_non_zero_when_a_journey_fails(
     assert stopped == ["journeys", "journeys"]
     (report,) = sorted(tmp_path.glob("meridian-journeys-*.md"))[-1:]
     assert "Home Assistant: 2026.10.4" in report.read_text()
+    assert "Refused by the stand-in: nothing" in report.read_text()
+
+
+def test_a_refusal_after_the_last_check_fails_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class _Process:
+        pid = 4242
+
+    folder = tmp_path / "config" / journeys.STANDIN_FOLDER
+
+    def launch(*_args: Any, **_kwargs: Any) -> live_ha.Instance:
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "installed-4242").write_text("")
+        return live_ha.Instance(tmp_path, 8125, _Process(), "2026.10.4")  # type: ignore[arg-type]
+
+    def run(self: journeys.Run, name: str) -> JourneyResult:
+        result = JourneyResult(name, name, [journeys.Check("c", ok=True)])
+        self.results.append(result)
+        return result
+
+    def stop(name: str = "live-ha", before_delete: Any = None) -> None:
+        del name
+        # Home Assistant tried to reach the internet as it shut down.
+        (folder / meridian_standin.REFUSED).write_text("t connection 192.0.2.1\n")
+        before_delete(tmp_path / "state")
+
+    monkeypatch.setattr(live_ha, "launch", launch)
+    monkeypatch.setattr(live_ha, "state_dir", lambda *_args: tmp_path / "state")
+    monkeypatch.setattr(live_ha, "stop", stop)
+    monkeypatch.setattr(live_ha, "config_dir", lambda _state: tmp_path / "config")
+    monkeypatch.setattr(journeys.Run, "run", run)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    assert journeys.main(["--only", "first_setup"]) == 1
+    out = capsys.readouterr().out
+    assert "FAIL the stand-in refused 1: t connection 192.0.2.1" in out
+    (report,) = tmp_path.glob("meridian-journeys-*.md")
+    assert "Refused by the stand-in: 1: t connection 192.0.2.1" in report.read_text()
 
 
 def test_the_journeys_refuse_another_integration(
