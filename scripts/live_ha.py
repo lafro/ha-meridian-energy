@@ -37,6 +37,12 @@ Add the integration from the printed link and sign in with a real account:
 that is the live test. ``stop`` removes the integration's config entries,
 stops Home Assistant and deletes the folder, with its database, log and stored
 sign-in. Only uv's package cache outlives it, so the next ``start`` is quick.
+
+Other scripts drive an instance through the same functions: ``launch``
+builds and starts one under another folder name and port, with extra files
+in its environment's site-packages before Home Assistant first starts;
+``relaunch`` stops it gracefully and starts it again on the same folder,
+checking it again; ``stop`` with the same name deletes it.
 """
 
 from __future__ import annotations
@@ -58,15 +64,19 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from pathlib import Path
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Mapping
 
 ROOT = Path(__file__).resolve().parents[1]
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8124
+# The instance's folder is "<name>-<domain>" in the system's temporary
+# directory.
+DEFAULT_NAME = "live-ha"
 PYTHON = "3.14"
 MARKER = ".live-ha"
 # The first start installs the frontend and the recorder's requirements.
@@ -135,9 +145,42 @@ def integration_domain() -> str:
     return domains[0]
 
 
-def state_dir(domain: str) -> Path:
+def state_dir(domain: str, name: str = DEFAULT_NAME) -> Path:
     """Return the folder that holds the whole instance."""
-    return Path(tempfile.gettempdir()) / f"live-ha-{domain}"
+    return Path(tempfile.gettempdir()) / f"{name}-{domain}"
+
+
+def venv_dir(state: Path) -> Path:
+    """Return the instance's own Python environment."""
+    return state / "venv"
+
+
+def config_dir(state: Path) -> Path:
+    """Return the instance's Home Assistant configuration folder."""
+    return state / "config"
+
+
+def site_packages_of(python: Path) -> Path:
+    """Return the site-packages folder of the environment ``python`` runs."""
+    return Path(
+        run(python, "-c", "import sysconfig; print(sysconfig.get_path('purelib'))")
+    )
+
+
+def site_packages(state: Path) -> Path:
+    """Return the site-packages folder of the instance's environment."""
+    return site_packages_of(venv_dir(state) / "bin" / "python")
+
+
+def install_site_files(target: Path, files: Mapping[str, bytes]) -> None:
+    """Write files, by relative path, into a site-packages folder."""
+    for name, content in files.items():
+        relative = PurePosixPath(name)
+        if relative.is_absolute() or ".." in relative.parts or not relative.parts:
+            raise SystemExit(f"Not a path inside site-packages: {name}")
+        path = target.joinpath(*relative.parts)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
 
 
 def configuration_yaml(domain: str) -> str:
@@ -236,6 +279,7 @@ def call(
     token: str | None = None,
     data: dict[str, Any] | None = None,
     form: dict[str, str] | None = None,
+    timeout: float = 30,
 ) -> Any:
     """Send one request to the instance and return its decoded JSON."""
     headers: dict[str, str] = {}
@@ -251,7 +295,7 @@ def call(
     request = urllib.request.Request(
         f"http://{HOST}:{port}{path}", data=body, headers=headers, method=method
     )
-    with opener().open(request, timeout=30) as response:
+    with opener().open(request, timeout=timeout) as response:
         raw = response.read()
     return json.loads(raw) if raw else None
 
@@ -536,9 +580,20 @@ def listens_on(lines: list[str], port: int) -> bool:
 
 
 def check_contained(
-    state: Path, running: Callable[[], bool], pid: int, port: int, domain: str
+    state: Path,
+    running: Callable[[], bool],
+    pid: int,
+    port: int,
+    domain: str,
+    *,
+    allowed_entries: frozenset[str] = SYSTEM_ENTRIES,
 ) -> str:
-    """Fail unless the instance is running, contained and offers the domain."""
+    """
+    Fail unless the instance is running, contained and offers the domain.
+
+    Its config entries must be Home Assistant's own, or of the domains in
+    ``allowed_entries`` (such as the integration's, once a test added one).
+    """
     token = access_token(state, port)
     config = wait_for(
         running,
@@ -556,7 +611,7 @@ def check_contained(
     if forbidden := sorted(loaded & NOT_ALLOWED):
         raise SystemExit(f"Integrations that must not load are loaded: {forbidden}")
     entries = call(port, "GET", "/api/config/config_entries/entry", token=token)
-    if extra := sorted({entry["domain"] for entry in entries} - SYSTEM_ENTRIES):
+    if extra := sorted({entry["domain"] for entry in entries} - allowed_entries):
         raise SystemExit(f"Unexpected config entries: {extra}")
     if not analytics_off(state / "config"):
         raise SystemExit("Analytics is turned on")
@@ -593,10 +648,56 @@ def build(state: Path, domain: str, ref: str | None, version: str | None) -> str
     return installed
 
 
-def start(ref: str | None, version: str | None, port: int) -> None:
-    """Build, start and check a new instance."""
+@dataclass(slots=True)
+class Instance:
+    """A running instance: its folder, port, Home Assistant process and version."""
+
+    state: Path
+    port: int
+    process: subprocess.Popen[bytes]
+    version: str
+
+    @property
+    def pid(self) -> int:
+        """Return Home Assistant's process ID."""
+        return self.process.pid
+
+    def running(self) -> bool:
+        """Return whether Home Assistant still runs."""
+        # poll() also collects an exited Home Assistant, which a signal-0
+        # probe would still find.
+        return self.process.poll() is None
+
+
+def spawn(state: Path) -> subprocess.Popen[bytes]:
+    """Start the instance's Home Assistant in a process group of its own."""
+    with (state / "hass.out").open("ab") as out:
+        process = subprocess.Popen(  # noqa: S603
+            [venv_dir(state) / "bin" / "hass", "--config", config_dir(state)],
+            stdout=out,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    (state / "hass.pid").write_text(str(process.pid))
+    return process
+
+
+def launch(
+    ref: str | None,
+    version: str | None,
+    port: int,
+    *,
+    name: str = DEFAULT_NAME,
+    site_files: Mapping[str, bytes] | None = None,
+) -> Instance:
+    """
+    Build, start and check a new instance, and return it.
+
+    ``site_files`` (relative path to content) are written into the instance
+    environment's site-packages before Home Assistant first starts.
+    """
     domain = integration_domain()
-    state = state_dir(domain)
+    state = state_dir(domain, name)
     if state.exists():
         raise SystemExit(f"{state} exists: run 'stop' first")
     if port_in_use(port):
@@ -608,6 +709,8 @@ def start(ref: str | None, version: str | None, port: int) -> None:
     (state / "port").write_text(str(port))
     try:
         installed = build(state, domain, ref, version)
+        if site_files:
+            install_site_files(site_packages(state), site_files)
         # The install can take minutes: if the port was taken meanwhile, Home
         # Assistant would fall back to its defaults, every address included.
         if port_in_use(port):
@@ -615,25 +718,12 @@ def start(ref: str | None, version: str | None, port: int) -> None:
     except BaseException:
         shutil.rmtree(state)
         raise
-    with (state / "hass.out").open("wb") as out:
-        process = subprocess.Popen(  # noqa: S603
-            [state / "venv" / "bin" / "hass", "--config", state / "config"],
-            stdout=out,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-        )
-    (state / "hass.pid").write_text(str(process.pid))
-    say(f"Starting Home Assistant {installed} (pid {process.pid})...")
-
-    def running() -> bool:
-        # poll() also collects an exited Home Assistant, which a signal-0
-        # probe would still find.
-        return process.poll() is None
-
+    instance = Instance(state, port, spawn(state), installed)
+    say(f"Starting Home Assistant {installed} (pid {instance.pid})...")
     try:
         wait_for(
-            running,
-            process.pid,
+            instance.running,
+            instance.pid,
             state,
             lambda: call(port, "GET", "/api/onboarding") is not None,
             "the web server",
@@ -641,12 +731,62 @@ def start(ref: str | None, version: str | None, port: int) -> None:
         auth = state / "auth.json"
         auth.write_text(json.dumps({"refresh_token": onboard(port)}))
         auth.chmod(0o600)
-        running_version = check_contained(state, running, process.pid, port, domain)
+        instance.version = check_contained(
+            state, instance.running, instance.pid, port, domain
+        )
     except BaseException:
-        terminate(process.pid, running)
+        terminate(instance.pid, instance.running)
         say(f"Stopped Home Assistant; its output is in {state / 'hass.out'}")
         say("'stop' deletes the folder")
         raise
+    return instance
+
+
+def relaunch(
+    instance: Instance, domain: str, allowed_entries: frozenset[str] = SYSTEM_ENTRIES
+) -> Instance:
+    """
+    Stop the instance gracefully, start it again on its folder, and check it.
+
+    The checks are those of the first start, with config entries of the
+    domains in ``allowed_entries`` allowed too.
+    """
+    state, port = instance.state, instance.port
+    terminate(instance.pid, instance.running)
+    if instance.running():
+        raise SystemExit(f"Home Assistant (pid {instance.pid}) did not stop")
+    if not gone_within(lambda: port_in_use(port), STOP_TIMEOUT_S):
+        raise SystemExit(f"Something still listens on {HOST}:{port}")
+    again = Instance(state, port, spawn(state), instance.version)
+    say(f"Starting Home Assistant again (pid {again.pid})...")
+    try:
+        wait_for(
+            again.running,
+            again.pid,
+            state,
+            lambda: call(port, "GET", "/api/onboarding") is not None,
+            "the web server",
+        )
+        again.version = check_contained(
+            state,
+            again.running,
+            again.pid,
+            port,
+            domain,
+            allowed_entries=allowed_entries,
+        )
+    except BaseException:
+        terminate(again.pid, again.running)
+        say(f"Stopped Home Assistant; its output is in {state / 'hass.out'}")
+        raise
+    return again
+
+
+def start(ref: str | None, version: str | None, port: int) -> None:
+    """Build, start and check a new instance, and say how to use it."""
+    domain = integration_domain()
+    instance = launch(ref, version, port)
+    state, running_version = instance.state, instance.version
     url = f"http://{HOST}:{port}"
     say(
         f"Home Assistant {running_version} is running at {url}, "
@@ -694,10 +834,10 @@ def remove_entries(state: Path, port: int, domain: str) -> int:
     return len(entries)
 
 
-def stop() -> None:
+def stop(name: str = DEFAULT_NAME) -> None:
     """Remove the integration, stop the instance and delete its folder."""
     domain = integration_domain()
-    state = state_dir(domain)
+    state = state_dir(domain, name)
     if not state.exists():
         say(f"Nothing to stop: {state} does not exist")
         return
