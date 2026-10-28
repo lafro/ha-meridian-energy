@@ -275,8 +275,10 @@ async def test_a_request_the_fake_cannot_answer_is_journalled_as_an_error(
 
 
 def test_connections_and_lookups_beyond_this_computer_are_refused(
-    standin: StandIn, folder: Path, socket_enabled: None
+    socket_enabled: None, standin: StandIn, folder: Path
 ) -> None:
+    # socket_enabled comes first, so the stand-in patches the real socket class. Its
+    # setup hook may or may not already have done that, depending on plugin order.
     del standin, socket_enabled
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as outbound:
         with pytest.raises(ConnectionRefusedError):
