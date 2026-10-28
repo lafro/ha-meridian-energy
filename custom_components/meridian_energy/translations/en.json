@@ -2,132 +2,126 @@
   "title": "Meridian Energy",
   "config": {
     "abort": {
-      "already_configured": "This Meridian account is already configured.",
-      "login_expired": "The login attempt expired. Start setup again to request a new code.",
-      "no_accounts": "No active Meridian electricity accounts were found for this login.",
-      "too_many_attempts": "The history import failed 5 times, so setup has stopped. What failed last: {detail}.\n\nWait a while before starting setup again; Meridian will email a new code. A warning with more detail for each attempt is in the Home Assistant log.",
-      "unique_id_mismatch": "This login does not match the configured Meridian entry. Remove the integration and add it again with the email address you want to use."
+      "already_configured": "This Meridian account is already set up.",
+      "login_expired": "The sign-in expired. Start setup again to get a new code.",
+      "no_accounts": "No active Meridian electricity accounts were found.",
+      "too_many_attempts": "The history import failed 5 times, so setup has stopped. Wait a while, then start setup again.\n\nDetails: {detail}.",
+      "unique_id_mismatch": "That email doesn't match this Meridian Energy entry. To use a different email, remove the integration and add it again."
     },
     "error": {
-      "cannot_connect": "Home Assistant could not reach Meridian, or Meridian's service returned an error. Wait a few minutes, then try again.",
-      "cleanup_pending": "Home Assistant has not finished removing the statistics from an earlier attempt, or is still busy saving other data. Wait a minute, then try again.",
-      "continue_too_soon": "Wait {seconds} more seconds before continuing without history, so Meridian is not asked again too soon.",
-      "email_not_found": "Meridian did not accept that email address.",
-      "import_cannot_connect": "Home Assistant could not reach Meridian, or Meridian's service returned an error, while importing your history. Wait a few minutes, then try again.",
-      "import_invalid_data": "Meridian returned history that Home Assistant could not use. Try again later; if it keeps failing, report it with the Meridian Energy warning from the Home Assistant log.",
-      "import_rate_limited": "Meridian asked Home Assistant to wait before requesting more history. Wait, then try again.",
-      "import_statistics_refused": "Home Assistant already has Meridian Energy statistics for this property that are older than the history to import, with no running total in the 800 days before it that the import could continue. Nothing was imported, so those statistics are unchanged. Trying again gives the same result until they are deleted, which you can do in Settings → Tools → Statistics (select them, then Delete selected statistics) if you intend to discard that history; the Home Assistant log has a warning from Meridian Energy about them.",
-      "import_statistics_write": "Home Assistant could not confirm that it had saved the imported history. It may be busy, for example with a backup: wait a few minutes, then try again.",
-      "import_timeout": "The history import could not finish in time: it was still running after 5 minutes, not counting the time Home Assistant takes to save it, when setup stops it. Try again later; if it keeps happening, report it with the Meridian Energy warning from the Home Assistant log.",
-      "invalid_auth": "Meridian rejected the login attempt. Request a new code and try again.",
-      "invalid_data": "Meridian returned account data Home Assistant could not use. Try again later.",
-      "last_upstream_timeout": "Meridian's service did not answer in time, and no import attempts are left.",
+      "cannot_connect": "Couldn't reach Meridian. Wait a few minutes, then try again.",
+      "cleanup_pending": "Home Assistant is still saving data. Wait a minute, then try again.",
+      "continue_too_soon": "Wait {seconds} more seconds before continuing.",
+      "email_not_found": "Meridian didn't recognise that email.",
+      "import_cannot_connect": "Couldn't reach Meridian. Wait a few minutes, then try again.",
+      "import_invalid_data": "Meridian sent history Home Assistant couldn't use. Try again later.",
+      "import_rate_limited": "Meridian asked Home Assistant to slow down. Wait a while, then try again.",
+      "import_statistics_refused": "Older Meridian Energy statistics for this property can't be continued, so nothing was imported. Deleting them in Settings → Tools → Statistics discards that history; then try again.",
+      "import_statistics_write": "Home Assistant couldn't confirm the history was saved. It may be busy, for example with a backup. Wait a few minutes, then try again.",
+      "import_timeout": "The import took too long. Try again later.",
+      "invalid_auth": "Meridian rejected the sign-in. Request a new code and try again.",
+      "invalid_data": "Meridian sent account details Home Assistant couldn't use. Try again later.",
+      "last_upstream_timeout": "Meridian didn't answer in time, and no import attempts are left.",
       "last_upstream_unavailable": "Meridian's service returned an error, and no import attempts are left.",
-      "otp_expired": "The code has expired. Start setup again to request a new one.",
-      "otp_invalid": "The code is incorrect. Check the email and try again.",
-      "otp_not_found": "The code has already been used or was not found. Start setup again.",
-      "otp_too_many_attempts": "Too many attempts were made. Start setup again to request a new code.",
-      "rate_limited": "Meridian asked Home Assistant to wait before trying again. Please retry later.",
-      "retry_too_soon": "Wait {seconds} more seconds before trying again, so Meridian is not asked again too soon.",
-      "select_account": "Select at least one available Meridian account.",
-      "unknown": "The history import failed unexpectedly. Check the Home Assistant log for a warning from Meridian Energy, then try again.",
-      "upstream_timeout": "Meridian's service did not answer in time. Wait a few minutes, then try again.",
+      "otp_expired": "That code has expired. Start setup again to get a new one.",
+      "otp_invalid": "That code isn't right. Check the email and try again.",
+      "otp_not_found": "That code was already used or wasn't found. Start setup again.",
+      "otp_too_many_attempts": "Too many tries. Start setup again to get a new code.",
+      "rate_limited": "Meridian asked Home Assistant to slow down. Try again later.",
+      "retry_too_soon": "Wait {seconds} more seconds, then try again.",
+      "select_account": "Select at least one account.",
+      "unknown": "Something unexpected went wrong. Try again; if it keeps happening, the Home Assistant log has the details.",
+      "upstream_timeout": "Meridian didn't answer in time. Wait a few minutes, then try again.",
       "upstream_unavailable": "Meridian's service returned an error. Wait a few minutes, then try again."
     },
     "step": {
       "user": {
         "title": "Connect Meridian Energy",
-        "description": "Enter the email address used for MyMeridian. Meridian will email a six-digit login code. No password is requested or stored. After setup, Home Assistant refreshes the session automatically; another code is only needed if Meridian rejects or revokes that session.",
+        "description": "Enter the email you use for MyMeridian. Meridian will email you a six-digit code. No password needed.",
         "data": {
-          "email": "Email address"
-        },
-        "data_description": {
-          "email": "The email address you use to sign in at app.meridianenergy.nz."
+          "email": "Email"
         }
       },
       "otp": {
-        "title": "Enter the Meridian login code",
+        "title": "Enter your code",
         "description": "Enter the six-digit code Meridian sent to {email}.",
         "data": {
-          "otp": "Six-digit code"
-        },
-        "data_description": {
-          "otp": "Codes are single-use and expire quickly."
+          "otp": "Code"
         }
       },
       "discovery_retry": {
-        "title": "Continue Meridian setup",
-        "description": "Authentication succeeded, but setup could not continue yet. Submit to try again without requesting or reusing a login code.",
+        "title": "Couldn't continue setup",
+        "description": "You're signed in. Select Submit to try again. You won't need a new code.",
         "data": {}
       },
       "accounts": {
-        "title": "Choose Meridian accounts",
-        "description": "Select the electricity accounts to import. Each selected account will have its own device, billing-period totals and statistics.",
+        "title": "Choose accounts",
+        "description": "Each account gets its own device and Energy statistics.",
         "data": {
           "selected_accounts": "Accounts"
         },
         "data_description": {
-          "selected_accounts": "You can change this later with Reconfigure, in the integration's menu."
+          "selected_accounts": "Select them all to add new accounts automatically. You can change this later with Reconfigure."
         }
       },
       "import_failed": {
-        "title": "Meridian history import failed",
-        "description": "Home Assistant signed in to Meridian, but importing your usage history did not finish.\n\nWhat failed: {detail}.\n\nSubmit to try again with the same login; no new emailed code is needed. Statistics the failed attempt created are removed first; statistics kept from an earlier installation stay. A warning with more detail is in the Home Assistant log.",
+        "title": "History import failed",
+        "description": "Select Submit to try again. You won't need a new code.\n\nDetails: {detail}.",
         "data": {
           "continue_without_history": "Continue without history"
         },
         "data_description": {
-          "continue_without_history": "Finish setup now without importing any usage history. The first update after setup asks Meridian for the last 90 days, as setup would, and the updates after it fill in what is still missing, a few weeks at each; the Energy dashboard and the Current bill sensors fill in as it arrives. Leave this off to try the import again."
+          "continue_without_history": "Finish setup now and import your history in the background."
         }
       },
       "import_failed_last": {
-        "title": "Meridian history import failed",
-        "description": "Home Assistant signed in to Meridian, but importing your usage history failed 5 times, the most setup allows.\n\nWhat failed last: {detail}.\n\nTick Continue without history and submit to finish setup now without history: Home Assistant then asks Meridian for it in the background. Submit without it to end setup; Meridian will email a new code when you start setup again. Statistics the failed attempts created are removed either way; statistics kept from an earlier installation stay. A warning with more detail for each attempt is in the Home Assistant log.",
+        "title": "History import failed",
+        "description": "The import failed 5 times. To finish setup anyway, turn on Continue without history and select Submit; your history will import in the background. Otherwise, select Submit to cancel setup.\n\nDetails: {detail}.",
         "data": {
           "continue_without_history": "Continue without history"
         },
         "data_description": {
-          "continue_without_history": "Finish setup now without importing any usage history. The first update after setup asks Meridian for the last 90 days, as setup would, and the updates after it fill in what is still missing, a few weeks at each; the Energy dashboard and the Current bill sensors fill in as it arrives. Leave this off to end setup."
+          "continue_without_history": "Finish setup now and import your history in the background."
         }
       },
       "reconfigure": {
-        "title": "Choose Meridian accounts",
-        "description": "Choose which accounts Home Assistant should import. Removing an account stops future updates and removes its device and entities, but preserves its existing long-term statistics.",
+        "title": "Choose accounts",
+        "description": "Removing an account removes its device but keeps its past Energy statistics.",
         "data": {
           "selected_accounts": "Accounts"
         },
         "data_description": {
-          "selected_accounts": "Grid-export metering on selected accounts is discovered automatically. Newly available accounts appear here and are added automatically only when automatic account addition was enabled during setup."
+          "selected_accounts": "Select them all to add new accounts automatically."
         }
       },
       "reconfigure_discovery": {
-        "title": "Retry Meridian account discovery",
-        "description": "Home Assistant could not retrieve the available Meridian accounts. Submit to try again.",
+        "title": "Couldn't load your accounts",
+        "description": "Select Submit to try again.",
         "data": {}
       },
       "reauth_confirm": {
         "title": "Reconnect Meridian Energy",
-        "description": "Meridian no longer accepts the stored session for {email}. Submit to request a new six-digit code.",
+        "description": "Meridian has ended the sign-in for {email}. Select Submit to get a new code.",
         "data": {}
       }
     },
     "progress": {
-      "initial_import": "Meridian is importing up to 90 days of electricity usage and available cost history, a week at a time, newest first; the progress shows how many weeks are done. This can take a few minutes. The import has 4 minutes: once every grid import and export of a property has its newest week, setup keeps the weeks imported in them, and Home Assistant's updates complete the rest in the background. Setup stops an import still running after 5 minutes, not counting the time Home Assistant takes to save it, and removes the statistics it created, as when this dialog is closed. Keep this dialog open; setup will continue automatically when the import is complete. Closing it cancels the import."
+      "initial_import": "Importing your last 90 days of usage and cost. This can take a few minutes. Keep this window open."
     },
     "create_entry": {
-      "default": "Meridian Energy is connected. Home Assistant will refresh the stored session automatically; a new emailed code is only required if Meridian invalidates it.",
-      "partial": "Meridian Energy is connected, but some of your usage history is not imported yet. Home Assistant asks Meridian for the rest in the background with its updates: the last 90 days at the first update for a grid import or export setup imported none of, then a few weeks at each until the history is complete. Until it reaches the start of the billing period, the Current bill sensors stay unknown. Home Assistant will refresh the stored session automatically; a new emailed code is only required if Meridian invalidates it."
+      "default": "Meridian Energy is connected.",
+      "partial": "Meridian Energy is connected. Your history will finish importing in the background, and the Current bill sensors will fill in as it does."
     }
   },
   "exceptions": {
     "cannot_connect": {
-      "message": "Home Assistant could not reach Meridian, or Meridian's service returned an error. Home Assistant will try again automatically."
+      "message": "Couldn't reach Meridian. Home Assistant will try again automatically."
     },
     "upstream_unavailable": {
       "message": "Meridian's service returned an error ({detail}). Home Assistant will try again automatically."
     },
     "upstream_timeout": {
-      "message": "Meridian's service did not answer in time ({detail}). Home Assistant will try again automatically."
+      "message": "Meridian's service didn't answer in time ({detail}). Home Assistant will try again automatically."
     },
     "invalid_auth": {
       "message": "Meridian no longer accepts the stored session. Reauthenticate the integration."
@@ -139,13 +133,13 @@
       "message": "Meridian asked Home Assistant to wait before trying again."
     },
     "recorder_busy": {
-      "message": "Home Assistant has not finished saving earlier statistics, so Meridian Energy is waiting before it reads them. Home Assistant will try again automatically."
+      "message": "Home Assistant is still saving earlier statistics. It will try again automatically."
     },
     "statistics_write": {
-      "message": "Home Assistant could not confirm that it had saved Meridian's statistics, so they will be imported again. Home Assistant will try again automatically."
+      "message": "Home Assistant couldn't confirm Meridian's statistics were saved. It will import them again automatically."
     },
     "statistics_refused": {
-      "message": "Meridian Energy found older statistics with no running total to continue in the 800 days before the hours it would import, so it imported none rather than start the running total again from zero. Home Assistant tries again later, with the same result until those statistics are deleted in Settings → Tools → Statistics."
+      "message": "Older Meridian Energy statistics can't be continued, so nothing was imported. Deleting them in Settings → Tools → Statistics discards that history and lets the import go ahead."
     },
     "migration_unsupported_version": {
       "message": "This Meridian Energy configuration entry (version {version}) is not supported by this release. Remove the integration and add it again."
