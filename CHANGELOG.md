@@ -10,7 +10,7 @@ Requires Home Assistant 2026.10.0 or newer. Every change is listed in [0.3.0 in 
 
 - Setup no longer spins forever when Meridian is slow. Usage history is asked for a week at a time, and a slow answer gets up to 75 seconds instead of 30.
 - When the history import fails, setup says why and offers to try again without a new code. After a Meridian timeout or service error it also offers **Continue without history**.
-- If Meridian is too slow, setup finishes once the newest week of history is in, and the rest imports in the background.
+- If Meridian is too slow for setup's 4 minutes, setup keeps what came back as long as the newest week of history is in, and the rest imports in the background.
 - A property, or its grid import or export, that fails no longer stops the others updating. It is tried again on its own after 1 hour, then 2, doubling up to a day; reload the integration to try sooner.
 - A property whose supply has not started yet no longer stops setup and updates for the others.
 - Missing history is filled in automatically, after a partial setup or an outage, back 90 days or to the start of the current billing period when that is older (up to 400 days). Within that range, estimates more than 14 days old are corrected once a month.
