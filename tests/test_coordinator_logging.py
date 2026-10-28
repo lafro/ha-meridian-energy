@@ -141,21 +141,21 @@ async def test_upstream_failures_have_their_own_keys(
         (
             MeridianUpstreamError(504, gateway=True),
             (
-                "Meridian's service did not answer in time (HTTP 504). "
+                "Meridian's service didn't answer in time (HTTP 504). "
                 "Home Assistant will try again automatically"
             ),
         ),
         (
             MeridianUpstreamError(524, gateway=True),
             (
-                "Meridian's service did not answer in time (HTTP 524). "
+                "Meridian's service didn't answer in time (HTTP 524). "
                 "Home Assistant will try again automatically"
             ),
         ),
         (
             MeridianUpstreamError(None, gateway=True),
             (
-                "Meridian's service did not answer in time (no answer within the time "
+                "Meridian's service didn't answer in time (no answer within the time "
                 "limit). Home Assistant will try again automatically"
             ),
         ),
