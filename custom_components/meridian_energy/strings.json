@@ -15,8 +15,8 @@
       "email_not_found": "Meridian didn't recognise that email.",
       "import_cannot_connect": "Couldn't reach Meridian. Wait a few minutes, then try again.",
       "import_invalid_data": "Meridian sent history Home Assistant couldn't use. Try again later.",
-      "import_rate_limited": "Meridian asked Home Assistant to slow down. Wait a few minutes, then try again.",
-      "import_statistics_refused": "Older Meridian Energy statistics for this property can't be continued, so nothing was imported. To start again, delete them in Settings → Tools → Statistics.",
+      "import_rate_limited": "Meridian asked Home Assistant to slow down. Wait a while, then try again.",
+      "import_statistics_refused": "Older Meridian Energy statistics for this property can't be continued, so nothing was imported. Deleting them in Settings → Tools → Statistics discards that history; then try again.",
       "import_statistics_write": "Home Assistant couldn't confirm the history was saved. It may be busy, for example with a backup. Wait a few minutes, then try again.",
       "import_timeout": "The import took too long. Try again later.",
       "invalid_auth": "Meridian rejected the sign-in. Request a new code and try again.",
@@ -50,8 +50,8 @@
         }
       },
       "discovery_retry": {
-        "title": "Couldn't load your accounts",
-        "description": "You're signed in, but Meridian didn't send your accounts. Select Submit to try again. You won't need a new code.",
+        "title": "Couldn't continue setup",
+        "description": "You're signed in. Select Submit to try again. You won't need a new code.",
         "data": {}
       },
       "accounts": {
@@ -96,7 +96,7 @@
       },
       "reconfigure_discovery": {
         "title": "Couldn't load your accounts",
-        "description": "Meridian didn't send your accounts. Select Submit to try again.",
+        "description": "Select Submit to try again.",
         "data": {}
       },
       "reauth_confirm": {
@@ -110,7 +110,7 @@
     },
     "create_entry": {
       "default": "Meridian Energy is connected.",
-      "partial": "Meridian Energy is connected. The rest of your history will import in the background, and the Current bill sensors will fill in as it does."
+      "partial": "Meridian Energy is connected. Your history will finish importing in the background, and the Current bill sensors will fill in as it does."
     }
   },
   "exceptions": {
@@ -121,7 +121,7 @@
       "message": "Meridian's service returned an error ({detail}). Home Assistant will try again automatically."
     },
     "upstream_timeout": {
-      "message": "Meridian's service did not answer in time ({detail}). Home Assistant will try again automatically."
+      "message": "Meridian's service didn't answer in time ({detail}). Home Assistant will try again automatically."
     },
     "invalid_auth": {
       "message": "Meridian no longer accepts the stored session. Reauthenticate the integration."
@@ -133,13 +133,13 @@
       "message": "Meridian asked Home Assistant to wait before trying again."
     },
     "recorder_busy": {
-      "message": "Home Assistant is still saving earlier statistics. Meridian Energy will try again automatically."
+      "message": "Home Assistant is still saving earlier statistics. It will try again automatically."
     },
     "statistics_write": {
       "message": "Home Assistant couldn't confirm Meridian's statistics were saved. It will import them again automatically."
     },
     "statistics_refused": {
-      "message": "Older Meridian Energy statistics can't be continued, so nothing was imported. To start again, delete them in Settings → Tools → Statistics."
+      "message": "Older Meridian Energy statistics can't be continued, so nothing was imported. Deleting them in Settings → Tools → Statistics discards that history and lets the import go ahead."
     },
     "migration_unsupported_version": {
       "message": "This Meridian Energy configuration entry (version {version}) is not supported by this release. Remove the integration and add it again."

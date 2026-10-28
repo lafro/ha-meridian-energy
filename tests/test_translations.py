@@ -13,6 +13,7 @@ import pytest
 
 from custom_components.meridian_energy.const import (
     SETUP_IMPORT_BUDGET_SECONDS,
+    SETUP_IMPORT_MAX_ATTEMPTS,
     SETUP_IMPORT_TIMEOUT_SECONDS,
 )
 
@@ -296,3 +297,12 @@ def test_the_setup_dialog_is_brief() -> None:
     config = _source_strings()["config"]
     for text in _texts(config):
         assert len(text) <= 250, text
+
+
+def test_the_last_failure_texts_give_the_attempt_limit() -> None:
+    """The texts after the last attempt allowed say how many attempts failed."""
+    assert SETUP_IMPORT_MAX_ATTEMPTS == 5
+    config = _source_strings()["config"]
+    stated = f"failed {SETUP_IMPORT_MAX_ATTEMPTS} times"
+    assert stated in config["step"]["import_failed_last"]["description"]
+    assert stated in config["abort"]["too_many_attempts"]
