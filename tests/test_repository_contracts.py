@@ -69,20 +69,20 @@ def test_pull_requests_are_tested_on_a_supported_release() -> None:
     """The locked Home Assistant is a final release, no older than the minimum.
 
     The harness pin selects the Home Assistant that every pull request is
-    tested on (compat.yml tests newer ones, betas included). A pre-release, or
-    a release older than the minimum in hacs.json, is one no user runs: the
+    tested on. Betas are compat.yml's job, and a release older than the
+    minimum in hacs.json is one this integration does not support: the
     harness 0.13.370 locked 2026.10.0b4, below the minimum 2026.10.0, and
     nothing said so. The locked version is read rather than the installed one,
     which compat.yml replaces.
     """
     lock = tomllib.loads(Path("uv.lock").read_text())
-    locked = Version(
-        next(
-            package["version"]
-            for package in lock["package"]
-            if package["name"] == "homeassistant"
-        )
-    )
+    versions = [
+        Version(package["version"])
+        for package in lock["package"]
+        if package["name"] == "homeassistant"
+    ]
+    assert len(versions) == 1, f"uv.lock has {len(versions)} homeassistant entries"
+    (locked,) = versions
     minimum = Version(json.loads(Path("hacs.json").read_text())["homeassistant"])
 
     assert not locked.is_prerelease, f"{locked} is a pre-release"
