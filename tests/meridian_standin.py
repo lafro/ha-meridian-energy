@@ -84,11 +84,13 @@ EXIT_NOT_INSTALLED = 70
 # The ``.pth`` line, run as the interpreter starts. If the stand-in cannot be
 # imported or installed, the interpreter exits before Home Assistant can
 # start: Python would only print a failed import in a ``.pth`` line, and go on.
+# The traceback goes to the interpreter's error output (hass.out).
 PTH_LINE = (
     "import os; exec("
     + repr(
         f"try:\n import {PACKAGE}\n {PACKAGE}.install_or_exit()\n"
-        f"except BaseException:\n os._exit({EXIT_NOT_INSTALLED})"
+        "except BaseException:\n import traceback\n traceback.print_exc()\n"
+        f" os._exit({EXIT_NOT_INSTALLED})"
     )
     + ")\n"
 )

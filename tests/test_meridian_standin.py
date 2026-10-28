@@ -378,3 +378,4 @@ def test_the_interpreter_exits_when_the_stand_in_cannot_be_imported(
     done = _start_with_pth(tmp_path, "raise ImportError('broken')\n")
     assert done.returncode == meridian_standin.EXIT_NOT_INSTALLED
     assert "started" not in done.stdout
+    assert "ImportError: broken" in done.stderr

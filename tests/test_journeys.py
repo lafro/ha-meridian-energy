@@ -196,6 +196,7 @@ def test_changed_rows_names_lost_and_changed_hours() -> None:
 # -------------------------------------------------------------------- screens
 
 _TRANSLATIONS = {
+    "component.meridian_energy.title": "Meridian Energy",
     "component.meridian_energy.config.step.import_failed.title": "Import failed",
     "component.meridian_energy.config.step.import_failed.description": (
         "Select Submit.\n\nDetails: {detail}."
@@ -287,15 +288,27 @@ def test_progress_abort_and_entry_screens_are_rendered() -> None:
         _TRANSLATIONS,
     )
     assert form.fields == ("otp",)
-    assert form.missing == ("component.meridian_energy.title", "step.otp.data.otp")
+    assert form.missing == ("step.otp.title", "step.otp.data.otp")
 
 
 def test_a_form_without_its_own_title_shows_the_integrations() -> None:
-    words = {**_TRANSLATIONS, "component.meridian_energy.title": "Meridian Energy"}
+    words = {
+        **_TRANSLATIONS,
+        "component.meridian_energy.config.step.untitled.description": "Words.",
+    }
     form = journeys.render(
         {"type": "form", "handler": "meridian_energy", "step_id": "untitled"}, words
     )
     assert (form.title, form.missing) == ("Meridian Energy", ())
+
+
+def test_a_form_with_no_words_of_its_own_lacks_them() -> None:
+    # A step renamed, or its texts dropped: only the dialog's own title shows.
+    form = journeys.render(
+        {"type": "form", "handler": "meridian_energy", "step_id": "renamed"},
+        _TRANSLATIONS,
+    )
+    assert (form.title, form.missing) == ("Meridian Energy", ("step.renamed.title",))
 
 
 def test_a_screen_with_an_unfilled_placeholder_lacks_its_words() -> None:
@@ -328,7 +341,7 @@ def test_field_labels_come_from_the_handlers_words() -> None:
     )
     assert screen.fields == ("Continue without history",)
     assert screen.missing == (
-        "component.meridian_energy.title",
+        "step.import_failed.title",
         "error.retry_too_soon",
     )
 
@@ -443,11 +456,13 @@ class _Client:
         (domain,) = messages[0]["integration"]
         category = messages[0]["category"]
         self.translated.append((domain, category))
-        prefix = f"component.{domain}.{category}."
+        prefix = f"component.{domain}.{category}"
         return [
             {
                 "resources": {
-                    k: v for k, v in _TRANSLATIONS.items() if k.startswith(prefix)
+                    k: v
+                    for k, v in _TRANSLATIONS.items()
+                    if k == prefix or k.startswith(f"{prefix}.")
                 }
             }
         ]
@@ -739,8 +754,24 @@ def test_a_journey_whose_clean_up_fails_fails_and_the_next_one_runs(
     )
     monkeypatch.setattr(Journey, "remove_entries", lambda _self: None)
     assert run.run("two_accounts").ok
-    assert journeys.summary(run.results, 2, 1) == (
-        "1 of 2 journeys passed; FAIL: the stand-in refused 1"
+    assert journeys.summary(run.results, 2) == "1 of 2 journeys passed"
+
+
+def test_a_failed_journey_whose_clean_up_fails_reports_both(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def stops(_journey: Journey) -> None:
+        raise JourneyError("timed out")
+
+    def broken(_self: Journey) -> None:
+        raise ValueError("not JSON")
+
+    monkeypatch.setattr(journeys, "first_setup", stops)
+    monkeypatch.setattr(Journey, "remove_entries", broken)
+    run = journeys.Run(live_ha.Instance(tmp_path, 8125, None, "1"), tmp_path)  # type: ignore[arg-type]
+    failed = run.run("first_setup")
+    assert failed.error == (
+        "JourneyError: timed out; the clean-up failed: ValueError: not JSON"
     )
 
 

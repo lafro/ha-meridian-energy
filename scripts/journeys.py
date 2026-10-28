@@ -339,7 +339,8 @@ def render(result: dict[str, Any], translations: dict[str, str]) -> Screen:
     Return a flow result as Home Assistant's dialog shows it.
 
     A form with no title of its own shows the integration's title, as in the
-    dialog.
+    dialog, but one with neither a title nor a description of its own lacks
+    its words.
     """
     handler = result.get("handler") or DOMAIN
     domain = result.get("translation_domain") or handler
@@ -365,10 +366,12 @@ def render(result: dict[str, Any], translations: dict[str, str]) -> Screen:
     fields: tuple[str, ...] = ()
     if kind == "form":
         step = str(result["step_id"])
-        title = text(f"{base}.step.{step}.title", required=False) or text(
+        body = text(f"{base}.step.{step}.description", required=False)
+        # A form needs words of its own, a title or a description: without
+        # them, its step was renamed or its texts dropped.
+        title = text(f"{base}.step.{step}.title", required=not body) or text(
             f"component.{handler}.title"
         )
-        body = text(f"{base}.step.{step}.description", required=False)
         if base_error := (result.get("errors") or {}).get("base"):
             error = text(f"{base}.error.{base_error}") or str(base_error)
         # Field labels come from the handler's texts alone, as in the dialog.
@@ -1330,10 +1333,9 @@ class Run:
                 journey.remove_entries()
             except Exception as err:  # noqa: BLE001
                 # What is left could change the next journey: this one fails.
-                result.error = result.error or (
-                    f"the clean-up failed: {type(err).__name__}: {err}"
-                )
-                say(f"  FAIL  {result.error}")
+                failed = f"the clean-up failed: {type(err).__name__}: {err}"
+                result.error = f"{result.error}; {failed}" if result.error else failed
+                say(f"  FAIL  {failed}")
             result.seconds = time.monotonic() - began
         say(
             f"{'PASS' if result.ok else 'FAIL'} journey {name} ({result.seconds:.0f} s)"
