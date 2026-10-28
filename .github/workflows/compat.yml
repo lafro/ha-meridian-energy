@@ -1,45 +1,56 @@
 name: Compatibility
 
-# Runs the test suite against the newest Home Assistant test harness, unpinned,
-# so a breaking Home Assistant release or beta shows up here before it reaches
-# production. The pinned harness in uv.lock is tested by validate.yml.
+# Tests the integration on each new Home Assistant version, beta, release and
+# patch alike, within hours of its test harness, so a break or a deprecation
+# shows up before that version reaches an installation. validate.yml tests the
+# harness pinned in uv.lock; this tests the newest ones, unpinned.
 #
-# - stable: the newest pytest-homeassistant-custom-component build for a final
-#   Home Assistant release. Skipped while that release is older than the
-#   minimum in hacs.json (the harness for a new release can lag it by a day).
-# - beta: the newest build overall. Skipped when it is not a pre-release.
-#
-# A scheduled failure opens, or comments on, one tracking issue, labelled
-# compat.
+# - plan (scripts/compat_plan.py): every 6 hours, works out the targets: main
+#   and the newest published release, each on the newest harness for a final
+#   Home Assistant release (stable) and, in a beta week, the newest harness for
+#   a beta (beta); and main on the minimum Home Assistant in hacs.json
+#   (minimum). A scheduled run stops here when an earlier run left the marker
+#   compat-done-<fingerprint> for exactly these targets, so the tests run only
+#   when Home Assistant, the harness or the integration has changed.
+# - tests: runs each target's own test suite on its harness, with
+#   scripts/compat_pytest_plugin.py from this checkout and the repository
+#   contract tests left out (they check the pinned harness on purpose). A
+#   broken outcome is retried once. Each target uploads its result as the
+#   artifact compat-result-<target>-<channel> (schema: docs/releasing.md).
+# - report: keeps one issue labelled compat open while any target is broken
+#   and one labelled deprecation while Home Assistant reports a deprecation,
+#   comments when what they list changes, and closes them when clear. Pull
+#   requests that change this workflow or its scripts run the plan and the
+#   tests but leave the issues and the marker alone.
 
 on:
   schedule:
-    - cron: "41 4 * * 2"
+    - cron: "17 */6 * * *"
   workflow_dispatch:
   pull_request:
     paths:
       - .github/workflows/compat.yml
+      - scripts/compat_*.py
 
 permissions:
   contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  tests:
-    name: tests (${{ matrix.channel }})
+  plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - channel: stable
-            prerelease: disallow
-          - channel: beta
-            prerelease: allow
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      # Reads the done markers (artifacts) of earlier runs.
+      actions: read
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      fingerprint: ${{ steps.plan.outputs.fingerprint }}
+      run: ${{ steps.plan.outputs.run }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -48,82 +59,180 @@ jobs:
         with:
           python-version: "3.14"
           enable-cache: false
-      - name: Install the newest test harness, unpinned
+      - id: plan
         env:
-          PRERELEASE: ${{ matrix.prerelease }}
-        run: |
-          uv venv
-          uv pip install --prerelease "$PRERELEASE" \
-            pytest-homeassistant-custom-component aioresponses
-      - name: Decide whether this channel applies
-        id: plan
+          GH_TOKEN: ${{ github.token }}
+        run: uv run --no-project scripts/compat_plan.py
+
+  tests:
+    needs: plan
+    if: needs.plan.outputs.run == 'true'
+    name: tests (${{ matrix.tag || matrix.target }}, ${{ matrix.channel }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    steps:
+      - name: Check out the scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: tooling
+          persist-credentials: false
+      - name: Check out the code under test
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.ref }}
+          path: target
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: false
+      - name: Install the harness, unpinned from uv.lock
+        working-directory: target
         env:
-          CHANNEL: ${{ matrix.channel }}
+          INSTALL: ${{ matrix.install }}
         run: |
-          .venv/bin/python - <<'PY'
-          import json
-          import os
-          from importlib.metadata import version
-          from pathlib import Path
-
-          from packaging.version import Version
-
-          channel = os.environ["CHANNEL"]
-          ha = Version(version("homeassistant"))
-          harness = version("pytest-homeassistant-custom-component")
-          minimum = Version(json.loads(Path("hacs.json").read_text())["homeassistant"])
-          if channel == "beta" and not ha.is_prerelease:
-              run, reason = False, "no Home Assistant beta is current"
-          elif channel == "stable" and ha < minimum:
-              run, reason = False, f"newest stable harness is below the minimum {minimum}"
-          else:
-              run, reason = True, "testing"
-          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
-              output.write(f"run={str(run).lower()}\n")
-          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as summary:
-              summary.write(
-                  f"### {channel}\n\n"
-                  f"- Home Assistant {ha}\n"
-                  f"- pytest-homeassistant-custom-component {harness}\n"
-                  f"- {reason}\n"
-              )
-          if not run:
-              print(f"::notice title=Compatibility ({channel})::Skipped: {reason}")
-          PY
+          # --no-config: none of pyproject.toml's uv settings apply here.
+          uv venv --no-config
+          # INSTALL is one or two requirements: the exact harness the plan
+          # chose, or the harness and the minimum Home Assistant for uv to
+          # match.
+          read -ra requirements <<< "$INSTALL"
+          uv pip install --no-config "${requirements[@]}" aioresponses
       - name: Run the test suite
-        if: steps.plan.outputs.run == 'true'
-        run: .venv/bin/python -m pytest
+        working-directory: target
+        env:
+          PYTHONPATH: ${{ github.workspace }}/tooling/scripts
+          COMPAT_PYTEST_REPORT: ${{ runner.temp }}/record.json
+          HA_DEPRECATIONS_REPORT: ${{ runner.temp }}/deprecations.json
+        run: |
+          args=(-p compat_pytest_plugin --no-cov --snapshot-warn-unused
+                --ignore=tests/test_repository_contracts.py)
+          # The outcome, not pytest's exit status, decides what this run found.
+          .venv/bin/python -m pytest "${args[@]}" || true
+          outcome="$(uv run --no-project --no-config ../tooling/scripts/compat_results.py outcome "$COMPAT_PYTEST_REPORT")"
+          if [[ "$outcome" == broken ]]; then
+            echo "::notice title=Compatibility::Broken; running the failed tests once more"
+            # The retry runs only the failed tests, so its deprecations are
+            # not the whole list: keep the first run's.
+            COMPAT_PYTEST_REPORT="${RUNNER_TEMP}/retry-record.json" \
+              HA_DEPRECATIONS_REPORT="${RUNNER_TEMP}/retry-deprecations.json" \
+              .venv/bin/python -m pytest "${args[@]}" --last-failed || true
+          fi
+      - name: Record the result
+        if: always()
+        working-directory: target
+        env:
+          MATRIX: ${{ toJSON(matrix) }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          installed="$(.venv/bin/python -c 'from importlib.metadata import version as v
+          print(v("homeassistant"), v("pytest-homeassistant-custom-component"))' || true)"
+          outcome="$(uv run --no-project --no-config ../tooling/scripts/compat_results.py result \
+            --matrix "$MATRIX" --installed "$installed" \
+            --manifest custom_components/meridian_energy/manifest.json \
+            --record "${RUNNER_TEMP}/record.json" \
+            --retry-record "${RUNNER_TEMP}/retry-record.json" \
+            --deprecations "${RUNNER_TEMP}/deprecations.json" \
+            --run-url "$RUN_URL" --out "${RUNNER_TEMP}/result/result.json")"
+          echo "OUTCOME=${outcome}" >> "$GITHUB_ENV"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: compat-result-${{ matrix.target }}-${{ matrix.channel }}
+          path: ${{ runner.temp }}/result/result.json
+          retention-days: 90
+          if-no-files-found: error
+      - name: Fail when broken
+        if: always()
+        run: |
+          echo "Outcome: ${OUTCOME:-none}"
+          [[ "${OUTCOME:-}" != broken && -n "${OUTCOME:-}" ]]
 
   report:
-    needs: tests
-    if: failure() && github.event_name == 'schedule'
+    needs: [plan, tests]
+    if: always() && needs.plan.outputs.run == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     permissions:
+      actions: read
       issues: write
     steps:
-      - name: Open or update the tracking issue
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          python-version: "3.14"
+          enable-cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: compat-result-*
+          path: results
+      - name: Summarise, and check every target has a result
+        env:
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+        run: |
+          uv run --no-project scripts/compat_results.py report --kind summary results >> "$GITHUB_STEP_SUMMARY"
+          uv run --no-project scripts/compat_results.py check results "$MATRIX"
+          uv run --no-project scripts/compat_results.py report --kind broken results > "${RUNNER_TEMP}/compat.md"
+          uv run --no-project scripts/compat_results.py report --kind deprecated results > "${RUNNER_TEMP}/deprecation.md"
+      - name: Open, update or close the tracking issues
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          title="Compatibility check failing against the newest Home Assistant"
-          # Anyone can open an issue with this title, so only an open issue
-          # labelled compat (which only the maintainer and this workflow can
-          # add) and opened by this workflow's bot counts as the tracking issue.
-          number="$(
-            gh api "repos/${GH_REPO}/issues?state=open&labels=compat&creator=github-actions%5Bbot%5D&per_page=100" \
-              --jq "map(select(.pull_request == null)) | .[0].number // empty"
-          )"
-          body="The weekly compatibility run failed: $RUN_URL"
-          if [[ -n "$number" ]]; then
-            gh issue comment "$number" --body "$body"
-          else
-            # --force updates the label when it already exists, so any other
-            # failure stops the step here. issues: write is enough to create
-            # or update a label.
-            gh label create compat --force --color e99695 \
-              --description "Weekly HA compatibility check failed (opened by compat.yml)"
-            gh issue create --title "$title" --body "$body" --label compat
-          fi
+          sync() {
+            local label="$1" color="$2" title="$3" description="$4" text="${RUNNER_TEMP}/$1.md"
+            local number marker body
+            # Anyone can open an issue, so only an open one with this label
+            # (which only the maintainer and this workflow can add) opened by
+            # this workflow's bot counts as the tracking issue.
+            number="$(
+              gh api "repos/${GH_REPO}/issues?state=open&labels=${label}&creator=github-actions%5Bbot%5D&per_page=100" \
+                --jq "map(select(.pull_request == null)) | .[0].number // empty"
+            )"
+            if [[ ! -s "$text" ]]; then
+              if [[ -n "$number" ]]; then
+                gh issue comment "$number" --body "Clear in the run of ${RUN_URL}, so this is closed."
+                gh issue close "$number" --reason completed
+              fi
+              return
+            fi
+            if [[ -z "$number" ]]; then
+              # --force updates the label when it already exists, so any other
+              # failure stops the step here.
+              gh label create "$label" --force --color "$color" --description "$description"
+              gh issue create --title "$title" --body-file "$text" --label "$label"
+              return
+            fi
+            # The first line is a hidden marker of what the text lists: comment
+            # only when that changed.
+            marker="$(head -n 1 "$text")"
+            body="$(gh issue view "$number" --json body --jq .body)"
+            if [[ "$body" != *"$marker"* ]]; then
+              gh issue comment "$number" --body-file "$text"
+              gh issue edit "$number" --body-file "$text"
+            fi
+          }
+          sync compat e99695 "Compatibility check failing against the newest Home Assistant" \
+            "Compatibility check failing (opened by compat.yml)"
+          sync deprecation fbca04 "Home Assistant reports a deprecation in this integration" \
+            "Home Assistant deprecation (opened by compat.yml)"
+      - name: Mark these targets tested
+        if: github.event_name != 'pull_request'
+        env:
+          FINGERPRINT: ${{ needs.plan.outputs.fingerprint }}
+        run: echo "$FINGERPRINT" > "${RUNNER_TEMP}/done.txt"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: github.event_name != 'pull_request'
+        with:
+          name: compat-done-${{ needs.plan.outputs.fingerprint }}
+          path: ${{ runner.temp }}/done.txt
+          retention-days: 30
+          if-no-files-found: error
