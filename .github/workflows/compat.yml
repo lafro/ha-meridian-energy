@@ -9,9 +9,10 @@ name: Compatibility
 #   and the newest published release, each on the newest harness for a final
 #   Home Assistant release (stable) and, in a beta week, the newest harness for
 #   a beta (beta); and main on the minimum Home Assistant in hacs.json
-#   (minimum). A scheduled run stops here when an earlier run left the marker
-#   compat-done-<fingerprint> for exactly these targets, so the tests run only
-#   when Home Assistant, the harness or the integration has changed.
+#   (minimum). A scheduled run stops here when an earlier run on main left
+#   the marker compat-done-<fingerprint> for exactly these targets, so the
+#   tests run only when Home Assistant, the harness or the integration has
+#   changed. Markers from other branches and forks do not count.
 # - tests: runs each target's own test suite on its harness, with
 #   scripts/compat_pytest_plugin.py from this checkout and the repository
 #   contract tests left out (they check the pinned harness on purpose). A

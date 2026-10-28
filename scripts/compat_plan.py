@@ -40,6 +40,9 @@ HARNESS = "pytest-homeassistant-custom-component"
 PYPI = "https://pypi.org/pypi/"
 GITHUB_API = "https://api.github.com/"
 DONE_PREFIX = "compat-done-"
+# The only branch whose runs' done markers count: a fork's pull request runs
+# its own copy of compat.yml in this repository and could upload one.
+TRUSTED_BRANCH = "main"
 # Harness releases looked at for one that pins a final release: a beta week
 # brings at most about five.
 LOOKBACK = 20
@@ -204,11 +207,29 @@ def fingerprint(entries: list[dict[str, str]]) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
 
+def _trusted(artifact: dict[str, Any]) -> bool:
+    """
+    Return whether a run on this repository's own main uploaded ``artifact``.
+
+    A pull request's run, a fork's included, uploads its artifacts to this
+    repository too, under its own head branch and head repository.
+    """
+    run = artifact.get("workflow_run") or {}
+    return (
+        not artifact["expired"]
+        and run.get("head_branch") == TRUSTED_BRANCH
+        and run.get("head_repository_id") is not None
+        and run.get("head_repository_id") == run.get("repository_id")
+    )
+
+
 def already_tested(fetch_github: Fetch, repository: str, digest: str) -> bool:
-    """Return whether a run left the done marker for this fingerprint."""
+    """Return whether a run on main left the done marker for this fingerprint."""
     name = urllib.parse.quote(DONE_PREFIX + digest, safe="")
-    found = fetch_github(f"repos/{repository}/actions/artifacts?name={name}&per_page=5")
-    return any(not artifact["expired"] for artifact in found["artifacts"])
+    found = fetch_github(
+        f"repos/{repository}/actions/artifacts?name={name}&per_page=20"
+    )
+    return any(_trusted(artifact) for artifact in found["artifacts"])
 
 
 def summary(entries: list[dict[str, str]], *, run: bool, digest: str) -> str:

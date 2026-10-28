@@ -35,7 +35,7 @@ Users update through HACS and restart Home Assistant. A problem found after rele
   - `main` and the newest published release (what HACS installs), each on the newest harness for a final Home Assistant release (`stable`) and, while the newest harness pins a beta, on that one too (`beta`);
   - `main` on exactly the minimum Home Assistant in `hacs.json` (`minimum`), with the harness uv matches to it.
 
-  A scheduled run tests only when the targets changed since a run that tested them: it leaves the artifact `compat-done-<fingerprint>` (kept 30 days), and the next scheduled run with the same targets stops after the plan. A manual run, or a pull request that changes the workflow or `scripts/compat_*.py`, always tests.
+  A scheduled run tests only when the targets changed since a run on `main` that tested them: such a run leaves the artifact `compat-done-<fingerprint>` (kept 30 days), and the next scheduled run with the same targets stops after the plan. A marker from any other branch or a fork does not count. A manual run, or a pull request that changes the workflow or `scripts/compat_*.py`, always tests.
 - Each target runs its own test suite on its harness, unpinned from `uv.lock`, without the coverage gates and without `tests/test_repository_contracts.py`, which checks the pinned harness on purpose. `scripts/compat_pytest_plugin.py` sorts the failures:
   - `passed`;
   - `snapshot-differences`: only syrupy snapshots differ, as when Home Assistant adds a field to what a snapshot stores. Not a break; the snapshots move with the harness pin (`uv run pytest --snapshot-update`, then review the `.ambr` diff);

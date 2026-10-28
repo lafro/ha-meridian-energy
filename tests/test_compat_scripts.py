@@ -240,14 +240,32 @@ def test_the_newest_release_passes_over_drafts() -> None:
     )
 
 
+MAIN_RUN = {"head_branch": "main", "repository_id": 7, "head_repository_id": 7}
+FORK_RUN = {"head_branch": "main", "repository_id": 7, "head_repository_id": 8}
+BRANCH_RUN = {"head_branch": "fix/x", "repository_id": 7, "head_repository_id": 7}
+
+
 @pytest.mark.parametrize(
     ("event", "artifacts", "run"),
     [
         ("schedule", [], "true"),
-        ("schedule", [{"expired": True}], "true"),
-        ("schedule", [{"expired": False}], "false"),
-        ("workflow_dispatch", [{"expired": False}], "true"),
-        ("pull_request", [{"expired": False}], "true"),
+        ("schedule", [{"expired": True, "workflow_run": MAIN_RUN}], "true"),
+        ("schedule", [{"expired": False, "workflow_run": MAIN_RUN}], "false"),
+        # Only a run on this repository's own main can mark targets tested:
+        # a fork's pull request runs its own copy of the workflow here.
+        ("schedule", [{"expired": False, "workflow_run": FORK_RUN}], "true"),
+        ("schedule", [{"expired": False, "workflow_run": BRANCH_RUN}], "true"),
+        ("schedule", [{"expired": False}], "true"),
+        (
+            "schedule",
+            [
+                {"expired": False, "workflow_run": FORK_RUN},
+                {"expired": False, "workflow_run": MAIN_RUN},
+            ],
+            "false",
+        ),
+        ("workflow_dispatch", [{"expired": False, "workflow_run": MAIN_RUN}], "true"),
+        ("pull_request", [{"expired": False, "workflow_run": MAIN_RUN}], "true"),
     ],
 )
 def test_main_writes_the_plan_and_skips_what_was_tested(
