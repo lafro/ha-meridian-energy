@@ -77,7 +77,7 @@ Requires Home Assistant 2026.10.0 or newer.
 
 ### Maintenance
 
-- Tests run against Home Assistant 2026.10 (pytest-homeassistant-custom-component 0.13.370), plus a weekly compatibility run against the newest release and beta.
+- Tests run against Home Assistant 2026.10.4 (pytest-homeassistant-custom-component 0.13.375), plus a weekly compatibility run against the newest release and beta.
 - Dependabot uses the `uv` ecosystem, so updates change `uv.lock` together with `pyproject.toml`, and CI installs with `uv sync --locked`.
 - Development dependencies upgraded; the Pillow and PyJWT overrides were removed because Home Assistant 2026.10 pins patched versions.
 - Release notes are this file's section for the version, and CI fails when the version has no section here.
