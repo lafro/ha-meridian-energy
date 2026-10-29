@@ -252,16 +252,18 @@ def port_in_use(port: int) -> bool:
 def is_instance(pid: int, state: Path) -> bool:
     """Return whether ``pid`` is still this instance's Home Assistant."""
     # A process ID is reused once its process ends, so it is checked against
-    # the command line ``start`` used, never trusted on its own. -ww: the
-    # whole command line, which Linux's ps otherwise cuts to 80 columns when
-    # its output is not a terminal.
+    # the command line ``spawn`` used, never trusted on its own: by the
+    # instance's configuration folder, since a framework build of Python shows
+    # its own path in place of the instance's. -ww: the whole command line,
+    # which Linux's ps otherwise cuts to 80 columns when its output is not a
+    # terminal.
     result = subprocess.run(  # noqa: S603
         ["ps", "-ww", "-o", "command=", "-p", str(pid)],  # noqa: S607
         check=False,
         capture_output=True,
         text=True,
     )
-    return str(state / "venv" / "bin" / "hass") in result.stdout
+    return f"--config {config_dir(state)}" in result.stdout
 
 
 def signal_group(pid: int, signum: signal.Signals) -> None:
@@ -684,9 +686,19 @@ class Instance:
 
 def spawn(state: Path) -> subprocess.Popen[bytes]:
     """Start the instance's Home Assistant in a process group of its own."""
+    # Through the launcher rather than Home Assistant's own hass script, so the
+    # process ends without the teardown that crashes Python 3.14 on macOS.
+    # -P: the launcher's folder, this repository's scripts, stays off sys.path.
+    launcher = ROOT / "scripts" / "hass_launcher.py"
     with (state / "hass.out").open("ab") as out:
         process = subprocess.Popen(  # noqa: S603
-            [venv_dir(state) / "bin" / "hass", "--config", config_dir(state)],
+            [
+                venv_dir(state) / "bin" / "python",
+                "-P",
+                launcher,
+                "--config",
+                config_dir(state),
+            ],
             stdout=out,
             stderr=subprocess.STDOUT,
             start_new_session=True,
