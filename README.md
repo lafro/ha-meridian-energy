@@ -46,7 +46,7 @@ Each selected account is represented by one service device.
 | **Latest usage data** | End of the newest completed usage interval received. |
 | **Provisional data intervals** | Non-actual consumption intervals in the rolling 14-day correction window. |
 | **Current bill usage** | Grid import recorded in Meridian's current billing period. |
-| **Current bill cost** | Available tax-inclusive interval cost for that period, including any standing-charge components Meridian assigns to intervals. |
+| **Current bill cost** | Available tax-inclusive interval cost for that period, added up as Meridian's app does: usage, the daily charge, and any other charges or credits Meridian assigns to intervals. |
 | **Current bill export** | Grid export in the current period; feed-in accounts only. |
 | **Current bill export credit** | Retailer credit for that export; feed-in accounts only. |
 
