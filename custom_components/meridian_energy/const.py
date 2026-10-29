@@ -131,5 +131,17 @@ READING_FREQUENCY_HOUR = "HOUR_INTERVAL"
 READING_QUALITY_COMBINED = "COMBINED"
 AGGREGATE_CHANNEL_ID = "aggregate"
 
-COST_STATISTIC_TYPES = frozenset({"CONSUMPTION_COST", "STANDING_CHARGE_COST"})
+# The cost types Meridian's own app adds up for an hour's cost, each with its
+# sign, so a credit lowers it. Only the first two have been seen on an account.
+COST_STATISTIC_TYPES = frozenset(
+    {
+        "CONSUMPTION_COST",
+        "STANDING_CHARGE_COST",
+        "CAPACITY_CHARGE_COST",
+        "DEMAND_CHARGE_COST",
+        "DISTANCE_CHARGE_COST",
+        "ADDITIONAL_CHARGE_COST",
+        "ADDITIONAL_CREDIT_COST",
+    }
+)
 GENERATION_CREDIT_TYPES = frozenset({"GENERATION_VALUE"})

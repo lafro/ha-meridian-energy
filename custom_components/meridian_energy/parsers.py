@@ -5,7 +5,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-from datetime import UTC, date, datetime, timedelta
+import logging
+import re
+from datetime import UTC, date, datetime, timedelta, tzinfo
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -17,12 +19,21 @@ from .const import (
 )
 from .models import MeridianMeasurement, MeridianTokenSet, require_list, require_mapping
 
+_LOGGER = logging.getLogger(__name__)
+
 
 class TokenParseError(ValueError):
     """A Firebase token response could not be parsed safely."""
 
 
 _MAX_TOKEN_LIFETIME_SECONDS = 86400
+_KNOWN_COST_TYPES = COST_STATISTIC_TYPES | GENERATION_CREDIT_TYPES
+_COST_TYPE_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+# What a type is named in the log when it is not a plain upper-case name.
+_UNNAMED_COST_TYPE = "UNNAMED"
+# The unknown types already logged since Home Assistant started: every hour
+# of every window would carry one, so each is logged once.
+_logged_cost_types: set[str] = set()
 
 
 def parse_firebase_tokens(payload: dict[str, Any]) -> MeridianTokenSet:
@@ -128,10 +139,16 @@ def _measurement_channel_id(filters: dict[str, Any]) -> str:
 
 
 def _measurement_cost_cents(metadata: dict[str, Any], direction: str) -> Decimal | None:
-    """Return a complete interval cost or credit, in cents."""
-    allowed_cost_types = (
-        GENERATION_CREDIT_TYPES if direction == "GENERATION" else COST_STATISTIC_TYPES
-    )
+    """
+    Return a complete interval cost or credit, in cents.
+
+    A cost adds up every cost type Meridian's own app counts, each with its
+    sign, so a credit lowers it, below zero even. An export credit counts
+    as positive, whatever its sign. A type the integration does not know is
+    left out, and its name logged once.
+    """
+    generation = direction == "GENERATION"
+    allowed_cost_types = GENERATION_CREDIT_TYPES if generation else COST_STATISTIC_TYPES
     cost_cents = Decimal(0)
     found_cost = False
     incomplete_cost = False
@@ -139,7 +156,9 @@ def _measurement_cost_cents(metadata: dict[str, Any], direction: str) -> Decimal
         metadata.get("statistics") or [], "measurement statistics"
     ):
         statistic = require_mapping(statistic_value, "measurement statistic")
-        if statistic.get("type") not in allowed_cost_types:
+        cost_type = statistic.get("type")
+        if not isinstance(cost_type, str) or cost_type not in allowed_cost_types:
+            _log_unknown_cost_type(cost_type)
             continue
         found_cost = True
         raw_cost = statistic.get("costInclTax")
@@ -151,8 +170,24 @@ def _measurement_cost_cents(metadata: dict[str, Any], direction: str) -> Decimal
         if amount in {None, ""}:
             incomplete_cost = True
             continue
-        cost_cents += abs(_finite_decimal(amount, "measurement cost"))
+        cents = _finite_decimal(amount, "measurement cost")
+        cost_cents += abs(cents) if generation else cents
     return None if not found_cost or incomplete_cost else cost_cents
+
+
+def _log_unknown_cost_type(cost_type: object) -> None:
+    """Log, once and by name only, a type that is neither a cost nor a credit."""
+    if isinstance(cost_type, str) and cost_type in _KNOWN_COST_TYPES:
+        return
+    name = (
+        cost_type
+        if isinstance(cost_type, str) and _COST_TYPE_PATTERN.fullmatch(cost_type)
+        else _UNNAMED_COST_TYPE
+    )
+    if name in _logged_cost_types:
+        return
+    _logged_cost_types.add(name)
+    _LOGGER.debug("Left out a measurement statistic of an unknown type: %s", name)
 
 
 def _finite_decimal(value: Any, context: str) -> Decimal:
@@ -205,3 +240,28 @@ def optional_date(value: Any) -> date | None:
     except ValueError:
         # Not chained: the standard message would put the date in a traceback.
         raise ValueError("Invalid Meridian billing date") from None
+
+
+def optional_local_date(value: Any, zone: tzinfo) -> date | None:
+    """
+    Parse an optional plain date, or an aware instant as its date in ``zone``.
+
+    Meridian sends register dates as UTC instants of New Zealand midnight
+    (``2021-06-30T12:00:00+00:00`` is 1 July there), not as plain dates.
+    """
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise ValueError("Invalid Meridian register date")
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        pass
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        # Not chained: the standard message would put the date in a traceback.
+        raise ValueError("Invalid Meridian register date") from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("Naive Meridian register date")
+    return parsed.astimezone(zone).date()

@@ -1331,7 +1331,7 @@ async def test_bill_completeness_checks_the_cost_steps_not_only_the_hours(
             property_keys=(key,),
             start=T0,
             end=T0 + 10 * HOUR,
-            include_generation=False,
+            feed_in_keys=(),
         )
 
     complete = await totals()
@@ -1348,6 +1348,37 @@ async def test_bill_completeness_checks_the_cost_steps_not_only_the_hours(
     assert seamed.usage == Decimal(10)
     assert seamed.cost_complete is False
     assert seamed.cost is None
+
+
+@pytest.mark.asyncio
+async def test_an_hour_a_credit_takes_below_zero_lowers_the_running_and_bill_cost(
+    recorder_mock, hass: HomeAssistant
+) -> None:
+    """
+    An hour whose credits outweigh its charges keeps its negative cost.
+
+    Its row stores the negative state, the running total steps down by it,
+    and the bill's cost, summed from the rows' changes, is lowered by it.
+    """
+    del recorder_mock
+    key = property_key("A-TEST-1", "synthetic-property")
+    cents = ["10", "10", "-25", "10"]
+    await _replay(hass, "A-TEST-1", [_m(i, "1", c) for i, c in enumerate(cents)])
+
+    _energy_id, cost_id = _ids("A-TEST-1")
+    rows = await _rows(hass, cost_id)
+    assert [row[1] for row in rows] == pytest.approx([0.1, 0.1, -0.25, 0.1])
+    assert [row[2] for row in rows] == pytest.approx([0.1, 0.2, -0.05, 0.05])
+    totals = await async_account_period_totals(
+        hass,
+        property_keys=(key,),
+        feed_in_keys=(),
+        start=T0,
+        end=T0 + 4 * HOUR,
+    )
+    assert totals.cost_complete is True
+    assert totals.cost is not None
+    assert float(totals.cost) == pytest.approx(0.05)
 
 
 @pytest.mark.parametrize("generation", [False, True], ids=["usage", "export"])
@@ -1401,9 +1432,9 @@ async def test_bill_completeness_checks_the_energy_steps_too(
     totals = await async_account_period_totals(
         hass,
         property_keys=(key,),
+        feed_in_keys=(key,) if generation else (),
         start=T0,
         end=T0 + 10 * HOUR,
-        include_generation=generation,
     )
 
     if generation:
@@ -1445,7 +1476,7 @@ async def test_bill_totals_do_not_wait_without_end_for_a_busy_recorder(
                     property_keys=(key,),
                     start=T0,
                     end=T0 + 4 * HOUR,
-                    include_generation=False,
+                    feed_in_keys=(),
                 )
     finally:
         hold.release()

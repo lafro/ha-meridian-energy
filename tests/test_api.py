@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import traceback
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
@@ -14,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from aiohttp import ClientError
 
+from custom_components.meridian_energy import parsers as parsers_module
 from custom_components.meridian_energy.api import (
     MeridianApiClient,
     MeridianAuthenticationError,
@@ -441,8 +443,10 @@ async def test_get_accounts_parses_feed_in_register() -> None:
                                     "marketIdentifier": "0000000000TEST",
                                     "registers": [
                                         {
+                                            # Meridian's form: the UTC instant
+                                            # of New Zealand midnight.
                                             "identifier": "EXPORT",
-                                            "activeFrom": "2026-01-01",
+                                            "activeFrom": "2025-12-31T11:00:00+00:00",
                                             "activeTo": None,
                                             "isFeedIn": True,
                                         }
@@ -519,17 +523,56 @@ async def test_get_accounts_ignores_inactive_feed_in_registers() -> None:
     [
         ({"isFeedIn": False}, date(2026, 7, 16), False),
         ({"isFeedIn": True}, date(2026, 7, 16), True),
+        # Plain dates: activeFrom is inclusive, activeTo exclusive.
         (
-            {
-                "isFeedIn": True,
-                "activeFrom": "2026-07-16",
-                "activeTo": "2026-07-16",
-            },
+            {"isFeedIn": True, "activeFrom": "2026-07-16", "activeTo": None},
             date(2026, 7, 16),
             True,
         ),
         (
-            {"isFeedIn": True, "activeFrom": None, "activeTo": "2026-07-15"},
+            {"isFeedIn": True, "activeFrom": "2026-07-17", "activeTo": None},
+            date(2026, 7, 16),
+            False,
+        ),
+        (
+            {"isFeedIn": True, "activeFrom": None, "activeTo": "2026-07-17"},
+            date(2026, 7, 16),
+            True,
+        ),
+        # A register ending today is no longer active.
+        (
+            {"isFeedIn": True, "activeFrom": "2026-01-01", "activeTo": "2026-07-16"},
+            date(2026, 7, 16),
+            False,
+        ),
+        # Meridian's form: UTC instants of New Zealand midnight, read as New
+        # Zealand dates (12:00 UTC on 15 July is midnight on 16 July there).
+        (
+            {"isFeedIn": True, "activeFrom": "2026-07-15T12:00:00+00:00"},
+            date(2026, 7, 16),
+            True,
+        ),
+        (
+            {"isFeedIn": True, "activeFrom": "2026-07-15T12:00:00+00:00"},
+            date(2026, 7, 15),
+            False,
+        ),
+        (
+            {"isFeedIn": True, "activeFrom": "2026-07-16T00:00:00+12:00"},
+            date(2026, 7, 16),
+            True,
+        ),
+        (
+            {"isFeedIn": True, "activeFrom": "2021-06-30T12:00:00Z"},
+            date(2026, 7, 16),
+            True,
+        ),
+        (
+            {
+                "isFeedIn": True,
+                "activeFrom": "2021-06-30T12:00:00+00:00",
+                "activeTo": "2026-07-15T12:00:00+00:00",
+            },
             date(2026, 7, 16),
             False,
         ),
@@ -539,6 +582,46 @@ def test_active_feed_in_register_contract(
     register: dict[str, object], today: date, expected: bool
 ) -> None:
     assert _is_active_feed_in_register(register, today) is expected
+
+
+@pytest.mark.parametrize(
+    ("today", "expected"),
+    [(date(2026, 7, 15), (True, False)), (date(2026, 7, 16), (False, True))],
+)
+def test_back_to_back_feed_in_registers_are_active_one_at_a_time(
+    today: date, expected: tuple[bool, bool]
+) -> None:
+    # One register's activeTo is the next one's activeFrom: New Zealand
+    # midnight starting 16 July.
+    handover = "2026-07-15T12:00:00+00:00"
+    earlier = {
+        "isFeedIn": True,
+        "activeFrom": "2021-06-30T12:00:00+00:00",
+        "activeTo": handover,
+    }
+    later = {"isFeedIn": True, "activeFrom": handover, "activeTo": None}
+    assert (
+        _is_active_feed_in_register(earlier, today),
+        _is_active_feed_in_register(later, today),
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("2026-07-16T00:00:00", "Naive"),
+        ("2026-13-45T00:00:00+00:00 for A-TEST-1", "Invalid"),
+        (20260716, "Invalid"),
+    ],
+)
+def test_feed_in_register_dates_are_strict_and_quote_nothing(
+    value: object, message: str
+) -> None:
+    register = {"isFeedIn": True, "activeFrom": value}
+    with pytest.raises(ValueError, match=message) as raised:
+        _is_active_feed_in_register(register, date(2026, 7, 16))
+    assert "A-TEST-1" not in "".join(traceback.format_exception(raised.value))
+    assert "2026" not in str(raised.value)
 
 
 def test_active_feed_in_register_rejects_invalid_flag() -> None:
@@ -715,6 +798,110 @@ def test_parse_consumption_measurement_filters_cost_types() -> None:
     assert str(measurement.value_kwh) == "1.25"
     assert str(measurement.cost_cents) == "45.5"
     assert measurement.start.utcoffset() == timedelta(hours=12)
+
+
+def _cost(cost_type: object, amount: str) -> dict[str, object]:
+    return {"type": cost_type, "costInclTax": {"estimatedAmount": amount}}
+
+
+def test_parse_consumption_measurement_adds_every_charge_meridian_counts() -> None:
+    """The charges Meridian's app adds to usage and the daily charge count too."""
+    measurement = _parse_measurement(
+        _measurement_node(
+            statistics=[
+                _cost("CONSUMPTION_COST", "37.5"),
+                _cost("STANDING_CHARGE_COST", "8.0"),
+                _cost("CAPACITY_CHARGE_COST", "1.25"),
+                _cost("DEMAND_CHARGE_COST", "2.5"),
+                _cost("DISTANCE_CHARGE_COST", "0.75"),
+                _cost("ADDITIONAL_CHARGE_COST", "3"),
+            ]
+        ),
+        "CONSUMPTION",
+    )
+
+    assert measurement.cost_cents == Decimal("53.0")
+
+
+@pytest.mark.parametrize(
+    ("credit", "expected"),
+    [("-20", "25.5"), ("-60", "-14.5")],
+    ids=["lowers_the_cost", "below_zero"],
+)
+def test_parse_consumption_measurement_subtracts_a_credit(
+    credit: str, expected: str
+) -> None:
+    """A credit keeps its sign, as in Meridian's app, so it lowers the hour's cost."""
+    measurement = _parse_measurement(
+        _measurement_node(
+            statistics=[
+                _cost("CONSUMPTION_COST", "37.5"),
+                _cost("STANDING_CHARGE_COST", "8.0"),
+                _cost("ADDITIONAL_CREDIT_COST", credit),
+            ]
+        ),
+        "CONSUMPTION",
+    )
+
+    assert measurement.cost_cents == Decimal(expected)
+
+
+def test_parse_measurement_leaves_out_an_unknown_type_and_logs_only_its_name(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A type Meridian may add later is left out, and named once in the log.
+
+    The name is logged only when it is a plain upper-case name, and no
+    amount ever is. The export credit's type is known, so a usage reading
+    that carries it leaves it out without a word.
+    """
+    monkeypatch.setattr(parsers_module, "_logged_cost_types", set())
+    caplog.set_level(logging.DEBUG, logger=parsers_module.__name__)
+    node = _measurement_node(
+        statistics=[
+            _cost("CONSUMPTION_COST", "37.5"),
+            _cost("SYNTHETIC_NEW_COST", "123.45"),
+            _cost("synthetic-label-0f3a", "678.9"),
+            _cost({"nested": "synthetic"}, "246.8"),
+            _cost("GENERATION_VALUE", "-5"),
+        ]
+    )
+
+    first = _parse_measurement(node, "CONSUMPTION")
+    second = _parse_measurement(node, "CONSUMPTION")
+
+    assert first.cost_cents == second.cost_cents == Decimal("37.5")
+    records = [r for r in caplog.records if r.name == parsers_module.__name__]
+    assert [r.levelno for r in records] == [logging.DEBUG, logging.DEBUG]
+    assert [r.getMessage().rsplit(": ", 1)[1] for r in records] == [
+        "SYNTHETIC_NEW_COST",
+        "UNNAMED",
+    ]
+    for leaked in ("123.45", "678.9", "246.8", "synthetic-label", "nested"):
+        assert leaked not in caplog.text
+
+
+def test_parse_generation_measurement_keeps_the_export_credit_positive(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Export credit counts as before; the usage cost types are left out of it."""
+    monkeypatch.setattr(parsers_module, "_logged_cost_types", set())
+    caplog.set_level(logging.DEBUG, logger=parsers_module.__name__)
+    measurement = _parse_measurement(
+        _measurement_node(
+            direction="GENERATION",
+            statistics=[
+                _cost("GENERATION_VALUE", "-12.5"),
+                _cost("CONSUMPTION_COST", "40"),
+                _cost("ADDITIONAL_CREDIT_COST", "-3"),
+            ],
+        ),
+        "GENERATION",
+    )
+
+    assert measurement.cost_cents == Decimal("12.5")
+    assert not [r for r in caplog.records if r.name == parsers_module.__name__]
 
 
 def test_parse_measurement_rejects_negative_energy() -> None:

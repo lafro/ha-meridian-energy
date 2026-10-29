@@ -423,6 +423,64 @@ async def test_a_restart_goes_on_from_what_the_recorder_holds(
     await _assert_consistent(hass, energy_id, cost_id)
 
 
+@pytest.mark.asyncio
+async def test_gaps_older_than_14_days_in_a_stored_history_are_filled_in(
+    recorder_mock, hass: HomeAssistant
+) -> None:
+    """
+    Hours missing between stored days older than 14 days are asked for.
+
+    As after updating from a version that never asked for them again: the
+    history holds the last 90 days but for 6 days about 50 days back and 3
+    hours 20 days back, which Meridian has. A new coordinator finds them in
+    the recorder, and the update after its first sync fills them in with
+    Meridian's readings, every running sum consistent.
+    """
+    del recorder_mock
+    big = (local_midnight(TODAY - 50 * DAY), local_midnight(TODAY - 44 * DAY))
+    small_start = local_midnight(TODAY - 20 * DAY) + 10 * HOUR
+    small = (small_start, small_start + 3 * HOUR)
+    number = "A-TEST-L5"
+    gapped = FakeKraken(
+        NOW, history_start=NOW - 400 * DAY, future_rows=False, gaps=[big, small]
+    )
+    energy_id, cost_id = await _seed_recent(hass, number, gapped, 90)
+    rows = await _rows(hass, energy_id)
+    assert len(_missing_hours(rows, *big)) == 6 * 24
+    assert len(_missing_hours(rows, *small)) == 3
+    await _assert_consistent(hass, energy_id, cost_id)
+
+    kraken = FakeKraken(NOW, history_start=NOW - 400 * DAY, future_rows=False)
+    service = _Service(kraken)
+    coordinator = await _restarted(hass, number, service)
+    data = await _sync(hass, coordinator, NOW)
+
+    # After the hourly update's one request, one window for each: the small
+    # gap's day, the big gap's 6 days, and the day 90 days back, whose
+    # hours from midnight the seed left out.
+    oldest = coverage_target(NOW, None).astimezone(NZ).date()
+    small_day = small_start.astimezone(NZ).date()
+    big_days = (TODAY - 50 * DAY, TODAY - 45 * DAY)
+    assert data.coverage_windows == 3
+    assert service.requests[1:] == [
+        (small_day, small_day, "CONSUMPTION"),
+        (*big_days, "CONSUMPTION"),
+        (oldest, oldest, "CONSUMPTION"),
+    ]
+    rows = await _rows(hass, energy_id)
+    assert _missing_hours(rows, coverage_target(NOW, None), _floor_hour(NOW)) == []
+    filled = [
+        row
+        for row in rows
+        if big[0].timestamp() <= row[0] < big[1].timestamp()
+        or small[0].timestamp() <= row[0] < small[1].timestamp()
+    ]
+    assert len(filled) == 6 * 24 + 3
+    assert all(row[1] == pytest.approx(0.5) for row in filled)
+    await _assert_consistent(hass, energy_id, cost_id)
+    assert coordinator.unit_diagnostics()[0]["reaches_target"] is True
+
+
 # ---------------------------------------------------------------- outages
 
 
@@ -617,6 +675,206 @@ async def test_a_quarterly_billing_period_92_days_back_gets_complete_bill_totals
     hours = (_floor_hour(later) - local_midnight(start)) / HOUR
     assert float(totals.current_bill_usage or 0) == pytest.approx(0.5 * hours)
     assert float(totals.current_bill_cost or 0) == pytest.approx(0.15 * hours)
+
+
+@pytest.mark.parametrize(("days_back", "undone"), [(3, True), (20, False)])
+@pytest.mark.asyncio
+async def test_an_adjust_sum_in_the_bill_leaves_its_totals_unknown_until_rewritten(
+    recorder_mock, hass: HomeAssistant, days_back: int, undone: bool
+) -> None:
+    """
+    Adjust sum on an hour of the current bill leaves its totals unknown.
+
+    The usage total and its cost both, though only the usage was adjusted.
+    A restart writes the last 14 days again from Meridian: that undoes an
+    adjustment 3 days back, and the totals return. One 20 days back is
+    kept, and so are the unknown totals, until the bill ends: the next
+    bill's totals, from its own first hour, are known again, and the
+    adjustment is still there.
+    """
+    del recorder_mock
+    kraken = FakeKraken(NOW, history_start=NOW - 400 * DAY, future_rows=False)
+    service = _Service(kraken)
+    start = TODAY - 30 * DAY
+    billing = MeridianBillingPeriod(
+        period_length="MONTHLY",
+        period_length_multiplier=1,
+        is_fixed=True,
+        start=start,
+        end=TODAY + 5 * DAY,
+        next_billing_date=TODAY + 6 * DAY,
+        period_start_day=start.day,
+    )
+    number = "A-TEST-B9"
+    energy_id, cost_id = consumption_ids(property_key(number, PROPERTY))
+    coordinator = _coordinator(hass, number, service, billing=billing)
+    await _sync(hass, coordinator, NOW)
+
+    def totals(data: Any) -> tuple[float | None, float | None]:
+        (result,) = data.account_results
+        return (
+            None
+            if result.current_bill_usage is None
+            else float(result.current_bill_usage),
+            None
+            if result.current_bill_cost is None
+            else float(result.current_bill_cost),
+        )
+
+    def expected(now: datetime) -> tuple[float, float]:
+        hours = (_floor_hour(now) - local_midnight(start)) / HOUR
+        return (pytest.approx(0.5 * hours), pytest.approx(0.15 * hours))
+
+    now = NOW + HOUR
+    kraken.now = now
+    assert totals(await _sync(hass, coordinator, now)) == expected(now)
+
+    adjusted = _floor_hour(now - days_back * DAY)
+    get_instance(hass).async_adjust_statistics(energy_id, adjusted, -5.0, "kWh")
+    await async_wait_recording_done(hass)
+    now += HOUR
+    kraken.now = now
+    assert totals(await _sync(hass, coordinator, now)) == (None, None)
+    assert _bad_steps(await _rows(hass, energy_id)) == [adjusted.timestamp()]
+
+    now += HOUR
+    kraken.now = now
+    restarted = await _restarted(hass, number, service, billing=billing)
+    data = await _sync(hass, restarted, now)
+
+    if undone:
+        assert totals(data) == expected(now)
+        await _assert_consistent(hass, energy_id, cost_id)
+    else:
+        assert totals(data) == (None, None)
+        assert _bad_steps(await _rows(hass, energy_id)) == [adjusted.timestamp()]
+        following = billing.end + DAY
+        restarted.client.async_get_billing_period.return_value = replace(
+            billing,
+            start=following,
+            end=following + 30 * DAY,
+            next_billing_date=following + 31 * DAY,
+            period_start_day=following.day,
+        )
+        now = local_midnight(following) + 5 * HOUR
+        kraken.now = now
+        assert totals(await _sync(hass, restarted, now)) == (
+            pytest.approx(0.5 * 5),
+            pytest.approx(0.15 * 5),
+        )
+        assert _bad_steps(await _rows(hass, energy_id)) == [adjusted.timestamp()]
+
+
+@pytest.mark.parametrize(
+    ("adjusted", "unknown"),
+    [
+        ("usage", {"usage", "cost"}),
+        ("cost", {"cost"}),
+        ("export", {"export", "credit"}),
+        ("credit", {"credit"}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_an_adjust_sum_leaves_unknown_the_totals_that_use_its_statistic(
+    recorder_mock, hass: HomeAssistant, adjusted: str, unknown: set[str]
+) -> None:
+    """
+    Adjusted usage leaves its cost unknown too, and export its credit.
+
+    A cost total is withheld with its usage, so an adjusted usage or export
+    leaves both of its totals unknown; an adjusted cost or credit leaves
+    that total alone unknown. The other totals stay known.
+    """
+    del recorder_mock
+    kraken = FakeKraken(NOW, history_start=NOW - 400 * DAY, future_rows=False)
+    service = _Service(kraken)
+    start = TODAY - 30 * DAY
+    billing = MeridianBillingPeriod(
+        period_length="MONTHLY",
+        period_length_multiplier=1,
+        is_fixed=True,
+        start=start,
+        end=TODAY + 5 * DAY,
+        next_billing_date=TODAY + 6 * DAY,
+        period_start_day=start.day,
+    )
+    number = "A-TEST-B11"
+    key = property_key(number, PROPERTY)
+    statistics = dict(
+        zip(
+            ("usage", "cost", "export", "credit"),
+            (*consumption_ids(key), *generation_ids(key)),
+            strict=True,
+        )
+    )
+    coordinator = _coordinator(hass, number, service, billing=billing, feed_in=True)
+    await _sync(hass, coordinator, NOW)
+
+    def known(data: Any) -> set[str]:
+        (result,) = data.account_results
+        return {
+            name
+            for name in ("usage", "cost", "export", "credit")
+            if getattr(result, f"current_bill_{name}") is not None
+        }
+
+    now = NOW + HOUR
+    kraken.now = now
+    everything = {"usage", "cost", "export", "credit"}
+    assert known(await _sync(hass, coordinator, now)) == everything
+
+    unit = "NZD" if adjusted in {"cost", "credit"} else "kWh"
+    hour = _floor_hour(now - 3 * DAY)
+    get_instance(hass).async_adjust_statistics(statistics[adjusted], hour, -5.0, unit)
+    await async_wait_recording_done(hass)
+    now += HOUR
+    kraken.now = now
+
+    assert known(await _sync(hass, coordinator, now)) == everything - unknown
+
+
+@pytest.mark.asyncio
+async def test_the_weekly_reconciliation_undoes_an_adjust_sum_in_the_last_14_days(
+    recorder_mock, hass: HomeAssistant
+) -> None:
+    """
+    With no restart, the week's reconciliation writes the 14 days again.
+
+    An hour adjusted 3 days back is still inside them 7 days later, so the
+    weekly update writes it again from Meridian and the bill totals return.
+    """
+    del recorder_mock
+    kraken = FakeKraken(NOW, history_start=NOW - 400 * DAY, future_rows=False)
+    service = _Service(kraken)
+    start = TODAY - 30 * DAY
+    billing = MeridianBillingPeriod(
+        period_length="MONTHLY",
+        period_length_multiplier=1,
+        is_fixed=True,
+        start=start,
+        end=TODAY + 10 * DAY,
+        next_billing_date=TODAY + 11 * DAY,
+        period_start_day=start.day,
+    )
+    number = "A-TEST-B10"
+    energy_id, cost_id = consumption_ids(property_key(number, PROPERTY))
+    coordinator = _coordinator(hass, number, service, billing=billing)
+    await _sync(hass, coordinator, NOW)
+    adjusted = _floor_hour(NOW - 3 * DAY)
+    get_instance(hass).async_adjust_statistics(energy_id, adjusted, -5.0, "kWh")
+    await async_wait_recording_done(hass)
+
+    seen = []
+    for days in range(1, 9):
+        now = NOW + days * DAY
+        kraken.now = now
+        data = await _sync(hass, coordinator, now)
+        (result,) = data.account_results
+        seen.append((data.sync_mode, result.current_bill_usage is None))
+
+    targeted, full = SyncMode.TARGETED_RECONCILIATION, SyncMode.FULL_RECONCILIATION
+    assert seen == [(targeted, True)] * 6 + [(full, False), (targeted, False)]
+    await _assert_consistent(hass, energy_id, cost_id)
 
 
 @pytest.mark.asyncio
@@ -1138,7 +1396,7 @@ async def test_the_monthly_revision_corrects_an_estimate_older_than_14_days(
     recorder_mock, hass: HomeAssistant, revision_pass: None
 ) -> None:
     """
-    An hour 30 days back that Meridian has revised since is written again.
+    An hour 30 days back, an estimate Meridian has since read, is written again.
 
     On the lane's day of the month its updates ask again for every stored
     day from 90 days to 14 days back, 6 windows at a time, and write only
@@ -1156,15 +1414,28 @@ async def test_the_monthly_revision_corrects_an_estimate_older_than_14_days(
 
     seed_at = at - DAY
     kraken = FakeKraken(
-        seed_at, history_start=at - 400 * DAY, future_rows=False, value=value
+        seed_at,
+        history_start=at - 400 * DAY,
+        future_rows=False,
+        value=value,
+        estimated={revised},
     )
     service = _Service(kraken)
     coordinator = _coordinator(hass, number, service)
     energy_id, cost_id = consumption_ids(key)
+    quality = kraken.node(revised, 0, "CONSUMPTION")["metaData"]["utilityFilters"]
+    assert quality["readingQuality"] == "ESTIMATE"
     data = await _sync(hass, coordinator, seed_at)
     assert data.revision_windows == 0
+    (row,) = [
+        row for row in await _rows(hass, energy_id) if row[0] == revised.timestamp()
+    ]
+    assert row[1] == pytest.approx(0.5)
     values["revised"] = "2.5"
+    kraken.estimated.clear()
     kraken.now = at
+    quality = kraken.node(revised, 0, "CONSUMPTION")["metaData"]["utilityFilters"]
+    assert quality["readingQuality"] == "ACTUAL"
 
     data = await _sync(hass, coordinator, at)
 
