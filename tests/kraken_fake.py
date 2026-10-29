@@ -25,7 +25,8 @@ that end before it, or for any ``startOn`` before its date, as the web
 app's clamping of ``startOn`` to the supply start suggests), gaps, rows
 without a cost, withdrawn newest rows, empty windows and in-band error
 codes, for any window starting on a date or only for one longer than a day
-(``week_codes``). Every value is synthetic.
+(``week_codes``), and past hours still estimated (``estimated``). Every
+value is synthetic.
 
 The fake answers at two levels: ``graphql`` returns the HTTP body for the
 integration's real client (see ``meridian_http.FakeMeridianSession``), and
@@ -120,6 +121,7 @@ class FakeKraken:
         codes: dict[date, str] | None = None,
         week_codes: dict[date, str] | None = None,
         repeat_cursors: bool = False,
+        estimated: Iterable[datetime] = (),
     ) -> None:
         self.now = now
         if history_start is None:
@@ -146,6 +148,7 @@ class FakeKraken:
         self.codes = dict(codes or {})
         self.week_codes = dict(week_codes or {})
         self.repeat_cursors = repeat_cursors
+        self.estimated = set(estimated)
         # Each request's arguments, without identifiers, and the rows its
         # list held: what Kraken had to build to answer it.
         self.requests: list[dict[str, Any]] = []
@@ -245,6 +248,7 @@ class FakeKraken:
                     "readingQuality": (
                         "ACTUAL"
                         if end <= local_midnight(self.now.astimezone(NZ).date())
+                        and start not in self.estimated
                         else "ESTIMATE"
                     ),
                 },

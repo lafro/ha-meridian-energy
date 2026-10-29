@@ -66,7 +66,7 @@ def test_the_instance_is_reachable_from_this_computer_only(tmp_path: Path) -> No
 
 
 def test_the_store_form_matches_the_home_assistant_under_test() -> None:
-    # The weekly compatibility workflow runs this against newer releases, so a
+    # The compatibility workflow runs this against each new release, so a
     # change to how Home Assistant stores web-server settings shows here
     # before a live test meets it.
     assert live_ha.http_store_version(Path(sys.executable)) == (
@@ -250,23 +250,32 @@ def test_terminate_kills_a_group_that_ignores_sigterm_and_waits_for_it(
     child.stdout.close()
 
 
-def test_the_instance_is_recognised_by_its_command_line(tmp_path: Path) -> None:
-    hass = tmp_path / "venv" / "bin" / "hass"
-    hass.parent.mkdir(parents=True)
-    hass.write_text("import time\ntime.sleep(60)\n")
-    process = subprocess.Popen([sys.executable, hass], start_new_session=True)
+def test_home_assistant_starts_through_the_launcher_and_is_recognised(
+    tmp_path: Path,
+) -> None:
+    # The instance's Python, faked: a shell script that sleeps, so its
+    # arguments stay on its command line.
+    python = tmp_path / "venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("#!/bin/sh\nsleep 60\n")
+    python.chmod(0o700)
+    process = live_ha.spawn(tmp_path)
     try:
-        assert live_ha.is_instance(process.pid, tmp_path), subprocess.run(
+        command = subprocess.run(
             ["ps", "-ww", "-o", "command=", "-p", str(process.pid)],
             capture_output=True,
             text=True,
             check=False,
         ).stdout
+        launcher = live_ha.ROOT / "scripts" / "hass_launcher.py"
+        assert f"-P {launcher} --config {tmp_path / 'config'}" in command
+        assert (tmp_path / "hass.pid").read_text() == str(process.pid)
+        assert live_ha.is_instance(process.pid, tmp_path), command
         assert not live_ha.is_instance(process.pid, tmp_path / "other")
         assert not live_ha.is_instance(os.getpid(), tmp_path)
     finally:
-        process.kill()
-        process.wait()
+        live_ha.terminate(process.pid, lambda: process.poll() is None)
+    assert process.returncode == -signal.SIGTERM
 
 
 def test_stop_never_signals_a_process_that_is_not_the_instance(

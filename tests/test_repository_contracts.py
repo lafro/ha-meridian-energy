@@ -179,28 +179,119 @@ def test_dependabot_labels_are_explicit() -> None:
     }
 
 
-def test_compat_failures_open_a_labelled_tracking_issue() -> None:
-    workflow = yaml.safe_load(Path(".github/workflows/compat.yml").read_text())
-    report = workflow["jobs"]["report"]
-    assert report["if"] == "failure() && github.event_name == 'schedule'"
-    assert report["permissions"] == {"issues": "write"}
+def _compat_workflow() -> dict[Any, Any]:
+    return yaml.safe_load(Path(".github/workflows/compat.yml").read_text())
+
+
+def _commands(script: str) -> str:
+    """Join continuation lines and whitespace so each command matches whole."""
+    return " ".join(script.replace("\\\n", " ").split())
+
+
+def test_compat_runs_when_home_assistant_or_the_integration_changes() -> None:
+    """The plan polls; the tests run only for targets not already tested.
+
+    A scheduled run whose targets (each ref with its harness and Home
+    Assistant) carry an earlier run's done marker stops after the plan, so
+    polling every 6 hours costs a few seconds until a beta, a release, a patch,
+    a harness or a commit to main changes them.
+    """
+    workflow = _compat_workflow()
+    # PyYAML reads the key "on" as True.
+    triggers = workflow[True]
+    assert triggers["schedule"] == [{"cron": "17 */6 * * *"}]
+    assert "workflow_dispatch" in triggers
+    assert set(triggers["pull_request"]["paths"]) == {
+        ".github/workflows/compat.yml",
+        "scripts/compat_*.py",
+    }
     assert workflow["permissions"] == {"contents": "read"}
-    script = report["steps"][0]["run"]
-    # Join continuation lines and whitespace so each command matches whole.
-    commands = " ".join(script.replace("\\\n", " ").split())
-    # --force, not "|| true": only "already exists" is harmless. The colour and
-    # description are the live label's.
+
+    plan = workflow["jobs"]["plan"]
+    assert plan["permissions"] == {"contents": "read", "actions": "read"}
+    assert "scripts/compat_plan.py" in plan["steps"][-1]["run"]
+
+    tests = workflow["jobs"]["tests"]
+    assert tests["if"] == "needs.plan.outputs.run == 'true'"
+    assert tests["strategy"]["fail-fast"] is False
+    assert "permissions" not in tests
+    steps = {step.get("name"): step for step in tests["steps"]}
+    install = steps["Install the harness, unpinned from uv.lock"]
+    assert install["env"]["INSTALL"] == "${{ matrix.install }}"
+    assert "uv venv --no-config" in install["run"]
+    assert "uv pip install --no-config" in install["run"]
+    run = _commands(steps["Run the test suite"]["run"])
+    # The contract tests check the pinned harness on purpose, so they are left
+    # out; coverage gates belong to validate.yml.
     assert (
-        "gh label create compat --force --color e99695 "
-        '--description "Weekly HA compatibility check failed (opened by compat.yml)" '
-        "gh issue create"
+        "args=(-p compat_pytest_plugin --no-cov --snapshot-warn-unused "
+        "--ignore=tests/test_repository_contracts.py)"
+    ) in run
+    assert "--last-failed" in run
+    record = steps["Record the result"]["run"]
+    assert "--manifest custom_components/meridian_energy/manifest.json" in record
+
+
+def test_compat_failures_open_a_labelled_tracking_issue() -> None:
+    workflow = _compat_workflow()
+    report = workflow["jobs"]["report"]
+    assert report["if"] == "always() && needs.plan.outputs.run == 'true'"
+    assert report["permissions"] == {"actions": "read", "issues": "write"}
+
+    steps = {step.get("name"): step for step in report["steps"]}
+    sync = steps["Open, update or close the tracking issues"]
+    # Pull requests that change the workflow run it, but never touch issues
+    # or mark targets tested.
+    assert sync["if"] == "github.event_name != 'pull_request'"
+    assert steps["Mark these targets tested"]["if"] == sync["if"]
+    upload = next(step for step in report["steps"] if "compat-done-" in str(step))
+    assert upload["if"] == sync["if"]
+
+    script = sync["run"]
+    commands = _commands(script)
+    # --force, not "|| true": only "already exists" is harmless.
+    assert (
+        'gh label create "$label" --force --color "$color" '
+        '--description "$description" '
+        'gh issue create --title "$title" --body-file "$text" --label "$label"'
     ) in commands
     assert "|| true" not in script
-    assert 'gh issue create --title "$title" --body "$body" --label compat' in script
     # Anyone can open an issue with the title, so the tracking issue is found
     # by its label and by the bot that opened it, never by title alone.
-    assert "issues?state=open&labels=compat&creator=github-actions%5Bbot%5D" in script
+    assert (
+        "issues?state=open&labels=${label}&creator=github-actions%5Bbot%5D"
+    ) in script
     assert "--search" not in script
+    # The colour and description of compat are the live label's.
+    assert (
+        'sync compat e99695 "Compatibility check failing against the newest '
+        'Home Assistant" "Compatibility check failing (opened by compat.yml)"'
+    ) in commands
+    assert 'sync deprecation fbca04 "Home Assistant reports a deprecation' in commands
+
+
+def test_dependabot_moves_the_harness_after_the_month_s_release() -> None:
+    """The uv updates run once a month, while the harness pins a release.
+
+    The harness pins the newest Home Assistant, betas included. From about the
+    23rd until the day after the release, by the 8th, that is a beta, which
+    test_pull_requests_are_tested_on_a_supported_release refuses (the harness
+    locked 2026.10.0b4 on 1 October). Any day from the 9th to the 21st avoids
+    that window; compat.yml tests the patches between.
+    """
+    config = yaml.safe_load(Path(".github/dependabot.yml").read_text())
+    uv_updates = next(
+        update for update in config["updates"] if update["package-ecosystem"] == "uv"
+    )
+    schedule = uv_updates["schedule"]
+    assert schedule.keys() == {"interval", "cronjob"}
+    assert schedule["interval"] == "cron"
+    minute, hour, day, month, weekday = schedule["cronjob"].split()
+    assert (month, weekday) == ("*", "*")
+    assert day.isdigit(), f"one day of the month, not {day!r}"
+    assert 9 <= int(day) <= 21
+    assert minute.isdigit()
+    assert hour.isdigit()
 
 
 def test_workflow_actions_are_pinned_to_commit_shas() -> None:
