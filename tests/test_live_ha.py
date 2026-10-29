@@ -66,7 +66,7 @@ def test_the_instance_is_reachable_from_this_computer_only(tmp_path: Path) -> No
 
 
 def test_the_store_form_matches_the_home_assistant_under_test() -> None:
-    # The weekly compatibility workflow runs this against newer releases, so a
+    # The compatibility workflow runs this against each new release, so a
     # change to how Home Assistant stores web-server settings shows here
     # before a live test meets it.
     assert live_ha.http_store_version(Path(sys.executable)) == (
