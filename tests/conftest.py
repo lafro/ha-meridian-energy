@@ -14,7 +14,9 @@ from syrupy.assertion import SnapshotAssertion
 from custom_components.meridian_energy import coordinator as coordinator_module
 from custom_components.meridian_energy import lanes as lanes_module
 
-pytest_plugins = "pytest_homeassistant_custom_component"
+# ha_deprecations fails the run on any deprecation Home Assistant reports for
+# this integration; see that module.
+pytest_plugins = ["pytest_homeassistant_custom_component", "tests.ha_deprecations"]
 
 
 @pytest.fixture(autouse=True)
