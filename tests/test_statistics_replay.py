@@ -1331,7 +1331,7 @@ async def test_bill_completeness_checks_the_cost_steps_not_only_the_hours(
             property_keys=(key,),
             start=T0,
             end=T0 + 10 * HOUR,
-            include_generation=False,
+            feed_in_keys=(),
         )
 
     complete = await totals()
@@ -1401,9 +1401,9 @@ async def test_bill_completeness_checks_the_energy_steps_too(
     totals = await async_account_period_totals(
         hass,
         property_keys=(key,),
+        feed_in_keys=(key,) if generation else (),
         start=T0,
         end=T0 + 10 * HOUR,
-        include_generation=generation,
     )
 
     if generation:
@@ -1445,7 +1445,7 @@ async def test_bill_totals_do_not_wait_without_end_for_a_busy_recorder(
                     property_keys=(key,),
                     start=T0,
                     end=T0 + 4 * HOUR,
-                    include_generation=False,
+                    feed_in_keys=(),
                 )
     finally:
         hold.release()

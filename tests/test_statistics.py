@@ -364,9 +364,9 @@ async def test_account_period_totals_combines_properties_and_generation() -> Non
         result = await async_account_period_totals(
             AsyncMock(),
             property_keys=("first", "second"),
+            feed_in_keys=("first",),
             start=start,
             end=end,
-            include_generation=True,
         )
 
     assert result.usage == Decimal("12.0")
@@ -406,7 +406,7 @@ async def test_account_period_totals_withholds_incomplete_cost_and_history() -> 
             property_keys=("first",),
             start=start,
             end=end,
-            include_generation=False,
+            feed_in_keys=(),
         )
 
     assert result.usage is None
@@ -448,7 +448,7 @@ async def test_account_period_totals_withholds_matched_internal_hourly_gap(
             property_keys=("first",),
             start=start,
             end=end,
-            include_generation=False,
+            feed_in_keys=(),
         )
 
     assert result.usage is None
@@ -486,7 +486,7 @@ async def test_account_period_totals_reports_per_metric_completeness() -> None:
             property_keys=("first",),
             start=start,
             end=end,
-            include_generation=False,
+            feed_in_keys=(),
         )
 
     assert result.usage == Decimal("2.0")
@@ -551,7 +551,7 @@ async def test_multi_property_totals_share_latest_published_horizon() -> None:
             property_keys=("first", "second"),
             start=start,
             end=end,
-            include_generation=False,
+            feed_in_keys=(),
         )
 
     assert result.usage is None
@@ -598,9 +598,9 @@ async def test_account_period_totals_withhold_money_whose_steps_miss_its_states(
         result = await async_account_period_totals(
             AsyncMock(),
             property_keys=("first",),
+            feed_in_keys=("first",) if generation else (),
             start=start,
             end=end,
-            include_generation=generation,
         )
 
     if generation:
@@ -636,7 +636,7 @@ async def test_account_period_totals_read_on_after_a_barrier_timed_out(
             property_keys=("first",),
             start=start,
             end=start + timedelta(hours=1),
-            include_generation=False,
+            feed_in_keys=(),
         )
 
     assert result.usage == Decimal("1.0")
