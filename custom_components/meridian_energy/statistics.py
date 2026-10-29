@@ -866,9 +866,9 @@ async def async_account_period_totals(
     hass: HomeAssistant,
     *,
     property_keys: tuple[str, ...],
+    feed_in_keys: tuple[str, ...],
     start: datetime,
     end: datetime,
-    include_generation: bool,
 ) -> BillingPeriodTotals:
     """
     Return complete account totals for an exact UTC billing-period range.
@@ -884,6 +884,9 @@ async def async_account_period_totals(
     credit when it has a row for each of those hours, which steps so too.
     That leaves a total unknown for the period too where a user adjusted
     its running total there, and the money total with the usage or export.
+    Export and credit count each property in ``feed_in_keys``, those with a
+    feed-in register, so one with no export rows leaves them unknown as one
+    with no usage rows leaves usage unknown.
     """
     instance = get_instance(hass)
     if not await async_wait_for_recorder(hass):
@@ -897,7 +900,7 @@ async def async_account_period_totals(
         consumption_energy, consumption_cost = consumption_ids(key)
         pairs.append((consumption_energy, consumption_cost, False))
         statistic_ids.update((consumption_energy, consumption_cost))
-        if include_generation:
+        if key in feed_in_keys:
             generation_energy, generation_credit = generation_ids(key)
             pairs.append((generation_energy, generation_credit, True))
             statistic_ids.update((generation_energy, generation_credit))
@@ -970,9 +973,7 @@ async def async_account_period_totals(
             generation_horizon if generation else consumption_horizon,
         )
         if generation:
-            if not energy_rows:
-                continue
-            saw_generation = True
+            saw_generation |= bool(energy_rows)
             generation_complete &= energy_complete
             credit_complete &= energy_starts == money_starts and money_consistent
             exported += sum((row[1] for row in energy_rows), Decimal(0))

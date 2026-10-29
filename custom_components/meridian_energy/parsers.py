@@ -7,7 +7,7 @@ import hashlib
 import json
 import logging
 import re
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta, tzinfo
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -240,3 +240,28 @@ def optional_date(value: Any) -> date | None:
     except ValueError:
         # Not chained: the standard message would put the date in a traceback.
         raise ValueError("Invalid Meridian billing date") from None
+
+
+def optional_local_date(value: Any, zone: tzinfo) -> date | None:
+    """
+    Parse an optional plain date, or an aware instant as its date in ``zone``.
+
+    Meridian sends register dates as UTC instants of New Zealand midnight
+    (``2021-06-30T12:00:00+00:00`` is 1 July there), not as plain dates.
+    """
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str):
+        raise ValueError("Invalid Meridian register date")
+    try:
+        return date.fromisoformat(value)
+    except ValueError:
+        pass
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        # Not chained: the standard message would put the date in a traceback.
+        raise ValueError("Invalid Meridian register date") from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError("Naive Meridian register date")
+    return parsed.astimezone(zone).date()

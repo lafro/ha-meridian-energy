@@ -435,9 +435,8 @@ async def test_account_results_derive_current_period_totals(hass) -> None:
         "custom_components.meridian_energy.coordinator.async_account_period_totals",
         new=AsyncMock(return_value=totals),
     ) as calculate:
-        result = await coordinator._async_account_results(
-            (_account(feed_in=True),), NOW
-        )
+        account = _account(feed_in=True)
+        result = await coordinator._async_account_results((account,), NOW)
 
     assert result[0].current_bill_usage == Decimal("12.3")
     assert result[0].current_bill_cost == Decimal("4.56")
@@ -446,7 +445,9 @@ async def test_account_results_derive_current_period_totals(hass) -> None:
     assert result[0].cost_complete is True
     assert result[0].export_complete is True
     assert result[0].credit_complete is True
-    assert calculate.await_args.kwargs["include_generation"] is True
+    assert calculate.await_args.kwargs["feed_in_keys"] == (
+        property_key(account.number, account.properties[0].id),
+    )
 
 
 @pytest.mark.asyncio
