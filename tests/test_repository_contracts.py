@@ -388,6 +388,8 @@ def test_check_versions_reads_a_beta_from_its_release_section(tmp_path: Path) ->
     with pytest.raises(SystemExit, match="Tag mismatch"):
         check_versions.main(["v9.8.7b1"], root)
     assert check_versions.changelog_version("9.8.7rc1") == "9.8.7rc1"
+    # Digits as release.yml reads them, [0-9]: Python's \d takes other scripts' too.
+    assert check_versions.changelog_version("9.8.7b٢") == "9.8.7b٢"
 
 
 def test_release_workflow_marks_only_beta_tags_as_pre_releases() -> None:

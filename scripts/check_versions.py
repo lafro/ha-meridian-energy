@@ -20,7 +20,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 NOTES_OPTION = "--release-notes"
-BETA_VERSION = re.compile(r"(\d+\.\d+\.\d+)b\d+")
+BETA_VERSION = re.compile(r"([0-9]+\.[0-9]+\.[0-9]+)b[0-9]+")
 
 
 def changelog_version(version: str) -> str:
