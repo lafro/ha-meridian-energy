@@ -15,14 +15,17 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.update_coordinator import UpdateFailed
+from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.meridian_energy import coordinator as coordinator_module
+from custom_components.meridian_energy import sensor as sensor_module
 from custom_components.meridian_energy.api import (
     MeridianAuthenticationError,
     MeridianConnectionError,
@@ -31,6 +34,7 @@ from custom_components.meridian_energy.api import (
     MeridianUpstreamError,
 )
 from custom_components.meridian_energy.const import (
+    DOMAIN,
     FIRST_SYNC_RETRY_SCHEDULE,
     INITIAL_BACKFILL,
     POLL_BUDGET_SECONDS,
@@ -1216,6 +1220,117 @@ async def test_every_unit_waiting_fails_the_update_with_their_failure(hass) -> N
     assert waiting.value.translation_key == "upstream_timeout"
     assert waiting.value.translation_placeholders == {"detail": "HTTP 504"}
     assert waiting.value.retry_after is None
+
+
+@pytest.mark.asyncio
+async def test_a_reload_asks_again_at_once_for_a_waiting_unit(hass) -> None:
+    """
+    A unit's wait is kept in memory only, so a reload or restart ends it.
+
+    Either builds a new coordinator with no setup hand-off (test_init's reload
+    test), whose first update asks Meridian at once.
+    """
+    clock = _Clock()
+    now = {"value": NOW}
+    service = _service(clock)
+    client = _client(service, _account())
+    coordinator = MeridianDataCoordinator(hass, client)
+
+    with _running(clock, lambda: now["value"], latest=NOW - 2 * HOUR):
+        await coordinator.async_fetch_and_import()
+        service.fail = lambda _request: _gateway_timeout()
+        for hours in (1, 2):
+            now["value"] = NOW + hours * HOUR
+            with pytest.raises(UpdateFailed):
+                await coordinator.async_fetch_and_import()
+        before = len(service.requests)
+        now["value"] = NOW + 3 * HOUR
+        with pytest.raises(UpdateFailed):
+            await coordinator.async_fetch_and_import()
+        assert len(service.requests) == before
+
+        service.fail = lambda _request: None
+        reloaded = MeridianDataCoordinator(hass, client)
+        data = await reloaded.async_fetch_and_import()
+
+    assert len(service.requests) > before
+    assert data.windows_ok > 0
+
+
+@pytest.mark.parametrize("failing", ["property", "export"])
+@pytest.mark.asyncio
+async def test_one_failing_unit_leaves_the_updates_to_the_others(
+    hass, failing: str
+) -> None:
+    """
+    A second property, or a property's export, that keeps failing fails nothing.
+
+    Every update succeeds, so every entity stays available, the failing
+    unit's too, and the healthy unit imports its newest hours at each of
+    them while the failing one waits out its failures.
+    """
+    second = "synthetic-second-property"
+    clock = _Clock()
+    now = {"value": NOW}
+    if failing == "property":
+        service = _service(clock, ACTIVE, second)
+        account = _account(ACTIVE, second)
+
+        def broken(request: _Request) -> bool:
+            return request.property_id == second
+
+    else:
+        service = _service(clock)
+        account = _account(feed_in=True)
+
+        def broken(request: _Request) -> bool:
+            return request.direction == "GENERATION"
+
+    coordinator = MeridianDataCoordinator(hass, _client(service, account))
+    entry = MockConfigEntry(domain=DOMAIN, title="person@example.com")
+    entry.runtime_data = SimpleNamespace(coordinator=coordinator, client=MagicMock())
+    entities: list[Any] = []
+
+    with _running(clock, lambda: now["value"], latest=NOW - 2 * HOUR) as importer:
+        await coordinator.async_refresh()
+        await sensor_module.async_setup_entry(hass, entry, entities.extend)
+        assert all(entity.available for entity in entities)
+        service.fail = lambda request: _gateway_timeout() if broken(request) else None
+        seen = []
+        for hours in (1, 2, 3):
+            now["value"] = NOW + hours * HOUR
+            imports = importer.await_count
+            asked = len([request for request in service.requests if broken(request)])
+            await coordinator.async_refresh()
+            data = coordinator.data
+            seen.append(
+                (
+                    [
+                        call.kwargs["stat_energy_id"]
+                        for call in importer.await_args_list[imports:]
+                    ],
+                    len([request for request in service.requests if broken(request)])
+                    > asked,
+                    data.units_failed,
+                    data.units_deferred,
+                    coordinator.last_update_success,
+                    [
+                        entity.entity_description.key
+                        for entity in entities
+                        if not entity.available
+                    ],
+                )
+            )
+    await entry._async_process_on_unload(hass)
+
+    # Failed at 1 and 2 h, the failing unit then waits 2 h and asks nothing.
+    healthy = [f"meridian_energy:consumption_{property_key(ACCOUNT, ACTIVE)}"]
+    assert seen == [
+        (healthy, True, 1, 0, True, []),
+        (healthy, True, 1, 0, True, []),
+        (healthy, False, 0, 1, True, []),
+    ]
+    assert len(entities) == (8 if failing == "property" else 10)
 
 
 @pytest.mark.asyncio
