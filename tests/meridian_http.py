@@ -273,12 +273,13 @@ def account_data(
     Return a synthetic account, its property and its meter.
 
     With ``feed_in``, the meter also has an active feed-in register, so the
-    property has a generation direction.
+    property has a generation direction. Register dates are UTC instants of
+    New Zealand midnight, as Meridian sends them: 1 January 2020 here.
     """
     registers: list[dict[str, Any]] = [
         {
             "identifier": "synthetic-register",
-            "activeFrom": "2020-01-01",
+            "activeFrom": "2019-12-31T11:00:00+00:00",
             "activeTo": None,
             "isFeedIn": False,
         }
@@ -287,7 +288,7 @@ def account_data(
         registers.append(
             {
                 "identifier": "synthetic-feed-in-register",
-                "activeFrom": "2020-01-01",
+                "activeFrom": "2019-12-31T11:00:00+00:00",
                 "activeTo": None,
                 "isFeedIn": True,
             }

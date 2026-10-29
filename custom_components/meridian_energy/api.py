@@ -65,6 +65,9 @@ from .parsers import (
     optional_date as _optional_date,
 )
 from .parsers import (
+    optional_local_date as _optional_local_date,
+)
+from .parsers import (
     optional_string as _optional_string,
 )
 from .parsers import (
@@ -132,16 +135,21 @@ TokenUpdateCallback = Callable[[MeridianTokenSet], Awaitable[None]]
 
 
 def _is_active_feed_in_register(register: dict[str, Any], today: date) -> bool:
-    """Return whether a feed-in register is active on the supplied local date."""
+    """
+    Return whether a feed-in register is active on the supplied local date.
+
+    ``activeTo`` is exclusive: a register's ``activeTo`` is the next one's
+    ``activeFrom``.
+    """
     is_feed_in = register.get("isFeedIn")
     if not isinstance(is_feed_in, bool):
         raise ValueError("Invalid feed-in register flag")
     if not is_feed_in:
         return False
-    active_from = _optional_date(register.get("activeFrom"))
-    active_to = _optional_date(register.get("activeTo"))
+    active_from = _optional_local_date(register.get("activeFrom"), _NZ)
+    active_to = _optional_local_date(register.get("activeTo"), _NZ)
     return (active_from is None or active_from <= today) and (
-        active_to is None or active_to >= today
+        active_to is None or today < active_to
     )
 
 

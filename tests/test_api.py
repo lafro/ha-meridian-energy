@@ -441,8 +441,10 @@ async def test_get_accounts_parses_feed_in_register() -> None:
                                     "marketIdentifier": "0000000000TEST",
                                     "registers": [
                                         {
+                                            # Meridian's form: the UTC instant
+                                            # of New Zealand midnight.
                                             "identifier": "EXPORT",
-                                            "activeFrom": "2026-01-01",
+                                            "activeFrom": "2025-12-31T11:00:00+00:00",
                                             "activeTo": None,
                                             "isFeedIn": True,
                                         }
@@ -519,17 +521,56 @@ async def test_get_accounts_ignores_inactive_feed_in_registers() -> None:
     [
         ({"isFeedIn": False}, date(2026, 7, 16), False),
         ({"isFeedIn": True}, date(2026, 7, 16), True),
+        # Plain dates: activeFrom is inclusive, activeTo exclusive.
         (
-            {
-                "isFeedIn": True,
-                "activeFrom": "2026-07-16",
-                "activeTo": "2026-07-16",
-            },
+            {"isFeedIn": True, "activeFrom": "2026-07-16", "activeTo": None},
             date(2026, 7, 16),
             True,
         ),
         (
-            {"isFeedIn": True, "activeFrom": None, "activeTo": "2026-07-15"},
+            {"isFeedIn": True, "activeFrom": "2026-07-17", "activeTo": None},
+            date(2026, 7, 16),
+            False,
+        ),
+        (
+            {"isFeedIn": True, "activeFrom": None, "activeTo": "2026-07-17"},
+            date(2026, 7, 16),
+            True,
+        ),
+        # A register ending today is no longer active.
+        (
+            {"isFeedIn": True, "activeFrom": "2026-01-01", "activeTo": "2026-07-16"},
+            date(2026, 7, 16),
+            False,
+        ),
+        # Meridian's form: UTC instants of New Zealand midnight, read as New
+        # Zealand dates (12:00 UTC on 15 July is midnight on 16 July there).
+        (
+            {"isFeedIn": True, "activeFrom": "2026-07-15T12:00:00+00:00"},
+            date(2026, 7, 16),
+            True,
+        ),
+        (
+            {"isFeedIn": True, "activeFrom": "2026-07-15T12:00:00+00:00"},
+            date(2026, 7, 15),
+            False,
+        ),
+        (
+            {"isFeedIn": True, "activeFrom": "2026-07-16T00:00:00+12:00"},
+            date(2026, 7, 16),
+            True,
+        ),
+        (
+            {"isFeedIn": True, "activeFrom": "2021-06-30T12:00:00Z"},
+            date(2026, 7, 16),
+            True,
+        ),
+        (
+            {
+                "isFeedIn": True,
+                "activeFrom": "2021-06-30T12:00:00+00:00",
+                "activeTo": "2026-07-15T12:00:00+00:00",
+            },
             date(2026, 7, 16),
             False,
         ),
@@ -539,6 +580,46 @@ def test_active_feed_in_register_contract(
     register: dict[str, object], today: date, expected: bool
 ) -> None:
     assert _is_active_feed_in_register(register, today) is expected
+
+
+@pytest.mark.parametrize(
+    ("today", "expected"),
+    [(date(2026, 7, 15), (True, False)), (date(2026, 7, 16), (False, True))],
+)
+def test_back_to_back_feed_in_registers_are_active_one_at_a_time(
+    today: date, expected: tuple[bool, bool]
+) -> None:
+    # One register's activeTo is the next one's activeFrom: New Zealand
+    # midnight starting 16 July.
+    handover = "2026-07-15T12:00:00+00:00"
+    earlier = {
+        "isFeedIn": True,
+        "activeFrom": "2021-06-30T12:00:00+00:00",
+        "activeTo": handover,
+    }
+    later = {"isFeedIn": True, "activeFrom": handover, "activeTo": None}
+    assert (
+        _is_active_feed_in_register(earlier, today),
+        _is_active_feed_in_register(later, today),
+    ) == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("2026-07-16T00:00:00", "Naive"),
+        ("2026-13-45T00:00:00+00:00 for A-TEST-1", "Invalid"),
+        (20260716, "Invalid"),
+    ],
+)
+def test_feed_in_register_dates_are_strict_and_quote_nothing(
+    value: object, message: str
+) -> None:
+    register = {"isFeedIn": True, "activeFrom": value}
+    with pytest.raises(ValueError, match=message) as raised:
+        _is_active_feed_in_register(register, date(2026, 7, 16))
+    assert "A-TEST-1" not in "".join(traceback.format_exception(raised.value))
+    assert "2026" not in str(raised.value)
 
 
 def test_active_feed_in_register_rejects_invalid_flag() -> None:

@@ -2882,9 +2882,13 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                             property_key(account.number, item.id)
                             for item in account.properties
                         ),
+                        feed_in_keys=tuple(
+                            property_key(account.number, item.id)
+                            for item in account.properties
+                            if any(meter.has_feed_in for meter in item.meter_points)
+                        ),
                         start=start,
                         end=end,
-                        include_generation=has_feed_in,
                     )
                     usage = totals.usage
                     cost = totals.cost
