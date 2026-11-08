@@ -148,6 +148,30 @@ async def test_a_cost_of_the_wrong_json_type_is_unusable_data(
     assert failure.value.translation_placeholders == {"detail": "unexpected data"}
 
 
+@pytest.mark.parametrize("field", ["value", "cost"])
+async def test_an_hour_too_large_to_add_is_unusable_data(
+    hass: HomeAssistant, field: str
+) -> None:
+    """A finite number past any hour's kWh or cost fails its unit, not every update."""
+
+    def huge(_start: Any, _channel: Any) -> str:
+        return "1E+1000000"
+
+    kraken = (
+        FakeKraken(NOW, days=30, value=huge)
+        if field == "value"
+        else FakeKraken(NOW, days=30, cost=huge)
+    )
+    session = FakeMeridianSession(NOW, kraken=kraken)
+    coordinator = coordinator_for(hass, session)
+
+    with pytest.raises(UpdateFailed) as failure:
+        await sync(coordinator, NOW, session)
+
+    assert failure.value.translation_key == "invalid_data"
+    assert failure.value.translation_placeholders == {"detail": "unexpected data"}
+
+
 async def test_a_json_rejection_after_a_fresh_session_ends_the_sign_in(
     hass: HomeAssistant,
 ) -> None:

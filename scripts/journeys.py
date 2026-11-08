@@ -109,6 +109,7 @@ FIGURES_WITHOUT_FEED_IN = tuple(
     key for key in FIGURES if key not in {"bill_export", "bill_credit"}
 )
 BILL = ("bill_usage", "bill_cost", "bill_estimate")
+PRICES = ("daily_charge", "anytime_price")
 # Total due's credit when the stand-in has the account in credit, in dollars.
 CREDIT = standin.CREDIT_CENTS / 100
 # What the integration says when Meridian's own figures fail. (Not named for
@@ -1285,7 +1286,7 @@ def first_setup(j: Journey) -> None:
     j.check_warnings("the setup and the first sync", mark, every_logger=True)
 
 
-def figures(j: Journey) -> None:
+def figures(j: Journey, relaunch: Callable[[], None]) -> None:
     """
     Meridian's own figures fail at the first sync, then come.
 
@@ -1294,7 +1295,9 @@ def figures(j: Journey) -> None:
     the integration says so and that it asks for the prices again in a day.
     Each is next due hours later, so a reload asks again instead: with the
     day totals still failing, the bill shows unknown and says so; with every
-    request answered, every figure has a value.
+    request answered, every figure has a value. Then Home Assistant restarts
+    with the prices failing: the price sensors show unknown, written by the
+    integration rather than restored, and the rest keep their values.
     """
     account = "A-JOURNEY-7"
     failing = tuple(sorted(standin.FIGURES))
@@ -1324,10 +1327,19 @@ def figures(j: Journey) -> None:
         coordinator = j.wait_synced(entry_id, coordinator.get("synced_at"))
         if still_failing:
             j.check_unknown(when, entry_id, BILL)
-            j.check_figures(entry_id, ("daily_charge", "anytime_price"))
+            j.check_figures(entry_id, PRICES)
         else:
             j.check_figures(entry_id, FIGURES_WITHOUT_FEED_IN)
         j.check_log(when, mark, lines)
+    when = "a restart with the prices failing"
+    j.scenario(Scenario(accounts=(account,), failing_figures=("prices",)))
+    mark = j.log_mark()
+    relaunch()
+    j.wait_synced(entry_id, coordinator.get("synced_at"))
+    # A sensor Home Assistant restored for the integration shows unavailable.
+    j.check_unknown(when, entry_id, PRICES)
+    j.check_figures(entry_id, [k for k in FIGURES_WITHOUT_FEED_IN if k not in PRICES])
+    j.check_log(when, mark, [("INFO", PRICES_UNANSWERED)])
     j.check_entry(entry_id, {account: Expected(ended, imported, datetime.now(UTC))})
 
 
@@ -1564,6 +1576,8 @@ JOURNEYS: dict[str, str] = {
     "reauth": "Meridian ends the sign-in, reconnect",
     "restart": "Restart and reload, history unbroken",
 }
+# The journeys that restart Home Assistant.
+RELAUNCHING = frozenset({"figures", "restart"})
 
 
 # --------------------------------------------------------------------- runner
@@ -1615,14 +1629,14 @@ class Run:
         journey = Journey(client, self.folder, result)
         began = time.monotonic()
         try:
-            if name == "restart":
+            if name in RELAUNCHING:
 
                 def relaunch() -> None:
                     self.relaunch()
                     client.instance = self.instance
                     client.forget_token()
 
-                restart(journey, relaunch)
+                globals()[name](journey, relaunch)
             else:
                 globals()[name](journey)
         except Exception as err:  # noqa: BLE001
