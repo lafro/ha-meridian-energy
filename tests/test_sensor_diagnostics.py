@@ -606,8 +606,8 @@ def _units(hass) -> MeridianDataCoordinator:
     """
     Return a coordinator whose grid export failed and whose import is whole.
 
-    Its grid import's history reaches back to its target, where Meridian
-    showed the history starts; its grid export failed with a timeout.
+    Its grid import's history reaches back to its target; its grid export
+    failed with a timeout, and an older window of it with a gateway timeout.
     """
     solar_meter = replace(_account().properties[0].meter_points[0], has_feed_in=True)
     account = replace(
@@ -619,11 +619,12 @@ def _units(hass) -> MeridianDataCoordinator:
     key = property_key(account.number, account.properties[0].id)
     units._memory[(key, "CONSUMPTION")] = _Memory(
         complete=True,
-        fill_stopped=True,
         newest=datetime(2026, 7, 14, 11, tzinfo=UTC),
         oldest=datetime(2026, 4, 15, 12, tzinfo=UTC),
     )
-    units._memory[(key, "GENERATION")] = _Memory(failure="cannot_connect")
+    units._memory[(key, "GENERATION")] = _Memory(
+        failure="cannot_connect", fill_failure="cannot_connect (HTTP 504)"
+    )
     return units
 
 
@@ -712,6 +713,7 @@ async def test_diagnostics_before_first_sync(hass, freezer) -> None:
                 "target": datetime(2026, 4, 15, 12, tzinfo=UTC),
                 "history_complete": False,
                 "fill_stopped": False,
+                "fill_failure": None,
                 "quiet": False,
                 "last_failure": None,
             }

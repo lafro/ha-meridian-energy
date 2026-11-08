@@ -9,6 +9,7 @@ synthetic.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 from unittest.mock import patch
 
@@ -30,10 +31,19 @@ from custom_components.meridian_energy.const import (
     DOMAIN,
 )
 
-from .meridian_http import FakeMeridianSession, Response, json_response
-from .syncs import HOUR, NOW, coordinator_for, sync
+from .kraken_fake import FakeKraken
+from .meridian_http import (
+    ACCOUNT_NUMBER,
+    FakeMeridianSession,
+    Response,
+    json_response,
+    property_id,
+)
+from .syncs import DAY, HOUR, NOW, coordinator_for, refresh, sync
 
 _HTML = {"Content-Type": "text/html"}
+_GATEWAY = Response(b"<html>504</html>", status=504, headers=_HTML)
+_DORMANT = "A-TEST-2"
 
 
 @pytest.fixture(autouse=True)
@@ -100,12 +110,8 @@ def _measurements(answer: Any) -> Any:
             "invalid_data",
             "HTTP 422, KT-CT-4321",
         ),
-        (json_response({"data": None}), "invalid_data", "an answer it can't read"),
-        (
-            Response(b"<html>ok</html>", headers=_HTML),
-            "invalid_data",
-            "an answer it can't read",
-        ),
+        (json_response({"data": None}), "invalid_data", "unexpected data"),
+        (Response(b"<html>ok</html>", headers=_HTML), "invalid_data", "not JSON"),
     ],
 )
 async def test_each_failure_has_its_category_and_detail(
@@ -192,6 +198,12 @@ async def test_the_notice_comes_after_three_failed_updates_and_goes_after_one(
         "reason": "Couldn't get an answer from Meridian (HTTP 503). Meridian Energy "
         "tries again automatically"
     }
+    texts = await translation.async_get_translations(hass, "en", "issues", {DOMAIN})
+    description = texts[f"component.{DOMAIN}.issues.sync_failing.description"]
+    assert description.format(**issue.translation_placeholders) == (
+        "Couldn't get an answer from Meridian (HTTP 503). Meridian Energy tries "
+        "again automatically.\n\nThis notice goes away by itself once an update works."
+    )
 
     session.hook = lambda _operation, _variables: None
     await sync(coordinator, NOW + 3 * HOUR, session)
@@ -202,6 +214,82 @@ async def test_the_notice_comes_after_three_failed_updates_and_goes_after_one(
     with pytest.raises(UpdateFailed):
         await sync(coordinator, NOW + 4 * HOUR, session)
     assert registry.async_get_issue(DOMAIN, issue_id) is None
+
+
+@pytest.mark.parametrize("accounts_fail", [False, True])
+async def test_a_quiet_unit_never_hides_that_the_others_fail(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture, *, accounts_fail: bool
+) -> None:
+    """A dormant account beside one Meridian no longer answers: every update fails."""
+    caplog.set_level(logging.INFO)
+    entry = _entry(hass)
+    session = FakeMeridianSession(NOW, accounts=(ACCOUNT_NUMBER, _DORMANT))
+    dormant = FakeKraken(NOW, withdrawn_from=NOW - 400 * DAY)
+    failing = False
+
+    def answer(operation: str, variables: dict[str, Any]) -> Response | None:
+        if operation == "accountsList" and failing and accounts_fail:
+            return json_response({}, status=503)
+        if operation != "measurements":
+            return None
+        if variables["propertyId"] == property_id(_DORMANT):
+            return json_response(dormant.graphql(variables))
+        return _GATEWAY if failing else None
+
+    session.hook = answer
+    coordinator = coordinator_for(hass, session, config_entry=entry)
+    await refresh(coordinator, NOW, session)
+    assert [unit["quiet"] for unit in coordinator.unit_diagnostics()] == [False, True]
+
+    failing = True
+    # A day on, the accounts are asked for again; when that fails too, the
+    # cached ones are kept and the quiet unit is not woken.
+    start = NOW + DAY if accounts_fail else NOW
+    registry = ir.async_get(hass)
+    issue_id = f"sync_failing_{entry.entry_id}"
+    for update in range(1, 4):
+        await refresh(coordinator, start + update * HOUR, session)
+        failure = coordinator.last_exception
+        assert isinstance(failure, UpdateFailed)
+        assert failure.translation_key == "cannot_connect"
+        assert (registry.async_get_issue(DOMAIN, issue_id) is None) == (update < 3)
+    assert len(dormant.requests) == 13
+
+    failing = False
+    await refresh(coordinator, start + 4 * HOUR, session)
+    assert coordinator.last_update_success
+    assert registry.async_get_issue(DOMAIN, issue_id) is None
+    error = (
+        "Error fetching Meridian Energy data: Couldn't get an answer from Meridian "
+        "(HTTP 504). Meridian Energy tries again automatically"
+    )
+    assert [
+        (record.levelno, record.getMessage())
+        for record in caplog.records
+        if record.levelno >= logging.WARNING
+    ] == [(logging.ERROR, error)]
+
+
+async def test_an_empty_grid_export_never_hides_a_failing_grid_import(
+    hass: HomeAssistant,
+) -> None:
+    session = FakeMeridianSession(NOW, feed_in=(ACCOUNT_NUMBER,))
+    empty = FakeKraken(NOW, withdrawn_from=NOW - 400 * DAY)
+    session.hook = lambda operation, variables: (
+        None
+        if operation != "measurements"
+        else json_response(empty.graphql(variables))
+        if variables["readingDirectionType"] == "GENERATION"
+        else _GATEWAY
+    )
+    coordinator = coordinator_for(hass, session)
+
+    with pytest.raises(UpdateFailed) as failure:
+        await sync(coordinator, NOW, session)
+
+    assert failure.value.translation_key == "cannot_connect"
+    # A failed first sync is tried again after 10 minutes.
+    assert failure.value.retry_after == 600
 
 
 async def test_no_account_raises_the_notice_at_once_and_removal_clears_it(

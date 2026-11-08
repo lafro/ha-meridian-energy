@@ -10,7 +10,7 @@
       "cannot_connect": "Couldn't get an answer from Meridian. Wait a few minutes, then try again.",
       "email_not_found": "Meridian didn't accept that email. Use the email you sign in to MyMeridian with.",
       "invalid_auth": "Meridian didn't accept the sign-in. Close this window and start again to get a new code.",
-      "invalid_data": "Meridian Energy couldn't read your account details from Meridian. Select Submit to try again; if it keeps failing, check HACS for an update.",
+      "invalid_data": "Meridian Energy couldn't read your account details from Meridian. Select Submit to try again; if it keeps failing, check for an update to Meridian Energy.",
       "otp_expired": "That code has expired. Close this window and start again to get a new one.",
       "otp_invalid": "That code isn't right. Check the email and try again.",
       "otp_not_found": "Meridian didn't find that code; it may already have been used. Close this window and start again to get a new one.",
@@ -56,10 +56,10 @@
       "message": "Couldn't get an answer from Meridian ({detail}). Meridian Energy tries again automatically."
     },
     "rate_limited": {
-      "message": "Meridian asked Meridian Energy to wait. It tries again automatically after the wait."
+      "message": "Meridian asked Meridian Energy to wait. It tries again automatically."
     },
     "invalid_data": {
-      "message": "Meridian refused a request or sent an answer Meridian Energy can't read ({detail}). It tries again automatically; if this keeps happening, check HACS for an update."
+      "message": "Meridian refused a request or sent an answer Meridian Energy can't read ({detail}). It tries again automatically; if this keeps happening, check for an update to Meridian Energy."
     },
     "no_accounts": {
       "message": "Meridian lists no active electricity account for this login. Meridian Energy checks again automatically; if the account has closed, remove Meridian Energy."
@@ -71,7 +71,7 @@
   "issues": {
     "sync_failing": {
       "title": "Meridian Energy isn't updating",
-      "description": "{reason}\n\nThis notice goes away by itself once an update works."
+      "description": "{reason}.\n\nThis notice goes away by itself once an update works."
     }
   },
   "entity": {

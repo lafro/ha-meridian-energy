@@ -1174,7 +1174,7 @@ def outage(j: Journey) -> None:
         notice
         == (
             "Meridian Energy isn't updating",
-            f"{reason}\n\nThis notice goes away by itself once an update works.",
+            f"{reason}.\n\nThis notice goes away by itself once an update works.",
         ),
         str(notice),
     )

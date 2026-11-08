@@ -50,7 +50,8 @@
         dict({
           'account': '1/1',
           'direction': 'consumption',
-          'fill_stopped': True,
+          'fill_failure': None,
+          'fill_stopped': False,
           'history_complete': True,
           'last_failure': None,
           'newest_stored_hour': HAFakeDatetime(2026, 7, 14, 11, 0, tzinfo=datetime.timezone.utc),
@@ -62,6 +63,7 @@
         dict({
           'account': '1/1',
           'direction': 'generation',
+          'fill_failure': 'cannot_connect (HTTP 504)',
           'fill_stopped': False,
           'history_complete': False,
           'last_failure': 'cannot_connect',

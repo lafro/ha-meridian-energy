@@ -15,7 +15,9 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from aiohttp import ClientConnectionError
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers import translation
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from sqlalchemy.exc import OperationalError
@@ -56,8 +58,11 @@ _INTEGRATION = "custom_components.meridian_energy"
 KEY = property_key(ACCOUNT_NUMBER, property_id(ACCOUNT_NUMBER))
 ENERGY_ID, COST_ID = consumption_ids(KEY)
 EXPORT_ID, CREDIT_ID = generation_ids(KEY)
-_GATEWAY_PAGE = Response(
-    b"<html>gateway</html>", status=504, headers={"Content-Type": "text/html"}
+_HTML = {"Content-Type": "text/html"}
+_GATEWAY_PAGE = Response(b"<html>gateway</html>", status=504, headers=_HTML)
+_STOPPED = (
+    "Meridian Energy stopped filling in older grid import history until Home "
+    "Assistant restarts: Meridian refused a request for older dates"
 )
 
 
@@ -158,6 +163,14 @@ async def test_names_and_both_directions_of_two_properties(
     second = "A-TEST-2"
     session = FakeMeridianSession(
         NOW, accounts=(ACCOUNT_NUMBER, second), feed_in=(ACCOUNT_NUMBER,)
+    )
+    # An address over two lines, padded, reads as one.
+    padded = account_data(second)
+    padded["properties"][0]["address"] = "  1 Synthetic Street,\n   unit A-TEST-2\n"
+    session.hook = lambda operation, variables: (
+        json_response({"data": {"account": padded}})
+        if operation == "account" and variables["accountNumber"] == second
+        else None
     )
     coordinator = coordinator_for(hass, session)
 
@@ -296,6 +309,24 @@ async def test_a_unit_with_no_readings_waits_quietly_for_the_accounts(
     assert _own(caplog, logging.INFO) == []
 
 
+async def test_a_meter_with_late_readings_and_a_stored_history_stays_awake(
+    hass: HomeAssistant, statistics: Statistics
+) -> None:
+    """No readings for 3 dates, as when a meter can't send them, is not quiet."""
+    kraken = FakeKraken(NOW, withdrawn_from=local_midnight(TODAY - 2 * DAY))
+    session = FakeMeridianSession(NOW, kraken=kraken)
+    statistics.store((ENERGY_ID, COST_ID), hours_of(_days(TARGET, TODAY - 3 * DAY)))
+    coordinator = coordinator_for(hass, session)
+    coordinator._memory[(KEY, "CONSUMPTION")] = _Memory(daily_at=NOW - HOUR)
+
+    await sync(coordinator, NOW, session)
+    assert coordinator._memory[(KEY, "CONSUMPTION")].quiet is False
+
+    session.kraken.requests.clear()
+    await sync(coordinator, NOW + HOUR, session)
+    assert measurement_dates(session) == [(TODAY - 2 * DAY, TODAY)]
+
+
 async def test_requests_are_paced_a_second_apart(
     hass: HomeAssistant, waits: Any
 ) -> None:
@@ -309,11 +340,21 @@ async def test_requests_are_paced_a_second_apart(
     assert all(0 < wait <= 1 for wait in paces)
 
 
+@pytest.mark.parametrize(
+    "failure",
+    [
+        _GATEWAY_PAGE,
+        json_response({}, status=503),
+        json_response({}, status=524),
+        Response(b"", error=ClientConnectionError()),
+        Response(b"", error=TimeoutError()),
+    ],
+)
 async def test_a_passing_failure_is_resent_once_after_a_short_wait(
-    hass: HomeAssistant, waits: Any
+    hass: HomeAssistant, waits: Any, failure: Response
 ) -> None:
     session = FakeMeridianSession(NOW)
-    failures = iter([_GATEWAY_PAGE])
+    failures = iter([failure])
     session.hook = lambda operation, _variables: (
         next(failures, None) if operation == "measurements" else None
     )
@@ -368,10 +409,18 @@ async def test_a_failed_fill_window_waits_longer_each_time_and_says_so_after_a_d
     # Waiting: the older dates go on without it.
     assert (TODAY - 41 * DAY, TODAY - 35 * DAY) not in measurement_dates(session)
     assert (TODAY - 48 * DAY, TODAY - 42 * DAY) in measurement_dates(session)
+    (unit,) = coordinator.unit_diagnostics()
+    assert (unit["history_complete"], unit["fill_failure"]) == (
+        False,
+        "cannot_connect (HTTP 504)",
+    )
 
     for wait in (2, 4, 8, 16, 24, 24):
         await sync(coordinator, memory.cooldowns[TODAY - 35 * DAY].until, session)
         assert memory.cooldowns[TODAY - 35 * DAY].wait == wait * HOUR
+        if wait == 16:
+            # 15 hours after the first failure: not yet a day.
+            assert [m for m in _own(caplog, logging.INFO) if "for a day" in m] == []
     lines = [m for m in _own(caplog, logging.INFO) if "for a day" in m]
     assert lines == [
         (
@@ -384,6 +433,8 @@ async def test_a_failed_fill_window_waits_longer_each_time_and_says_so_after_a_d
     await sync(coordinator, memory.cooldowns[TODAY - 35 * DAY].until, session)
     assert memory.cooldowns == {}
     assert memory.fill_noted is False
+    (unit,) = coordinator.unit_diagnostics()
+    assert (unit["history_complete"], unit["fill_failure"]) == (True, None)
 
 
 async def test_a_refusal_older_than_every_reading_stops_the_fill(
@@ -399,16 +450,25 @@ async def test_a_refusal_older_than_every_reading_stops_the_fill(
     # 3 recent windows, two more with readings, and the one refused.
     assert len(measurement_dates(session)) == 6
     assert coordinator._memory[(KEY, "CONSUMPTION")].fill_stopped is True
-    assert _own(caplog, logging.INFO) == [
-        (
-            "Meridian Energy stopped filling in older grid import history: Meridian "
-            "refused the dates before it"
-        )
-    ]
+    assert _own(caplog, logging.INFO) == [_STOPPED]
     session.kraken.requests.clear()
     statistics.hours.clear()
     await sync(coordinator, NOW + HOUR, session)
     assert measurement_dates(session) == [(TODAY - 2 * DAY, TODAY)]
+
+
+async def test_a_fill_stopped_by_a_refusal_leaves_the_history_incomplete(
+    hass: HomeAssistant,
+) -> None:
+    """A new install whose second fill window is refused once stops at 28 dates."""
+    kraken = FakeKraken(NOW, days=100, codes={TODAY - 34 * DAY: "KT-CT-4321"})
+    session = FakeMeridianSession(NOW, kraken=kraken)
+    coordinator = coordinator_for(hass, session)
+
+    await sync(coordinator, NOW, session)
+
+    (unit,) = coordinator.unit_diagnostics()
+    assert (unit["fill_stopped"], unit["history_complete"]) == (True, False)
 
 
 async def test_a_refusal_inside_the_history_only_waits(
@@ -427,9 +487,10 @@ async def test_a_refusal_inside_the_history_only_waits(
 
 
 async def test_a_recent_window_refused_before_the_supply_starts_is_its_history_start(
-    hass: HomeAssistant,
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A supply younger than 21 days: the window before it is refused."""
+    caplog.set_level(logging.INFO)
     kraken = FakeKraken(NOW, days=5, pre_supply_error="KT-CT-4321")
     session = FakeMeridianSession(NOW, kraken=kraken)
     coordinator = coordinator_for(hass, session)
@@ -437,8 +498,70 @@ async def test_a_recent_window_refused_before_the_supply_starts_is_its_history_s
     data = await sync(coordinator, NOW, session)
 
     assert data.requests == 2
-    assert coordinator.last_update_success
-    assert coordinator._memory[(KEY, "CONSUMPTION")].fill_stopped is True
+    (unit,) = coordinator.unit_diagnostics()
+    assert (unit["fill_stopped"], unit["history_complete"]) == (True, False)
+
+    # The next day's request is refused too; the stop is said once.
+    await sync(coordinator, NOW + DAY, session)
+    assert _own(caplog, logging.INFO) == [_STOPPED]
+
+
+@pytest.mark.parametrize(
+    "refusal",
+    [
+        _coded("KT-CT-4321"),
+        Response(b"<html>Forbidden</html>", status=403, headers=_HTML),
+    ],
+)
+async def test_a_recent_window_refused_with_older_history_stored_fails_its_unit(
+    hass: HomeAssistant,
+    statistics: Statistics,
+    caplog: pytest.LogCaptureFixture,
+    refusal: Response,
+) -> None:
+    """One refusal after a start never stops the fill when older hours are stored."""
+    caplog.set_level(logging.INFO)
+    session = FakeMeridianSession(NOW)
+    gap = _days(TODAY - 40 * DAY, TODAY - 31 * DAY)
+    stored = [day for day in _days(TARGET, TODAY - DAY) if day not in gap]
+    statistics.store((ENERGY_ID, COST_ID), hours_of(stored))
+    refused = (TODAY - 7 * DAY).isoformat()
+    session.hook = lambda operation, variables: (
+        refusal
+        if operation == "measurements" and variables["endOn"] == refused
+        else None
+    )
+    coordinator = coordinator_for(hass, session)
+
+    with pytest.raises(UpdateFailed) as failure:
+        await sync(coordinator, NOW, session)
+
+    assert failure.value.translation_key == "invalid_data"
+    assert coordinator._memory[(KEY, "CONSUMPTION")].fill_stopped is False
+    assert _own(caplog, logging.INFO) == []
+
+    # Once Meridian answers, the 21 dates are asked for again, then the gap.
+    session.hook = lambda _operation, _variables: None
+    session.kraken.requests.clear()
+    await sync(coordinator, NOW + HOUR, session)
+    assert measurement_dates(session) == _fill_windows(
+        TODAY - 20 * DAY, TODAY
+    ) + _fill_windows(TODAY - 40 * DAY, TODAY - 31 * DAY)
+
+
+async def test_a_recent_window_refused_when_the_store_cannot_be_read_fails_its_unit(
+    hass: HomeAssistant, recorder_stand_in: SimpleNamespace
+) -> None:
+    kraken = FakeKraken(NOW, days=5, pre_supply_error="KT-CT-4321")
+    session = FakeMeridianSession(NOW, kraken=kraken)
+    recorder_stand_in.stored.side_effect = OperationalError("SELECT", {}, Exception())
+    coordinator = coordinator_for(hass, session)
+
+    with pytest.raises(UpdateFailed) as failure:
+        await sync(coordinator, NOW, session)
+
+    assert failure.value.translation_placeholders == {"detail": "KT-CT-4321"}
+    assert coordinator._memory[(KEY, "CONSUMPTION")].fill_stopped is False
 
 
 async def test_a_rate_limit_stops_the_sync_writes_what_came_and_waits(
@@ -462,6 +585,8 @@ async def test_a_rate_limit_stops_the_sync_writes_what_came_and_waits(
     assert len(statistics.writes) == 1
     assert len(statistics.writes[0][ENERGY_ID]) > 0
     assert coordinator.update_interval == UPDATE_INTERVAL
+    # No billing request after a rate limit, though none is cached.
+    assert "billingPeriods" not in session.operations
 
     # Meridian's 2 minutes are less than the hour between updates.
     session.hook = lambda _operation, _variables: _rate_limit("86400")
@@ -486,10 +611,65 @@ async def test_a_rate_limit_after_an_import_makes_the_next_update_wait(
 
     await sync(coordinator, NOW, session)
     assert coordinator.update_interval == timedelta(hours=2)
+    assert "billingPeriods" not in session.operations
 
     session.hook = lambda _operation, _variables: None
     await sync(coordinator, NOW + 2 * HOUR, session)
     assert coordinator.update_interval == UPDATE_INTERVAL
+
+
+async def test_a_rate_limit_after_the_newest_window_lets_the_update_succeed(
+    hass: HomeAssistant, statistics: Statistics, caplog: pytest.LogCaptureFixture
+) -> None:
+    session = FakeMeridianSession(NOW)
+    limited = (TODAY - 7 * DAY).isoformat()
+    session.hook = lambda operation, variables: (
+        _rate_limit()
+        if operation == "measurements" and variables["endOn"] == limited
+        else None
+    )
+    coordinator = coordinator_for(hass, session)
+
+    await refresh(coordinator, NOW, session)
+
+    assert coordinator.last_update_success
+    assert coordinator._failed_updates == 0
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR] == []
+    (written,) = statistics.writes
+    assert sorted(written[ENERGY_ID]) == _ended(TODAY - 6 * DAY, TODAY)
+    # Meridian's 2 minutes are less than the hour between updates.
+    assert coordinator.update_interval == UPDATE_INTERVAL
+
+    # The 21 dates were not all fetched, so they are asked for again.
+    session.hook = lambda _operation, _variables: None
+    session.kraken.requests.clear()
+    await sync(coordinator, NOW + HOUR, session)
+    assert measurement_dates(session)[:3] == _fill_windows(TODAY - 20 * DAY, TODAY)
+
+
+def _ended(first: Any, last: Any) -> list[Any]:
+    """Return the hours of some dates that have ended by ``NOW``, in order."""
+    return [hour for hour in hours_of(_days(first, last)) if hour + HOUR <= NOW]
+
+
+async def test_a_rate_limit_outranks_another_unit_s_failure(
+    hass: HomeAssistant,
+) -> None:
+    session = FakeMeridianSession(NOW, accounts=(ACCOUNT_NUMBER, "A-TEST-2"))
+    session.hook = lambda operation, variables: (
+        None
+        if operation != "measurements"
+        else _GATEWAY_PAGE
+        if variables["propertyId"] == property_id(ACCOUNT_NUMBER)
+        else _rate_limit("7200")
+    )
+    coordinator = coordinator_for(hass, session)
+
+    with pytest.raises(UpdateFailed) as failure:
+        await sync(coordinator, NOW, session)
+
+    assert failure.value.translation_key == "rate_limited"
+    assert failure.value.retry_after == 7200
 
 
 async def test_an_in_band_rate_limit_waits_an_hour_then_longer(
@@ -505,7 +685,36 @@ async def test_an_in_band_rate_limit_waits_an_hour_then_longer(
         with pytest.raises(UpdateFailed) as failure:
             await sync(coordinator, NOW + update * HOUR, session)
         waits.append(failure.value.retry_after)
+        # A rate limit is never resent.
+        assert session.operations.count("measurements") == update + 1
     assert waits == [3600, 7200, 14400]
+
+
+@pytest.mark.parametrize(
+    ("answer", "error"),
+    [
+        (_GATEWAY_PAGE, UpdateFailed),
+        (json_response({"error": "Synthetic"}, status=401), ConfigEntryAuthFailed),
+    ],
+)
+async def test_what_came_before_a_failure_or_an_ended_sign_in_is_written(
+    hass: HomeAssistant, statistics: Statistics, answer: Response, error: type
+) -> None:
+    session = FakeMeridianSession(NOW)
+    failing = (TODAY - 7 * DAY).isoformat()
+    session.hook = lambda operation, variables: (
+        answer
+        if operation == "measurements" and variables["endOn"] == failing
+        else None
+    )
+    coordinator = coordinator_for(hass, session)
+
+    with pytest.raises(error):
+        await sync(coordinator, NOW, session)
+
+    (written,) = statistics.writes
+    assert sorted(written[ENERGY_ID]) == _ended(TODAY - 6 * DAY, TODAY)
+    assert sorted(written[COST_ID]) == _ended(TODAY - 6 * DAY, TODAY)
 
 
 async def test_one_unit_failing_warns_once_and_says_when_it_works_again(
@@ -534,6 +743,8 @@ async def test_one_unit_failing_warns_once_and_says_when_it_works_again(
     assert [r.levelno for r in caplog.records if r.levelno >= logging.WARNING] == [
         logging.WARNING
     ]
+    failures = [unit["last_failure"] for unit in coordinator.unit_diagnostics()]
+    assert failures == [None, "cannot_connect"]
 
     session.hook = lambda _operation, _variables: None
     await refresh(coordinator, NOW + 2 * HOUR, session)
@@ -541,6 +752,8 @@ async def test_one_unit_failing_warns_once_and_says_when_it_works_again(
     assert _own(caplog, logging.INFO)[1:] == [
         "Meridian Energy is updating grid import for property 2 of 2 again"
     ]
+    failures = [unit["last_failure"] for unit in coordinator.unit_diagnostics()]
+    assert failures == [None, None]
 
 
 async def test_the_only_unit_failing_gives_home_assistant_s_error_alone(
@@ -603,9 +816,7 @@ async def test_readings_that_cannot_be_told_apart_fail_their_unit(
         await sync(coordinator, NOW, session)
 
     assert failure.value.translation_key == "invalid_data"
-    assert failure.value.translation_placeholders == {
-        "detail": "an answer it can't read"
-    }
+    assert failure.value.translation_placeholders == {"detail": "unexpected data"}
 
 
 async def test_several_channels_take_several_pages(
@@ -677,9 +888,32 @@ async def test_a_busy_recorder_or_a_failed_read_still_lets_the_update_succeed(
     data = await sync(coordinator, NOW, session)
     assert data.requests == 3
     assert coordinator._memory[(KEY, "CONSUMPTION")].newest is None
+    assert coordinator.unit_diagnostics()[0]["history_complete"] is False
 
     recorder_stand_in.write.side_effect = OperationalError("SELECT", {}, Exception())
     await sync(coordinator, NOW + HOUR, session)
+
+
+@pytest.mark.parametrize("failure", ["write skipped", "write failed", "read failed"])
+async def test_a_write_or_read_that_failed_leaves_the_history_incomplete(
+    hass: HomeAssistant, recorder_stand_in: SimpleNamespace, failure: str
+) -> None:
+    session = FakeMeridianSession(NOW)
+    coordinator = coordinator_for(hass, session)
+    await sync(coordinator, NOW, session)
+    assert coordinator.unit_diagnostics()[0]["history_complete"] is True
+
+    error = OperationalError("SELECT", {}, Exception())
+    if failure == "write skipped":
+        recorder_stand_in.write.side_effect = None
+        recorder_stand_in.write.return_value = False
+    elif failure == "write failed":
+        recorder_stand_in.write.side_effect = error
+    else:
+        recorder_stand_in.stored.side_effect = error
+    await sync(coordinator, NOW + HOUR, session)
+
+    assert coordinator.unit_diagnostics()[0]["history_complete"] is False
 
 
 async def test_the_sync_summary_counts_estimates_from_the_recent_qualities(

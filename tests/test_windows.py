@@ -110,6 +110,8 @@ def test_only_ended_hours_inside_the_window_are_kept() -> None:
 
     assert sorted(readings) == [first, first + 4 * HOUR]
     assert readings[first] == Reading(Decimal("0.5"), Decimal(15), "ACTUAL")
+    # The hour after the window has ended too, and is still left out.
+    assert hourly_readings([_row(window.end)], window, window.end + 2 * HOUR) == {}
 
 
 def test_channels_are_summed_and_an_hour_without_every_cost_has_none() -> None:

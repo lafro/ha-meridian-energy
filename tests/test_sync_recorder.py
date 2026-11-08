@@ -155,6 +155,7 @@ async def test_a_busy_recorder_leaves_the_update_working_and_heals_next_time(
     await async_wait_recording_done(hass)
     assert await _stored(hass, ENERGY_ID) == []
     assert coordinator.data is None or coordinator.last_update_success
+    assert coordinator.unit_diagnostics()[0]["history_complete"] is False
 
     # The next update fetches the recent dates and fills in the rest.
     await _synced(hass, coordinator, MIDNIGHT + HOUR, session)
@@ -164,6 +165,7 @@ async def test_a_busy_recorder_leaves_the_update_working_and_heals_next_time(
         MIDNIGHT + HOUR,
         0.5,
     )
+    assert coordinator.unit_diagnostics()[0]["history_complete"] is True
 
 
 async def test_a_restart_asks_for_21_dates_and_leaves_the_history_as_it_is(
