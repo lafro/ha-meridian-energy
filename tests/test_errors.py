@@ -129,6 +129,25 @@ async def test_each_failure_has_its_category_and_detail(
     assert f"({detail})" in str(failure.value)
 
 
+@pytest.mark.parametrize("amount", [["12.5"], {"amount": "12.5"}])
+async def test_a_cost_of_the_wrong_json_type_is_unusable_data(
+    hass: HomeAssistant, amount: object
+) -> None:
+    """A list or object where an hour's cost belongs fails its unit, no more."""
+
+    def cost(_start: Any, _channel: Any) -> Any:
+        return amount
+
+    session = FakeMeridianSession(NOW, kraken=FakeKraken(NOW, days=30, cost=cost))
+    coordinator = coordinator_for(hass, session)
+
+    with pytest.raises(UpdateFailed) as failure:
+        await sync(coordinator, NOW, session)
+
+    assert failure.value.translation_key == "invalid_data"
+    assert failure.value.translation_placeholders == {"detail": "unexpected data"}
+
+
 async def test_a_json_rejection_after_a_fresh_session_ends_the_sign_in(
     hass: HomeAssistant,
 ) -> None:

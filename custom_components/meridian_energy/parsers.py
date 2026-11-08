@@ -306,7 +306,7 @@ def _measurement_cost_cents(metadata: dict[str, Any], direction: str) -> Decimal
             continue
         cost = require_mapping(raw_cost, "measurement cost")
         amount = cost.get("estimatedAmount")
-        if amount in {None, ""}:
+        if amount is None or amount == "":
             incomplete_cost = True
             continue
         cents = _finite_decimal(amount, "measurement cost")
