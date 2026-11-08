@@ -59,7 +59,7 @@ Each account has one device, **Meridian Energy**.
 | Bill cost so far | The cost of that usage |
 | Bill export so far, Bill credit so far | Grid export in the period, and its credit (feed-in register only) |
 | Bill estimate | Meridian's estimate of the whole period's cost |
-| Total due | What you owe: 0 when you're in credit, with the credit as an attribute |
+| Total due | What you owe, 0 when in credit; its credit attribute holds any credit, otherwise empty |
 | Last bill | When your latest bill was issued, with the period it covers |
 | Last payment | Your latest payment's amount, with its date and status |
 | Daily charge, Anytime price | Your plan's prices, including GST (only for one property with one meter on an all-day plan) |

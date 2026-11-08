@@ -50,6 +50,7 @@ A run builds its own disposable Home Assistant, as the live test does, on port 8
 | Journey | What it does |
 | --- | --- |
 | `first_setup` | A feed-in register and an account in credit: the entry at once; the first sync asks 13 windows per direction back to midnight 90 dates ago, completing both histories; every figure has a value |
+| `figures` | Billing period, day totals and prices fail at the first sync: the update works, the bill shows unknown and the log says so; reloads bring every figure |
 | `outage` | Meridian times out from the start: the entry loads, sensors unavailable; a notice after 3 failed updates; once Meridian answers, one update imports 90 dates and the notice goes |
 | `two_accounts` | Two accounts on one login, both followed |
 | `reauth` | Meridian ends the sign-in; reconnecting with a new code keeps the history unbroken |
