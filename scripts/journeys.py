@@ -24,8 +24,10 @@ requirements it pins from PyPI, as for the live test.
 
 Each journey drives Home Assistant through its REST and websocket APIs, as
 the frontend would, with the owner's token, and checks what came of it: the
-screens met, the config entry, its devices and sensors, and the integration's
-statistics hour by hour against what the stand-in sent. ``--only`` runs some
+screens met, the config entry, its devices and sensors, the measurements
+windows the stand-in answered, repair notices, every line the integration
+logged above debug level, and its statistics hour by hour against what the
+stand-in sent. ``--only`` runs some
 of them, in their usual order. Each check and each journey is printed as
 PASS or FAIL, and a report (markdown) with every check and every screen, as
 Home Assistant shows it, is written to the system's temporary directory. The
@@ -44,17 +46,18 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import os
 import re
 import sys
 import tempfile
 import time
 import urllib.error
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from itertools import pairwise
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -76,9 +79,21 @@ DOMAIN = "meridian_energy"
 NZ = ZoneInfo("Pacific/Auckland")
 HOUR = timedelta(hours=1)
 DAY = timedelta(days=1)
-INITIAL_BACKFILL = timedelta(days=90)
-# A restart's update asks again for the last 14 days (README, "Data timing").
-CORRECTION_DAYS = 14
+# The history reaches back to New Zealand midnight 90 dates before today.
+HISTORY_DAYS = 90
+# Measurements windows hold up to 7 dates. A first sync asks for 13, newest
+# first, back to the target; the first sync after a start asks for the 3 of
+# the last 21 dates, and nothing older when the history is whole.
+WINDOW_DATES = 7
+FIRST_SYNC_WINDOWS = 13
+RECENT_WINDOWS = 3
+# The repair notice appears after this many failed updates in a row.
+NOTICE_AFTER = 3
+# The outage's answer to every measurements request, from a gateway.
+GATEWAY_TIMEOUT = 504
+# Home Assistant runs an update asked for within 10 s of the last one only
+# after those 10 s, and does not wait for it.
+UPDATE_COOLDOWN_S = 11.0
 TWO_DEVICES = 2
 OTP = "123456"
 # The setup asks Meridian for no history: the entry follows the code at once.
@@ -93,6 +108,15 @@ TOKEN_LIFETIME_S = 600
 SHOWN_PROBLEMS = 5
 # The stand-in's folder, in the instance's configuration folder.
 STANDIN_FOLDER = "journeys"
+# Home Assistant's log, in the instance's configuration folder, and its lines:
+# "<date> <time>.<ms> <LEVEL> (<thread>) [<logger>] <message>". From 2026.11
+# the time ends with the UTC offset, as in "12:00:00.123+13:00". A start
+# moves the log before it to LOG_FILE.1.
+LOG_FILE = "home-assistant.log"
+LOG_LINE = re.compile(
+    r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3}(?:[+-]\d\d:\d\d)? (?P<level>[A-Z]+) "
+    r"\(.*?\) \[(?P<name>[^\]]+)\] (?P<message>.*)$"
+)
 _FAKES = ("meridian_http.py", "kraken_fake.py")
 
 
@@ -152,21 +176,31 @@ def parse_rows(raw: Iterable[dict[str, Any]]) -> list[Row]:
     ]
 
 
-def ceil_hour(value: datetime) -> datetime:
-    """Return the start of the first whole hour at or after a time."""
-    floored = value.replace(minute=0, second=0, microsecond=0)
-    return floored if floored == value else floored + HOUR
-
-
 def floor_hour(value: datetime) -> datetime:
     """Return the start of the hour a time is in."""
     return value.replace(minute=0, second=0, microsecond=0)
 
 
+def nz_date(moment: datetime) -> date:
+    """Return the New Zealand date at a moment."""
+    return moment.astimezone(NZ).date()
+
+
 def backfill_start(now: datetime) -> datetime:
-    """Return New Zealand midnight at the start of the date 90 days back."""
-    day = (now - INITIAL_BACKFILL).astimezone(NZ).date()
+    """Return New Zealand midnight at the start of the date 90 dates back."""
+    day = nz_date(now) - timedelta(days=HISTORY_DAYS)
     return datetime.combine(day, datetime.min.time(), tzinfo=NZ).astimezone(UTC)
+
+
+def newest_windows(today: date, count: int) -> list[tuple[str, str]]:
+    """Return the first and last dates of ``count`` windows back from ``today``."""
+    return [
+        (
+            (today - timedelta(days=n * WINDOW_DATES + WINDOW_DATES - 1)).isoformat(),
+            (today - timedelta(days=n * WINDOW_DATES)).isoformat(),
+        )
+        for n in range(count)
+    ]
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,10 +208,10 @@ class Expected:
     """
     What a statistic's history should hold.
 
-    Its first hour is the first whole hour of the 90 days before an import
-    that ran between ``imported_from`` and ``imported_to``, or, once a
-    lane has completed that date, New Zealand midnight at its start; its
-    newest is the last whole hour before ``newest_by``, or the one before.
+    Its first hour is New Zealand midnight at the start of the date 90 dates
+    before an import that ran between ``imported_from`` and
+    ``imported_to``; its newest is the last whole hour before
+    ``newest_by``, or the one before.
     """
 
     imported_from: datetime
@@ -187,10 +221,7 @@ class Expected:
     @property
     def first_range(self) -> tuple[datetime, datetime]:
         """Return the earliest and latest first hour allowed."""
-        return (
-            backfill_start(self.imported_from),
-            ceil_hour(self.imported_to - INITIAL_BACKFILL),
-        )
+        return backfill_start(self.imported_from), backfill_start(self.imported_to)
 
 
 def _hour_problems(kind: str, rows: Sequence[Row]) -> list[str]:
@@ -538,6 +569,13 @@ def wait(what: str, ready: Callable[[], Any], timeout: float) -> Any:
 # -------------------------------------------------------------------- journey
 
 
+class LogMark(NamedTuple):
+    """Where the instance's log ended: its file's inode and size."""
+
+    inode: int
+    size: int
+
+
 def read_refused(folder: Path) -> list[str]:
     """Return the stand-in's record of what it refused in this run, a line each."""
     path = folder / standin.REFUSED
@@ -555,6 +593,8 @@ class Journey:
     translated: set[tuple[str, str]] = field(default_factory=set)
     entries: list[str] = field(default_factory=list)
     flows: list[str] = field(default_factory=list)
+    # When the last update asked for ended, by the monotonic clock.
+    updated_at: float = 0.0
 
     # ------------------------------------------------------------- recording
 
@@ -580,17 +620,7 @@ class Journey:
         if other := result.get("translation_domain"):
             wanted.append((other, "config"))
         for domain, kind in wanted:
-            if (domain, kind) not in self.translated:
-                (loaded,) = self.client.ws(
-                    {
-                        "type": "frontend/get_translations",
-                        "language": "en",
-                        "category": kind,
-                        "integration": [domain],
-                    }
-                )
-                self.translations.update(loaded["resources"])
-                self.translated.add((domain, kind))
+            self.translate(domain, kind)
         shown = render(result, self.translations)
         self.result.screens.append(shown)
         say(
@@ -598,6 +628,21 @@ class Journey:
             + (f": {shown.error}" if shown.error else "")
         )
         return shown
+
+    def translate(self, domain: str, kind: str) -> None:
+        """Load an integration's texts of one category, as the frontend does, once."""
+        if (domain, kind) in self.translated:
+            return
+        (loaded,) = self.client.ws(
+            {
+                "type": "frontend/get_translations",
+                "language": "en",
+                "category": kind,
+                "integration": [domain],
+            }
+        )
+        self.translations.update(loaded["resources"])
+        self.translated.add((domain, kind))
 
     # -------------------------------------------------------------- stand-in
 
@@ -617,6 +662,106 @@ class Journey:
         if since is None:
             return records
         return [r for r in records if datetime.fromisoformat(r["at"]) >= since]
+
+    def windows(
+        self, since: datetime, direction: str = standin.CONSUMPTION
+    ) -> list[tuple[str, str]]:
+        """Return the first and last dates of a direction's windows since ``since``."""
+        return [
+            (str(record["start_on"]), str(record["end_on"]))
+            for record in self.journal(since)
+            if record.get("operation") == "measurements"
+            and record.get("direction") == direction
+            and not record.get("continuation")
+        ]
+
+    def check_windows(
+        self,
+        when: str,
+        since: datetime,
+        count: int,
+        direction: str = standin.CONSUMPTION,
+    ) -> None:
+        """Check that a direction asked for ``count`` windows, newest first, alone."""
+        asked = self.windows(since, direction)
+        # Today is the New Zealand date when the sync began, or now.
+        wanted = [
+            newest_windows(nz_date(moment), count)
+            for moment in (since, datetime.now(UTC))
+        ]
+        self.check(
+            f"{when}: {direction.lower()} asked for {count} windows of "
+            f"{WINDOW_DATES} dates back from today, newest first, and no other",
+            asked in wanted,
+            f"{len(asked)} windows"
+            + (f", {asked[0][1]} back to {asked[-1][0]}" if asked else ""),
+        )
+
+    # -------------------------------------------------------------------- log
+
+    def log_mark(self) -> LogMark:
+        """Return where the instance's log ends now, to read ``own_log`` from."""
+        try:
+            found = self._log_file().stat()
+        except FileNotFoundError:
+            return LogMark(0, 0)
+        return LogMark(found.st_ino, found.st_size)
+
+    def own_log(self, since: LogMark) -> list[tuple[str, str]]:
+        """
+        Return the integration's log lines after ``since``: level, message.
+
+        From the instance's log, where the integration logs at debug level.
+        When a start has moved the marked log to ``LOG_FILE.1`` since, its
+        lines after the mark come first, then the new log's.
+        """
+        current = self._log_file()
+        texts: list[str] = []
+        for path in (current.with_name(f"{LOG_FILE}.1"), current):
+            try:
+                with path.open("rb") as log:
+                    marked = os.fstat(log.fileno()).st_ino == since.inode
+                    if path != current and not marked:
+                        continue
+                    log.seek(since.size if marked else 0)
+                    texts.append(log.read().decode(errors="replace"))
+            except FileNotFoundError:
+                continue
+        own = f"custom_components.{DOMAIN}"
+        return [
+            (line["level"], line["message"])
+            for text in texts
+            for line in map(LOG_LINE.match, text.splitlines())
+            if line is not None
+            and (line["name"] == own or line["name"].startswith(f"{own}."))
+        ]
+
+    def check_log(
+        self, when: str, since: LogMark, expected: Sequence[tuple[str, str]] = ()
+    ) -> None:
+        """
+        Check the integration's log lines above debug level since ``since``.
+
+        They must be ``expected``, in order, and no other. Its debug lines
+        must be there too, so a log that could not be read fails.
+        """
+        lines = self.own_log(since)
+        loud = [(level, message) for level, message in lines if level != "DEBUG"]
+
+        def shown(found: Sequence[tuple[str, str]]) -> str:
+            return "; ".join(f'{level} "{message}"' for level, message in found)
+
+        self.check(
+            f"{when}: the integration logged "
+            + (f"only {shown(expected)}" if expected else "nothing above debug level"),
+            bool(lines) and loud == list(expected),
+            (shown(loud) or "nothing above debug level")
+            if lines
+            else f"no line from it in {LOG_FILE}",
+        )
+
+    def _log_file(self) -> Path:
+        return live_ha.config_dir(self.client.instance.state) / LOG_FILE
 
     # ------------------------------------------------------------------ flows
 
@@ -710,7 +855,7 @@ class Journey:
             if entry is None or entry["state"] != "loaded":
                 return None
             coordinator = self.diagnostics(entry_id)
-            return coordinator if coordinator.get("last_exception_type") else None
+            return coordinator if coordinator.get("last_failure") else None
 
         return dict(wait("the entry's first sync to fail", failed, SYNC_TIMEOUT_S))
 
@@ -724,10 +869,44 @@ class Journey:
         ]
 
     def update(self, entry_id: str) -> None:
-        """Ask for an update, as the entity's menu does."""
+        """
+        Ask for an update, as the entity's menu does, and wait for it to end.
+
+        Home Assistant runs it at once, and answers when it has ended, unless
+        the last one asked for ended less than 10 s before: that is waited out.
+        """
+        if (wait_s := self.updated_at + UPDATE_COOLDOWN_S - time.monotonic()) > 0:
+            time.sleep(wait_s)
         entity = self.entity_ids(entry_id)[0]
-        self.client.rest(
-            "POST", "/api/services/homeassistant/update_entity", {"entity_id": entity}
+        try:
+            self.client.rest(
+                "POST",
+                "/api/services/homeassistant/update_entity",
+                {"entity_id": entity},
+            )
+        finally:
+            self.updated_at = time.monotonic()
+
+    def notice(self, entry_id: str) -> tuple[str, str] | None:
+        """Return the entry's repair notice, its title and text as shown, or None."""
+        (listed,) = self.client.ws({"type": "repairs/list_issues"})
+        issue = next(
+            (
+                item
+                for item in listed["issues"]
+                if item["domain"] == DOMAIN
+                and item["issue_id"] == f"sync_failing_{entry_id}"
+            ),
+            None,
+        )
+        if issue is None:
+            return None
+        self.translate(DOMAIN, "issues")
+        base = f"component.{DOMAIN}.issues.{issue['translation_key']}"
+        placeholders = issue.get("translation_placeholders")
+        return (
+            fill(self.translations.get(f"{base}.title", ""), placeholders),
+            fill(self.translations.get(f"{base}.description", ""), placeholders),
         )
 
     def entity_ids(self, entry_id: str) -> list[str]:
@@ -745,19 +924,39 @@ class Journey:
         return sum(entry_id in item.get("config_entries", []) for item in registry)
 
     def statistics(self, ids: Iterable[str]) -> dict[str, list[Row]]:
-        """Return every hourly row of the statistics, from 120 days back."""
+        """
+        Return every hourly row of the statistics, from 120 days back.
+
+        The integration queues its writes without waiting for the recorder to
+        save them, so the rows are read once nothing is queued and two reads,
+        a poll apart, agree.
+        """
         wanted = sorted(ids)
         start = datetime.now(UTC) - timedelta(days=120)
-        (loaded,) = self.client.ws(
-            {
-                "type": "recorder/statistics_during_period",
-                "start_time": start.isoformat(),
-                "statistic_ids": wanted,
-                "period": "hour",
-                "types": ["state", "sum"],
-            }
-        )
-        return {sid: parse_rows(loaded.get(sid, [])) for sid in wanted}
+
+        def read() -> dict[str, list[Row]]:
+            (loaded,) = self.client.ws(
+                {
+                    "type": "recorder/statistics_during_period",
+                    "start_time": start.isoformat(),
+                    "statistic_ids": wanted,
+                    "period": "hour",
+                    "types": ["state", "sum"],
+                }
+            )
+            return {sid: parse_rows(loaded.get(sid, [])) for sid in wanted}
+
+        def saved() -> tuple[dict[str, list[Row]]] | None:
+            (info,) = self.client.ws({"type": "recorder/info"})
+            if info.get("backlog"):
+                return None
+            first = read()
+            time.sleep(POLL_S)
+            again = read()
+            return (again,) if again == first else None
+
+        (rows,) = wait("the recorder to save the statistics", saved, SYNC_TIMEOUT_S)
+        return dict(rows)
 
     def remove_entries(self) -> None:
         """Remove the journey's entries and close its flows, as they stand."""
@@ -824,6 +1023,20 @@ class Journey:
         self.check_nothing_refused()
         return rows
 
+    def check_complete(self, coordinator: Mapping[str, Any], units: int) -> None:
+        """Check that each of the entry's units found its history complete."""
+        found = coordinator.get("units") or []
+        self.check(
+            f"each unit's history is complete, {units} in all",
+            len(found) == units
+            and all(unit.get("history_complete") is True for unit in found),
+            ", ".join(
+                f"{unit.get('direction')}: {unit.get('history_complete')}"
+                for unit in found
+            )
+            or "no units",
+        )
+
     def check_nothing_refused(self) -> None:
         """Check that the stand-in refused nothing and answered every request."""
         refused = read_refused(self.folder)
@@ -882,17 +1095,16 @@ def _created_at_once(j: Journey, done: dict[str, Any], took: timedelta) -> str:
 
 def first_setup(j: Journey) -> None:
     """
-    First-time setup while Meridian's history times out, then the history.
+    First-time setup with a feed-in register: the entry at once, then history.
 
-    The setup asks Meridian for no history, so it creates the entry all the
-    same, at once, and says the history comes in the background. The entry's
-    first sync fails while Meridian times out; once Meridian answers, an
-    update imports the 90 days.
+    The setup asks Meridian for no history, so it creates the entry at once
+    and says the history comes in the background. The first sync asks for
+    13 windows of each direction, newest first, back to New Zealand midnight
+    90 dates ago, imports them, and logs nothing above debug level.
     """
     account = "A-JOURNEY-1"
-    j.scenario(
-        Scenario(accounts=(account,), measurements_status=504, measurements_page="html")
-    )
+    j.scenario(Scenario(accounts=(account,), feed_in=(account,)))
+    mark = j.log_mark()
     done, started, ended = j.set_up("journey-1@example.com")
     entry_id = _created_at_once(j, done, ended - started)
     j.check(
@@ -900,36 +1112,116 @@ def first_setup(j: Journey) -> None:
         "background" in j.result.screens[-1].text,
         j.result.screens[-1].text,
     )
+    coordinator = j.wait_synced(entry_id)
+    for direction in (standin.CONSUMPTION, standin.GENERATION):
+        j.check_windows("the first sync", started, FIRST_SYNC_WINDOWS, direction)
+    j.check_complete(coordinator, 2)
+    now = datetime.now(UTC)
+    j.check_entry(entry_id, {account: Expected(ended, now, now)}, feed_in=(account,))
+    j.check_log("the setup and the first sync", mark)
+
+
+def outage(j: Journey) -> None:
+    """
+    Meridian times out from the start: the repair notice, then the history.
+
+    The setup creates the entry all the same. Its first sync fails, sending
+    the newest window twice, and Home Assistant logs one ERROR line; the
+    sensors are unavailable, and the third failed update in a row raises the
+    repair notice. Once Meridian answers, an update imports the 90 dates,
+    the notice goes, and Home Assistant says the updates recovered.
+    """
+    account = "A-JOURNEY-3"
+    j.scenario(
+        Scenario(
+            accounts=(account,),
+            measurements_status=GATEWAY_TIMEOUT,
+            measurements_page="html",
+        )
+    )
+    mark = j.log_mark()
+    done, started, ended = j.set_up("journey-3@example.com")
+    entry_id = _created_at_once(j, done, ended - started)
     failed = j.wait_failed(entry_id)
     j.check(
         "the first sync fails while Meridian times out",
         failed.get("first_sync_pending") is True
-        and failed.get("last_update_success") is False,
-        f"last exception {failed.get('last_exception_type')}",
+        and failed["last_failure"].get("key") == "cannot_connect",
+        f"last failure {failed['last_failure']}",
     )
+    entities = j.entity_ids(entry_id)
     unavailable = j.unavailable(entry_id)
     j.check(
         "the sensors are unavailable until the history arrives",
-        bool(unavailable) and unavailable == j.entity_ids(entry_id),
-        f"{len(unavailable)} of {len(j.entity_ids(entry_id))} unavailable",
+        bool(unavailable) and unavailable == entities,
+        f"{len(unavailable)} of {len(entities)} unavailable",
+    )
+    reason = (
+        "Couldn't get an answer from Meridian (HTTP 504). Meridian Energy tries "
+        "again automatically"
+    )
+    for failures in range(1, NOTICE_AFTER):
+        notice = j.notice(entry_id)
+        j.check(
+            f"no repair notice after {failures} of {NOTICE_AFTER} failed updates",
+            notice is None,
+            str(notice),
+        )
+        j.update(entry_id)
+    notice = j.notice(entry_id)
+    j.check(
+        f"the repair notice appears after {NOTICE_AFTER} failed updates in a row",
+        notice
+        == (
+            "Meridian Energy isn't updating",
+            f"{reason}\n\nThis notice goes away by itself once an update works.",
+        ),
+        str(notice),
+    )
+    sent = [r for r in j.journal(started) if r.get("operation") == "measurements"]
+    newest = [
+        newest_windows(nz_date(moment), 1)[0] for moment in (started, datetime.now(UTC))
+    ]
+    j.check(
+        "each failed update sent the newest window, and once more",
+        len(sent) == 2 * NOTICE_AFTER
+        and all(
+            (r.get("start_on"), r.get("end_on")) in newest
+            and r.get("status") == GATEWAY_TIMEOUT
+            for r in sent
+        ),
+        "; ".join(
+            f"{r.get('start_on')}..{r.get('end_on')} {r.get('status')}" for r in sent
+        ),
+    )
+    j.check_log(
+        "while Meridian times out",
+        mark,
+        [("ERROR", f"Error fetching Meridian Energy data: {reason}")],
     )
     j.scenario(Scenario(accounts=(account,)))
+    mark = j.log_mark()
     synced_from = datetime.now(UTC)
     j.update(entry_id)
     coordinator = j.wait_synced(entry_id)
-    j.check(
-        "the first sync that worked imported the history",
-        coordinator.get("sync_mode") == "initial",
-        f"mode {coordinator.get('sync_mode')}",
-    )
+    j.check_windows("the update once Meridian answers", synced_from, FIRST_SYNC_WINDOWS)
+    j.check_complete(coordinator, 1)
+    notice = j.notice(entry_id)
+    j.check("the repair notice goes once an update works", notice is None, str(notice))
     now = datetime.now(UTC)
     j.check_entry(entry_id, {account: Expected(synced_from, now, now)})
+    j.check_log(
+        "once Meridian answers",
+        mark,
+        [("INFO", "Fetching Meridian Energy data recovered")],
+    )
 
 
 def two_accounts(j: Journey) -> None:
     """Two accounts on one login: both are followed, with no choice to make."""
     first, second = "A-JOURNEY-2A", "A-JOURNEY-2B"
     j.scenario(Scenario(accounts=(first, second)))
+    mark = j.log_mark()
     done, started, ended = j.set_up("journey-2@example.com")
     entry_id = _created_at_once(j, done, ended - started)
     j.wait_synced(entry_id)
@@ -940,19 +1232,23 @@ def two_accounts(j: Journey) -> None:
         entry_id,
         {first: Expected(ended, now, now), second: Expected(ended, now, now)},
     )
+    j.check_log("the setup and the first sync", mark)
 
 
 def reauth(j: Journey) -> None:
     """Meridian ends the sign-in; reconnect from the reauthentication."""
     account = "A-JOURNEY-5"
     j.scenario(Scenario(accounts=(account,)))
+    mark = j.log_mark()
     done, started, ended = j.set_up("journey-5@example.com")
     entry_id = _created_at_once(j, done, ended - started)
     coordinator = j.wait_synced(entry_id)
     imported = datetime.now(UTC)
+    j.check_log("the setup and the first sync", mark)
     ids = statistic_ids(account)
     before = j.statistics(ids.values())
     j.scenario(Scenario(accounts=(account,), session_ended=True))
+    mark = j.log_mark()
     j.update(entry_id)
 
     def reauth_flow() -> dict[str, Any] | None:
@@ -1001,12 +1297,25 @@ def reauth(j: Journey) -> None:
             not changed,
             "; ".join(changed[:3]) or f"{len(before[sid])} hours identical",
         )
+    ended_sign_in = (
+        "Authentication failed while fetching Meridian Energy data: Meridian "
+        "has ended the sign-in. Reconnect Meridian Energy to sign in again"
+    )
+    j.check_log(
+        "from the ended sign-in to the renewed one", mark, [("ERROR", ended_sign_in)]
+    )
 
 
 def restart(j: Journey, relaunch: Callable[[], None]) -> None:
-    """Reload the entry, then restart Home Assistant: the history stays whole."""
+    """
+    Reload the entry, then restart Home Assistant: the history stays whole.
+
+    After each, the first sync asks for the last 21 dates, in 3 windows, and
+    nothing older, since the history is whole; no hour changes.
+    """
     account = "A-JOURNEY-6"
     j.scenario(Scenario(accounts=(account,)))
+    mark = j.log_mark()
     done, started, ended = j.set_up("journey-6@example.com")
     entry_id = _created_at_once(j, done, ended - started)
     coordinator = j.wait_synced(entry_id)
@@ -1014,23 +1323,16 @@ def restart(j: Journey, relaunch: Callable[[], None]) -> None:
     ids = statistic_ids(account)
     expected = {account: Expected(ended, imported, datetime.now(UTC))}
     before = j.check_entry(entry_id, expected)
+    j.check_log("the setup and the first sync", mark)
     for when, act in (("the reload", None), ("the restart", relaunch)):
+        mark = j.log_mark()
+        since = datetime.now(UTC)
         if act is None:
             j.client.rest("POST", f"/api/config/config_entries/entry/{entry_id}/reload")
         else:
             act()
         coordinator = j.wait_synced(entry_id, coordinator.get("synced_at"))
-        days = [
-            r["requested_days"]["consumption"]
-            for r in coordinator.get("property_results", [])
-        ]
-        j.check(
-            f"{when}'s update ran and asked for the correction window",
-            coordinator.get("sync_mode") == "restart"
-            and bool(days)
-            and min(days) >= CORRECTION_DAYS,
-            f"mode {coordinator.get('sync_mode')}, days asked {days}",
-        )
+        j.check_windows(f"the update after {when}", since, RECENT_WINDOWS)
         expected = {account: Expected(ended, imported, datetime.now(UTC))}
         after = j.check_entry(entry_id, expected)
         for kind, sid in ids.items():
@@ -1040,11 +1342,13 @@ def restart(j: Journey, relaunch: Callable[[], None]) -> None:
                 not changed,
                 "; ".join(changed[:3]) or f"{len(before[sid])} hours identical",
             )
+        j.check_log(f"{when} and the update after it", mark)
         before = after
 
 
 JOURNEYS: dict[str, str] = {
-    "first_setup": "First-time setup while Meridian times out, then the history",
+    "first_setup": "First-time setup with a feed-in register, the history",
+    "outage": "Meridian times out from the start, the notice, then the history",
     "two_accounts": "Two accounts on one login, both followed",
     "reauth": "Meridian ends the sign-in, reconnect",
     "restart": "Restart and reload, history unbroken",
