@@ -30,9 +30,10 @@ A refused request raises a connection error, and appends one line to
 ``refused.log`` in the stand-in's folder naming its kind and host only,
 never its path or query. Every request the fake answers appends one JSON
 line to ``journal.jsonl``: when, the operation, the synthetic account, the
-direction and dates of a measurements window, and the status, or the fake's
-error when it could not answer (such as a request the integration must never
-send). ``installed-<pid>`` marks each process the stand-in is installed in.
+direction, dates and frequency of a measurements window, and the status, or
+the fake's error when it could not answer (such as a request the integration
+must never send). ``installed-<pid>`` marks each process the stand-in is
+installed in.
 
 The scenario is read from ``scenario.json`` in the folder on each request,
 so the runner can change it between steps without any API (``Scenario``):
@@ -46,7 +47,9 @@ The data is a function of the hour alone (``hour_reading``, ``hour_cost``),
 from a fixed ``HISTORY_START`` to the end of today in New Zealand, whatever
 the time of the request or the requests before it, so a restarted Home
 Assistant sees the same history. Neighbouring hours differ, so an hour
-shifted or counted twice shows in the statistics.
+shifted or counted twice shows in the statistics. The billing period is the
+current New Zealand calendar month; the balance and the prices are the
+fake's.
 """
 
 from __future__ import annotations
@@ -59,12 +62,13 @@ import logging
 import os
 import socket
 from dataclasses import asdict, dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -99,6 +103,7 @@ PTH_LINE = (
 HISTORY_START = datetime(2023, 12, 31, 11, tzinfo=UTC)
 CONSUMPTION = "CONSUMPTION"
 GENERATION = "GENERATION"
+_NZ = ZoneInfo("Pacific/Auckland")
 _LOCAL_NAMES = frozenset({"localhost", "localhost.", "ip6-localhost"})
 # The variables a journal record keeps, by its own name: synthetic values only.
 _JOURNALLED = {
@@ -106,6 +111,7 @@ _JOURNALLED = {
     "direction": "readingDirectionType",
     "start_on": "startOn",
     "end_on": "endOn",
+    "frequency": "readingFrequencyType",
 }
 _GATEWAY_PAGE = (
     b"<html><head><title>504 Gateway Time-out</title></head>"
@@ -177,6 +183,13 @@ class Scenario:
     def to_json(self) -> dict[str, Any]:
         """Return the scenario as a JSON object."""
         return asdict(self)
+
+
+def billing_month(now: datetime) -> tuple[date, date]:
+    """Return the first and last dates of the New Zealand month ``now`` is in."""
+    first = now.astimezone(_NZ).date().replace(day=1)
+    following = (first + timedelta(days=31)).replace(day=1)
+    return first, following - timedelta(days=1)
 
 
 def is_local(host: str | bytes | None) -> bool:
@@ -295,6 +308,7 @@ class StandIn:
         session = self.session
         assert session is not None
         session.kraken.now = now
+        session.billing_period = billing_month(now)
         session.accounts = scenario.accounts
         session.feed_in = frozenset(scenario.feed_in)
         session.hook = partial(_graphql_answer, scenario, http)

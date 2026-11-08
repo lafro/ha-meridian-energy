@@ -87,6 +87,22 @@ HISTORY_DAYS = 90
 WINDOW_DATES = 7
 FIRST_SYNC_WINDOWS = 13
 RECENT_WINDOWS = 3
+# The bill's day totals come in requests of this frequency, not windows.
+DAY_FREQUENCY = "DAY_INTERVAL"
+# The sensors of Meridian's own figures, with a feed-in register and an
+# all-day plan, as the stand-in has.
+FIGURES = (
+    "bill_usage",
+    "bill_cost",
+    "bill_export",
+    "bill_credit",
+    "bill_estimate",
+    "total_due",
+    "last_bill",
+    "last_payment",
+    "daily_charge",
+    "anytime_price",
+)
 # The repair notice appears after this many failed updates in a row.
 NOTICE_AFTER = 3
 # The outage's answer to every measurements request, from a gateway.
@@ -663,16 +679,23 @@ class Journey:
             return records
         return [r for r in records if datetime.fromisoformat(r["at"]) >= since]
 
+    def hourly(self, since: datetime) -> list[dict[str, Any]]:
+        """Return the hourly measurements requests since ``since``."""
+        return [
+            record
+            for record in self.journal(since)
+            if record.get("operation") == "measurements"
+            and record.get("frequency") != DAY_FREQUENCY
+        ]
+
     def windows(
         self, since: datetime, direction: str = standin.CONSUMPTION
     ) -> list[tuple[str, str]]:
         """Return the first and last dates of a direction's windows since ``since``."""
         return [
             (str(record["start_on"]), str(record["end_on"]))
-            for record in self.journal(since)
-            if record.get("operation") == "measurements"
-            and record.get("direction") == direction
-            and not record.get("continuation")
+            for record in self.hourly(since)
+            if record.get("direction") == direction and not record.get("continuation")
         ]
 
     def check_windows(
@@ -909,6 +932,37 @@ class Journey:
             fill(self.translations.get(f"{base}.description", ""), placeholders),
         )
 
+    def sensor_states(self, entry_id: str) -> dict[str, str]:
+        """Return the state of each of the entry's enabled sensors, by its key."""
+        (registry,) = self.client.ws({"type": "config/entity_registry/list"})
+        return {
+            str(item.get("translation_key")): self.client.rest(
+                "GET", f"/api/states/{item['entity_id']}"
+            )["state"]
+            for item in registry
+            if item.get("config_entry_id") == entry_id and not item.get("disabled_by")
+        }
+
+    def check_figures(self, entry_id: str, figures: Iterable[str]) -> None:
+        """Check that each of the account's figures has a sensor with a value."""
+        states = self.sensor_states(entry_id)
+        wanted = sorted(figures)
+        missing = [key for key in wanted if key not in states]
+        unknown = [key for key in wanted if states.get(key) == "unknown"]
+        self.check(
+            "every figure from Meridian has a value: "
+            + ", ".join(key.replace("_", " ") for key in wanted),
+            not missing and not unknown,
+            "; ".join(
+                part
+                for part in (
+                    f"missing: {', '.join(missing)}" if missing else "",
+                    f"unknown: {', '.join(unknown)}" if unknown else "",
+                )
+                if part
+            ),
+        )
+
     def entity_ids(self, entry_id: str) -> list[str]:
         """Return the entry's enabled entities."""
         (registry,) = self.client.ws({"type": "config/entity_registry/list"})
@@ -1100,7 +1154,8 @@ def first_setup(j: Journey) -> None:
     The setup asks Meridian for no history, so it creates the entry at once
     and says the history comes in the background. The first sync asks for
     13 windows of each direction, newest first, back to New Zealand midnight
-    90 dates ago, imports them, and logs nothing above debug level.
+    90 dates ago, imports them, and logs nothing above debug level. Every
+    figure from Meridian has a value, the export and credit so far included.
     """
     account = "A-JOURNEY-1"
     j.scenario(Scenario(accounts=(account,), feed_in=(account,)))
@@ -1118,6 +1173,7 @@ def first_setup(j: Journey) -> None:
     j.check_complete(coordinator, 2)
     now = datetime.now(UTC)
     j.check_entry(entry_id, {account: Expected(ended, now, now)}, feed_in=(account,))
+    j.check_figures(entry_id, FIGURES)
     j.check_log("the setup and the first sync", mark)
 
 
@@ -1178,7 +1234,7 @@ def outage(j: Journey) -> None:
         ),
         str(notice),
     )
-    sent = [r for r in j.journal(started) if r.get("operation") == "measurements"]
+    sent = j.hourly(started)
     newest = [
         newest_windows(nz_date(moment), 1)[0] for moment in (started, datetime.now(UTC))
     ]

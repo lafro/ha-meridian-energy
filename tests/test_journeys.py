@@ -565,6 +565,17 @@ def test_a_syncs_windows_are_read_from_the_journal(tmp_path: Path) -> None:
             # A page after the first is the same window.
             standin.journal({**record, "continuation": True})
     standin.journal({"at": now.isoformat(), "operation": "GetAccounts"})
+    # The bill's day totals are not a window.
+    standin.journal(
+        {
+            "at": now.isoformat(),
+            "operation": "measurements",
+            "direction": meridian_standin.CONSUMPTION,
+            "start_on": "2026-07-01",
+            "end_on": "2026-07-31",
+            "frequency": "DAY_INTERVAL",
+        }
+    )
     assert journey.windows(since) == journeys.newest_windows(today, 3)
     journey.check_windows("the reload", since, 3)
     journey.check_windows("the reload", since, 3, meridian_standin.GENERATION)
@@ -604,6 +615,56 @@ def test_the_repair_notice_is_read_as_repairs_shows_it(tmp_path: Path) -> None:
     assert journey.notice("E1") == ("Not updating", "No answer\n\nGoes away.")
     assert journey.notice("E1") == ("Not updating", "No answer\n\nGoes away.")
     assert client.translated == [("meridian_energy", "issues")]
+
+
+def test_every_figure_must_have_a_sensor_with_a_value(tmp_path: Path) -> None:
+    client = _Client()
+    journey = _journey(tmp_path, client)
+    client.registry = [
+        {"entity_id": f"sensor.{key}", "config_entry_id": "E1", "translation_key": key}
+        for key in ("bill_usage", "bill_cost", "total_due")
+    ] + [
+        {
+            "entity_id": "sensor.billing_period_end",
+            "config_entry_id": "E1",
+            "translation_key": "billing_period_end",
+            "disabled_by": "integration",
+        },
+        {"entity_id": "sensor.other", "config_entry_id": "E2", "translation_key": "x"},
+    ]
+    client.answers = {
+        "/api/states/sensor.bill_usage": {"state": "12.5"},
+        "/api/states/sensor.bill_cost": {"state": "unknown"},
+        "/api/states/sensor.total_due": {"state": "40"},
+    }
+
+    assert journey.sensor_states("E1") == {
+        "bill_usage": "12.5",
+        "bill_cost": "unknown",
+        "total_due": "40",
+    }
+    journey.check_figures("E1", ("bill_usage", "total_due"))
+    journey.check_figures("E1", ("total_due", "bill_cost", "bill_export"))
+
+    passed, failed = journey.result.checks
+    assert passed.ok
+    assert (
+        passed.name == "every figure from Meridian has a value: bill usage, total due"
+    )
+    assert not failed.ok
+    assert failed.detail == "missing: bill_export; unknown: bill_cost"
+    assert set(journeys.FIGURES) == {
+        "bill_usage",
+        "bill_cost",
+        "bill_export",
+        "bill_credit",
+        "bill_estimate",
+        "total_due",
+        "last_bill",
+        "last_payment",
+        "daily_charge",
+        "anytime_price",
+    }
 
 
 def test_each_unit_must_have_its_history_complete(tmp_path: Path) -> None:
