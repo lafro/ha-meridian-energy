@@ -10,7 +10,7 @@ and 15 cents, so a day of 24 hours 12 kWh and $3.60.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -49,10 +49,22 @@ _BILLING_AND_BILL_LOST = (
     "Meridian Energy couldn't get the billing period; the billing period and bill "
     "sensors show unknown until it can"
 )
+_BILLING_LOST = (
+    "Meridian Energy couldn't get the billing period; the billing period sensors "
+    "show unknown until it can"
+)
+_BILLING_BACK = "Meridian Energy is getting the billing period again"
 _DAYS_ALL_LOST = (
     "Meridian Energy couldn't get the bill's day totals; the bill sensors show "
     "unknown until it can"
 )
+_DAYS_BACK = "Meridian Energy is getting the bill's day totals again"
+_PRICES_LOST = (
+    "Meridian Energy couldn't get the prices; Daily charge and Anytime price show "
+    "unknown until it can"
+)
+_PRICES_UNANSWERED = "Meridian Energy couldn't get the prices; it asks again in a day"
+_HUGE = "1E+1000000"
 
 
 @pytest.fixture
@@ -323,6 +335,120 @@ async def test_a_period_that_never_rolls_is_asked_for_4_times_a_day(
         await sync(coordinator, NOW + update * HOUR, session)
 
     assert session.operations.count("billingPeriods") == 1 + 4
+
+
+async def test_an_ended_period_answered_after_a_failure_is_not_back(
+    hass: HomeAssistant,
+    session: FakeMeridianSession,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The billing period is back when a new one shows, not when Meridian answers."""
+    caplog.set_level(logging.INFO)
+    session.billing_period = (TODAY - 30 * DAY, TODAY)
+    coordinator = coordinator_for(hass, session)
+    for update in range(12):
+        await sync(coordinator, NOW + update * HOUR, session)
+
+    session.hook = _failing("billingPeriods")
+    await sync(coordinator, NOW + 12 * HOUR, session)
+    assert _own(caplog, logging.INFO) == [_BILLING_AND_BILL_LOST]
+    for update in range(13, 24):
+        await sync(coordinator, NOW + update * HOUR, session)
+    assert session.operations.count("billingPeriods") == 3
+
+    # Meridian answers again, still with the ended period.
+    session.hook = lambda _operation, _variables: None
+    for update in range(24, 36):
+        data = await sync(coordinator, NOW + update * HOUR, session)
+        assert data.account_results[0].billing_period is None
+        assert data.account_results[0].bill == BillFigures()
+    assert session.operations.count("billingPeriods") == 5
+    assert _own(caplog, logging.INFO) == [_BILLING_AND_BILL_LOST]
+
+    session.billing_period = (TODAY + DAY, TODAY + 31 * DAY)
+    data = await sync(coordinator, NOW + 36 * HOUR, session)
+    assert data.account_results[0].billing_period is not None
+    assert _own(caplog, logging.INFO) == [_BILLING_AND_BILL_LOST, _BILLING_BACK]
+
+
+def _billing_asks(session: FakeMeridianSession, failing: range) -> list[int]:
+    """Answer the billing period with a 503 in some hours from NOW; note each ask."""
+    asked: list[int] = []
+
+    def answer(operation: str, _variables: dict[str, Any]) -> Response | None:
+        if operation != "billingPeriods":
+            return None
+        hours = round((session.kraken.now - NOW) / HOUR)
+        asked.append(hours)
+        return _FAILED if hours in failing else None
+
+    session.hook = answer
+    return asked
+
+
+async def _first_shown(
+    hass: HomeAssistant,
+    session: FakeMeridianSession,
+    caplog: pytest.LogCaptureFixture,
+    updates: int,
+) -> tuple[int | None, list[tuple[int, str]]]:
+    """
+    Update hourly, the next period offered from 36 hours on.
+
+    Return when it first shows, and each INFO line with the update it came at.
+    """
+    caplog.set_level(logging.INFO)
+    new = (TODAY + 2 * DAY, TODAY + 32 * DAY)
+    coordinator = coordinator_for(hass, session)
+    shown = None
+    said: list[tuple[int, str]] = []
+    for update in range(updates):
+        if update == 36:
+            session.billing_period = new
+        data = await sync(coordinator, NOW + update * HOUR, session)
+        period = data.account_results[0].billing_period
+        if shown is None and period is not None and period.start == new[0]:
+            shown = update
+        said.extend((update, line) for line in _own(caplog, logging.INFO)[len(said) :])
+    return shown, said
+
+
+async def test_a_failed_ask_before_a_periods_end_still_asks_after_it(
+    hass: HomeAssistant,
+    session: FakeMeridianSession,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """At the first update after its end, then every 6 hours: 4 a day at most."""
+    # The period ends tomorrow; New Zealand midnight after it is 35.5 hours on.
+    session.billing_period = (TODAY + DAY - 30 * DAY, TODAY + DAY)
+    asked = _billing_asks(session, range(24, 61))
+
+    shown, said = await _first_shown(hass, session, caplog, updates=73)
+
+    assert asked == [0, 24, 36, 42, 48, 54, 60, 66]
+    assert shown == 66
+    in_a_day = [
+        len([hours for hours in asked if start <= hours < start + 24])
+        for start in range(73)
+    ]
+    assert max(in_a_day) == 4
+    assert said == [(36, _BILLING_AND_BILL_LOST), (66, _BILLING_BACK)]
+
+
+async def test_an_ended_period_is_asked_for_every_6_hours_past_its_keep(
+    hass: HomeAssistant,
+    session: FakeMeridianSession,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The last period got decides, however long ago it came."""
+    session.billing_period = (TODAY + DAY - 30 * DAY, TODAY + DAY)
+    asked = _billing_asks(session, range(36, 100))
+
+    shown, said = await _first_shown(hass, session, caplog, updates=103)
+
+    assert asked == [0, 24, *range(36, 103, 6)]
+    assert shown == 102
+    assert said == [(36, _BILLING_AND_BILL_LOST), (102, _BILLING_BACK)]
 
 
 async def test_a_current_period_is_kept_two_days_when_its_refresh_fails(
@@ -599,6 +725,90 @@ async def test_a_kind_is_back_only_when_no_account_fails_it(
     ]
 
 
+@pytest.mark.parametrize(
+    "accounts", [(ACCOUNT_NUMBER, "A-TEST-2"), ("A-TEST-2", ACCOUNT_NUMBER)]
+)
+async def test_with_two_accounts_the_days_line_says_the_wider_loss(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture, accounts: tuple[str, str]
+) -> None:
+    """One account's bill unknown, the other's 'so far' only: one line, either way."""
+    caplog.set_level(logging.INFO)
+    session = FakeMeridianSession(NOW, accounts=accounts)
+    session.billing_period = _PERIOD
+    outages = {ACCOUNT_NUMBER: range(41), "A-TEST-2": range(6, 30)}
+
+    def answer(_operation: str, variables: dict[str, Any]) -> Response | None:
+        if variables.get("readingFrequencyType") != "DAY_INTERVAL":
+            return None
+        hours = round((session.kraken.now - NOW) / HOUR)
+        return _FAILED if hours in outages[variables["accountNumber"]] else None
+
+    session.hook = answer
+    coordinator = coordinator_for(hass, session)
+
+    for update in range(42):
+        await sync(coordinator, NOW + update * HOUR, session)
+    assert _own(caplog, logging.INFO) == [_DAYS_ALL_LOST]
+    await sync(coordinator, NOW + 42 * HOUR, session)
+
+    assert _own(caplog, logging.INFO) == [_DAYS_ALL_LOST, _DAYS_BACK]
+
+
+async def test_with_two_accounts_lost_prices_are_said_over_unanswered_ones(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    session = FakeMeridianSession(NOW, accounts=(ACCOUNT_NUMBER, "A-TEST-2"))
+    session.hook = lambda operation, variables: (
+        _FAILED
+        if operation == "prices"
+        and (variables["accountNumber"] == "A-TEST-2" or session.kraken.now > NOW)
+        else None
+    )
+    coordinator = coordinator_for(hass, session)
+    await sync(coordinator, NOW, session)
+    await sync(coordinator, NOW + DAY, session)
+    assert _own(caplog, logging.INFO) == [_PRICES_UNANSWERED]
+
+    data = await sync(coordinator, NOW + 2 * DAY, session)
+
+    assert [result.price_sensors for result in data.account_results] == [True, None]
+    assert data.account_results[0].prices is None
+    assert _own(caplog, logging.INFO) == [_PRICES_UNANSWERED, _PRICES_LOST]
+
+
+async def test_with_two_accounts_a_narrower_billing_line_waits_for_the_wider(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Said once the account whose bill sensors are unknown too has its period."""
+    caplog.set_level(logging.INFO)
+    session = FakeMeridianSession(NOW, accounts=(ACCOUNT_NUMBER, "A-TEST-2"))
+    session.billing_period = _PERIOD
+    failing = {ACCOUNT_NUMBER}
+    session.hook = lambda operation, variables: (
+        _FAILED
+        if operation == "billingPeriods" and variables["accountNumber"] in failing
+        else None
+    )
+    coordinator = coordinator_for(hass, session)
+    await sync(coordinator, NOW, session)
+
+    failing.add("A-TEST-2")
+    for day in (1, 2):
+        await sync(coordinator, NOW + day * DAY, session)
+    assert _own(caplog, logging.INFO) == [_BILLING_AND_BILL_LOST]
+
+    failing.discard(ACCOUNT_NUMBER)
+    for day in (3, 4):
+        data = await sync(coordinator, NOW + day * DAY, session)
+
+    assert [result.billing_period is None for result in data.account_results] == [
+        False,
+        True,
+    ]
+    assert _own(caplog, logging.INFO) == [_BILLING_AND_BILL_LOST, _BILLING_LOST]
+
+
 async def test_no_figure_is_asked_for_after_a_measurements_rate_limit(
     hass: HomeAssistant, session: FakeMeridianSession
 ) -> None:
@@ -698,6 +908,38 @@ async def test_failed_figures_never_fail_an_update_but_an_ended_sign_in_does(
     assert [name for name in session.operations if name in operations] == asked
 
 
+@pytest.mark.parametrize("field", ["value", "cost"])
+async def test_a_day_total_too_large_to_add_fails_only_the_bill(
+    hass: HomeAssistant,
+    session: FakeMeridianSession,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+) -> None:
+    """A day's value or cost out of range is unreadable, like any other."""
+    day_node = session.kraken.day_node
+
+    def huge(day: date, channel: int, direction: str) -> dict[str, Any]:
+        node = day_node(day, channel, direction)
+        if field == "value":
+            node["value"] = _HUGE
+        else:
+            node["metaData"]["statistics"][0]["costInclTax"] = {
+                "estimatedAmount": _HUGE
+            }
+        return node
+
+    monkeypatch.setattr(session.kraken, "day_node", huge)
+    coordinator = coordinator_for(hass, session)
+
+    await refresh(coordinator, NOW, session)
+
+    assert coordinator.last_update_success
+    assert coordinator.data.account_results[0].bill == BillFigures()
+    await refresh(coordinator, NOW + HOUR, session)
+    assert coordinator.last_update_success
+    assert len(_day_requests(session)) == 1
+
+
 async def test_a_property_whose_grid_import_failed_skips_its_day_request(
     hass: HomeAssistant,
 ) -> None:
@@ -776,6 +1018,26 @@ async def test_a_rate_limit_on_the_grid_export_days_waits_like_any_other(
     assert "balance" not in session.operations
     assert data.account_results[0].bill == BillFigures()
     assert not _own(caplog, logging.INFO)
+
+
+async def test_an_ended_sign_in_on_the_grid_export_days_stops_the_sync(
+    hass: HomeAssistant,
+) -> None:
+    session = FakeMeridianSession(NOW, feed_in=(ACCOUNT_NUMBER,))
+    session.billing_period = _PERIOD
+    session.hook = lambda operation, variables: (
+        json_response({}, status=401)
+        if operation == "measurements"
+        and variables["readingDirectionType"] == "GENERATION"
+        and variables["readingFrequencyType"] == "DAY_INTERVAL"
+        else None
+    )
+    coordinator = coordinator_for(hass, session)
+
+    with pytest.raises(ConfigEntryAuthFailed):
+        await sync(coordinator, NOW, session)
+
+    assert "balance" not in session.operations
 
 
 async def test_only_a_property_with_feed_in_is_asked_for_its_export_days(
