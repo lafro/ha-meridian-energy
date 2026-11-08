@@ -40,14 +40,21 @@ def _child(seconds: float) -> subprocess.Popen[bytes]:
     )
 
 
-def test_the_instance_is_reachable_from_this_computer_only(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("form", "profile"), [((2, 2), "modern"), ((3, 1), "intermediate_v6")]
+)
+def test_the_instance_is_reachable_from_this_computer_only(
+    tmp_path: Path, form: tuple[int, int], profile: str
+) -> None:
     (tmp_path / ".storage").mkdir()
-    live_ha.write_http_store(tmp_path, 8124)
+    live_ha.write_http_store(tmp_path, 8124, form)
     stored = json.loads((tmp_path / ".storage" / "http").read_text())
-    assert (stored["version"], stored["minor_version"]) == live_ha.HTTP_STORE_VERSION
+    assert (stored["version"], stored["minor_version"]) == form
     data = stored["data"]
     assert data["stable"]["server_host"] == ["127.0.0.1"]
     assert data["stable"]["server_port"] == 8124
+    # Each form's own default profile: 3.1 (2026.11) renamed them.
+    assert data["stable"]["ssl_profile"] == profile
     assert data["pending"] is None
     assert data["yaml_migration_done"] is True
     assert live_ha.http_store_problems(tmp_path, 8124) == []
@@ -65,13 +72,117 @@ def test_the_instance_is_reachable_from_this_computer_only(tmp_path: Path) -> No
     ]
 
 
+def test_entries_that_reach_past_this_computer_are_stored_turned_off(
+    tmp_path: Path,
+) -> None:
+    from pytest_homeassistant_custom_component.common import (  # noqa: PLC0415
+        MockConfigEntry,
+    )
+
+    (tmp_path / ".storage").mkdir()
+    live_ha.write_disabled_entries(tmp_path, ["marketplace"])
+    stored = json.loads((tmp_path / ".storage" / "core.config_entries").read_text())
+    assert (stored["version"], stored["minor_version"]) == (
+        live_ha.CONFIG_ENTRIES_STORE
+    )
+    (entry,) = stored["data"]["entries"]
+    assert entry["domain"] == "marketplace"
+    assert entry["disabled_by"] == "user"
+    assert entry["source"] == "system"
+    # Every field Home Assistant reads from a stored entry, and no other.
+    assert set(entry) == set(MockConfigEntry(domain="marketplace").as_dict())
+
+
+def test_a_release_without_such_entries_gets_no_entries_store(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / ".storage").mkdir()
+    live_ha.write_disabled_entries(tmp_path, [])
+    assert not (tmp_path / ".storage" / "core.config_entries").exists()
+
+
+def test_only_the_releases_own_integrations_are_turned_off() -> None:
+    assert live_ha.integrations_present(
+        Path(sys.executable), ["backup", "not_an_integration"]
+    ) == frozenset({"backup"})
+
+
+def test_a_failed_integration_check_stops_the_build(tmp_path: Path) -> None:
+    # Fail closed: skipping the Marketplace's entry would let it reach out.
+    failing = tmp_path / "python"
+    failing.write_text("#!/bin/sh\nexit 1\n")
+    failing.chmod(0o755)
+    with pytest.raises(SystemExit, match="cannot be shown to be contained"):
+        live_ha.integrations_present(failing, ["marketplace"])
+
+
+@pytest.mark.parametrize(
+    ("version", "form"), [("2026.11.0", (3, 1)), ("2026.10.4", (2, 2))]
+)
+@pytest.mark.parametrize("present", [frozenset({"marketplace"}), frozenset()])
+def test_the_build_turns_off_the_marketplace_where_the_release_has_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    version: str,
+    form: tuple[int, int],
+    present: frozenset[str],
+) -> None:
+    probed: list[tuple[Path, list[str]]] = []
+
+    def install_integration(state: Path, _domain: str, _ref: str | None) -> str:
+        (state / "config").mkdir()
+        return "the working tree"
+
+    def integrations_present(python: Path, domains: Any) -> frozenset[str]:
+        probed.append((python, sorted(domains)))
+        return present
+
+    monkeypatch.setattr(live_ha, "install_integration", install_integration)
+    monkeypatch.setattr(
+        live_ha, "install_home_assistant", lambda _state, _version: (version, form)
+    )
+    monkeypatch.setattr(live_ha, "integrations_present", integrations_present)
+    (tmp_path / "port").write_text("8124")
+
+    assert live_ha.build(tmp_path, DOMAIN, None, version) == version
+
+    assert probed == [(tmp_path / "venv" / "bin" / "python", ["marketplace"])]
+    storage = tmp_path / "config" / ".storage"
+    http = json.loads((storage / "http").read_text())
+    assert (http["version"], http["minor_version"]) == form
+    assert http["data"]["stable"]["server_host"] == ["127.0.0.1"]
+    entries = storage / "core.config_entries"
+    if present:
+        stored = json.loads(entries.read_text())["data"]["entries"]
+        assert [(e["domain"], e["disabled_by"]) for e in stored] == [
+            ("marketplace", "user")
+        ]
+    else:
+        assert not entries.exists()
+
+
+def test_the_entries_store_form_matches_the_home_assistant_under_test() -> None:
+    # As for the web-server store: the compatibility workflow shows a change.
+    from homeassistant import config_entries  # noqa: PLC0415
+
+    assert (config_entries.STORAGE_VERSION, config_entries.STORAGE_VERSION_MINOR) == (
+        live_ha.CONFIG_ENTRIES_STORE
+    )
+
+
 def test_the_store_form_matches_the_home_assistant_under_test() -> None:
     # The compatibility workflow runs this against each new release, so a
     # change to how Home Assistant stores web-server settings shows here
     # before a live test meets it.
-    assert live_ha.http_store_version(Path(sys.executable)) == (
-        live_ha.HTTP_STORE_VERSION
+    form = live_ha.http_store_version(Path(sys.executable))
+    assert form in live_ha.HTTP_STORES
+    # The profile written for that form is one its release accepts.
+    from homeassistant.components.http.config import (  # noqa: PLC0415
+        HTTP_STORAGE_SCHEMA,
     )
+
+    profile = live_ha.HTTP_STORES[form]
+    assert str(HTTP_STORAGE_SCHEMA({"ssl_profile": profile})["ssl_profile"]) == profile
 
 
 def test_the_instance_loads_nothing_that_discovers_or_announces() -> None:
@@ -145,13 +256,13 @@ def _instance(
     monkeypatch: pytest.MonkeyPatch,
     *,
     components: tuple[str, ...] = ("api", "frontend", DOMAIN),
-    entries: tuple[str, ...] = ("analytics", "backup"),
+    entries: tuple[str | dict[str, Any], ...] = ("analytics", "backup"),
     recovery_mode: bool = False,
     lines: tuple[str, ...] = (LISTENING,),
 ) -> None:
     config = tmp_path / "config"
     (config / ".storage").mkdir(parents=True)
-    live_ha.write_http_store(config, 8124)
+    live_ha.write_http_store(config, 8124, (2, 2))
     (tmp_path / "port").write_text("8124")
     answers = {
         "/api/config": {
@@ -160,7 +271,10 @@ def _instance(
             "recovery_mode": recovery_mode,
             "version": "1.0.0",
         },
-        "/api/config/config_entries/entry": [{"domain": d} for d in entries],
+        "/api/config/config_entries/entry": [
+            e if isinstance(e, dict) else {"domain": e, "disabled_by": None}
+            for e in entries
+        ],
         "/api/config/config_entries/flow_handlers": [DOMAIN],
     }
     monkeypatch.setattr(live_ha, "access_token", lambda _state, _port: "token")
@@ -174,10 +288,19 @@ def _check(tmp_path: Path) -> str:
     return live_ha.check_contained(tmp_path, lambda: True, 4242, 8124, DOMAIN)
 
 
+MARKETPLACE_OFF = {"domain": "marketplace", "disabled_by": "user"}
+MARKETPLACE_ON = {"domain": "marketplace", "disabled_by": None}
+
+
+@pytest.mark.parametrize(
+    "entries", [("analytics", "backup"), ("analytics", "backup", MARKETPLACE_OFF)]
+)
 def test_a_contained_instance_passes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    entries: tuple[str | dict[str, Any], ...],
 ) -> None:
-    _instance(tmp_path, monkeypatch)
+    _instance(tmp_path, monkeypatch, entries=entries)
     assert _check(tmp_path) == "1.0.0"
 
 
@@ -186,6 +309,8 @@ def test_a_contained_instance_passes(
     [
         ({"components": ("api", "zeroconf.sensor")}, "must not load"),
         ({"entries": ("analytics", "met")}, "Unexpected config entries"),
+        # Turned on, the Marketplace fetches its catalog over the network.
+        ({"entries": ("analytics", MARKETPLACE_ON)}, "Unexpected config entries"),
         ({"recovery_mode": True}, "recovery mode"),
         ({"lines": (_lsof("*:8123 (LISTEN)"),)}, "listens beyond"),
         ({"lines": ()}, "cannot be shown to be contained"),
@@ -324,7 +449,7 @@ def test_an_unconfirmed_or_wider_web_server_setting_is_a_problem(
     tmp_path: Path,
 ) -> None:
     (tmp_path / ".storage").mkdir()
-    live_ha.write_http_store(tmp_path, 8124)
+    live_ha.write_http_store(tmp_path, 8124, (3, 1))
     store = tmp_path / ".storage" / "http"
     raw = json.loads(store.read_text())
     raw["data"]["pending"] = {"server_port": 8123}
@@ -351,20 +476,28 @@ def test_the_install_ignores_the_repositorys_uv_settings(
         return "1.0.0"
 
     monkeypatch.setattr(live_ha, "run", fake_run)
-    monkeypatch.setattr(
-        live_ha, "http_store_version", lambda _python: live_ha.HTTP_STORE_VERSION
-    )
-    assert live_ha.install_home_assistant(tmp_path, None) == "1.0.0"
+    monkeypatch.setattr(live_ha, "http_store_version", lambda _python: (2, 2))
+    assert live_ha.install_home_assistant(tmp_path, None) == ("1.0.0", (2, 2))
     uv_calls = [call for call in calls if call[0] == "uv"]
     assert [call[1] for call in uv_calls] == ["venv", "pip"]
     assert all("--no-config" in call for call in uv_calls)
 
 
+@pytest.mark.parametrize("form", [(2, 2), (3, 1)])
+def test_the_install_reports_the_store_form_it_found(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, form: tuple[int, int]
+) -> None:
+    monkeypatch.setattr(live_ha, "run", lambda *_args: "2026.11.0")
+    monkeypatch.setattr(live_ha, "http_store_version", lambda _python: form)
+    assert live_ha.install_home_assistant(tmp_path, None) == ("2026.11.0", form)
+
+
+@pytest.mark.parametrize("form", [None, (2, 1), (3, 2), (4, 0)])
 def test_a_release_with_another_store_form_is_refused(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, form: tuple[int, int] | None
 ) -> None:
     monkeypatch.setattr(live_ha, "run", lambda *_args: "2026.7.2")
-    monkeypatch.setattr(live_ha, "http_store_version", lambda _python: None)
+    monkeypatch.setattr(live_ha, "http_store_version", lambda _python: form)
     with pytest.raises(SystemExit, match=r"cannot keep it to 127\.0\.0\.1"):
         live_ha.install_home_assistant(tmp_path, "2026.7.2")
 
