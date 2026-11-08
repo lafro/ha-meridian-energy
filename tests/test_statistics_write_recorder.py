@@ -39,10 +39,10 @@ from pytest_homeassistant_custom_component.components.recorder.common import (
 
 from custom_components.meridian_energy import statistics as statistics_module
 from custom_components.meridian_energy.statistics import (
-    _cost_metadata,
-    _energy_metadata,
     async_write_hours,
     consumption_ids,
+    cost_metadata,
+    energy_metadata,
     property_key,
 )
 
@@ -67,11 +67,11 @@ def mock_recorder_before_hass(recorder_db_url: str) -> None:
 
 
 def _energy_meta() -> StatisticMetaData:
-    return _energy_metadata(ENERGY_ID, "Meridian grid import")
+    return energy_metadata(ENERGY_ID, "Meridian grid import")
 
 
 def _cost_meta() -> StatisticMetaData:
-    return _cost_metadata(COST_ID, "Meridian grid import cost")
+    return cost_metadata(COST_ID, "Meridian grid import cost")
 
 
 def _energy(first: datetime, count: int) -> dict[datetime, Decimal]:
@@ -645,9 +645,18 @@ async def test_a_statistic_given_twice_is_refused(
     """A unit's hours come in one mapping per statistic: two are refused."""
     del recorder_mock
     readings = _energy(START, 48)
+    instance = get_instance(hass)
 
     with (
         _spy_writes() as spy,
+        patch.object(
+            instance, "async_clear_statistics", wraps=instance.async_clear_statistics
+        ) as barrier,
+        patch.object(
+            statistics_module,
+            "statistics_during_period",
+            wraps=statistics_during_period,
+        ) as read,
         pytest.raises(ValueError, match="Each statistic may be given once per call"),
     ):
         await async_write_hours(
@@ -659,8 +668,45 @@ async def test_a_statistic_given_twice_is_refused(
         )
     await async_wait_recording_done(hass)
 
+    # Refused before the barrier or any read.
+    barrier.assert_not_called()
+    read.assert_not_called()
     spy.assert_not_called()
     assert await _stored(hass, ENERGY_ID) == []
+
+
+async def test_two_writes_of_one_statistic_at_once_take_turns(
+    recorder_mock: Any, hass: HomeAssistant
+) -> None:
+    """
+    The second write waits for the first's rows to be queued, then reads them.
+
+    As when an update outlives a reload of its entry and the new entry's
+    first update writes the same statistic: without the per-statistic lock
+    both would read before either's rows were saved, and the later write
+    would continue its sums from zero.
+    """
+    del recorder_mock
+    readings = _energy(START, 48)
+    first = _between(readings, START, START + DAY)
+    second = _between(readings, START + DAY, START + 2 * DAY)
+
+    results = await asyncio.gather(
+        async_write_hours(hass, [(_energy_meta(), first)]),
+        async_write_hours(hass, [(_energy_meta(), second)]),
+    )
+    await async_wait_recording_done(hass)
+
+    assert results == [True, True]
+    rows = await _stored(hass, ENERGY_ID)
+    _assert_states(rows, readings)
+    _assert_steps(rows)
+    assert not any(
+        lock.locked()
+        for lock in hass.data[statistics_module.DOMAIN][
+            statistics_module.WRITE_LOCKS
+        ].values()
+    )
 
 
 async def test_energy_and_cost_are_queued_in_one_loop_iteration(

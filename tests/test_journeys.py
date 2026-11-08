@@ -11,12 +11,23 @@ import tempfile
 import urllib.error
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
+from custom_components.meridian_energy.const import (
+    DAILY_DATES,
+    HISTORY_DAYS,
+    WINDOW_DAYS,
+)
 from custom_components.meridian_energy.statistics import (
     property_key as integration_property_key,
+)
+from custom_components.meridian_energy.windows import (
+    local_midnight,
+    nz_date,
+    windows_for,
 )
 from scripts import journeys, live_ha
 from scripts.journeys import (
@@ -25,6 +36,7 @@ from scripts.journeys import (
     Journey,
     JourneyError,
     JourneyResult,
+    LogMark,
     Row,
     Screen,
 )
@@ -33,6 +45,8 @@ from . import meridian_standin
 from .meridian_http import property_id
 
 _NOW = datetime(2026, 7, 16, 12, 30, tzinfo=UTC)
+# New Zealand midnight at the start of 18 April 2026, standard time.
+_FIRST = datetime(2026, 4, 17, 12, tzinfo=UTC)
 
 
 def _history(first: datetime, hours: int, kind: str = "consumption") -> list[Row]:
@@ -47,7 +61,8 @@ def _history(first: datetime, hours: int, kind: str = "consumption") -> list[Row
 
 
 def _expected(first: datetime, hours: int) -> Expected:
-    imported = first + timedelta(days=90) - timedelta(minutes=30)
+    """Return what an import 90 dates after ``first``'s date leaves."""
+    imported = first + timedelta(days=90, hours=1, minutes=30)
     return Expected(imported, imported, first + hours * HOUR + timedelta(minutes=5))
 
 
@@ -90,10 +105,9 @@ def test_parse_rows_reads_the_recorders_milliseconds() -> None:
 
 
 def test_a_whole_history_has_no_problems() -> None:
-    first = datetime(2026, 4, 17, 13, tzinfo=UTC)
-    rows = _history(first, 2159)
-    assert journeys.history_problems("consumption", rows, _expected(first, 2159)) == []
-    cost = _history(first, 24, "consumption_cost")
+    rows = _history(_FIRST, 2159)
+    assert journeys.history_problems("consumption", rows, _expected(_FIRST, 2159)) == []
+    cost = _history(_FIRST, 24, "consumption_cost")
     assert journeys.history_problems("consumption_cost", cost, None) == []
 
 
@@ -130,31 +144,27 @@ def test_every_kind_of_damage_is_found() -> None:
 
 
 def test_the_first_and_newest_hours_must_be_where_the_import_left_them() -> None:
-    first = datetime(2026, 4, 17, 13, tzinfo=UTC)
-    rows = _history(first, 48)
-    expected = _expected(first, 48)
+    rows = _history(_FIRST, 48)
+    expected = _expected(_FIRST, 48)
     assert journeys.history_problems("consumption", rows, expected) == []
-    # Within the date, a lane may already have filled the hours before.
+    # The first hour is New Zealand midnight 90 dates before the import.
+    assert expected.first_range == (_FIRST, _FIRST)
+    day = timedelta(days=1)
+    # An import that ran over midnight allows either date's.
+    over_midnight = Expected(
+        expected.imported_from - day, expected.imported_to, expected.newest_by
+    )
+    assert journeys.history_problems("consumption", rows, over_midnight) == []
+    assert over_midnight.first_range == (_FIRST - day, _FIRST)
     later = Expected(
-        expected.imported_from + timedelta(hours=5),
-        expected.imported_to + timedelta(hours=5),
-        expected.newest_by,
+        expected.imported_from + day, expected.imported_to + day, expected.newest_by
     )
-    assert journeys.history_problems("consumption", rows, later) == []
-    late = Expected(
-        expected.imported_from + timedelta(days=2),
-        expected.imported_to + timedelta(days=2),
-        expected.newest_by,
-    )
-    assert journeys.history_problems("consumption", rows, late)[0].startswith(
+    assert journeys.history_problems("consumption", rows, later)[0].startswith(
         "first hour"
     )
-    early = Expected(
-        expected.imported_from - timedelta(hours=3),
-        expected.imported_to - timedelta(hours=3),
-        expected.newest_by,
-    )
-    assert journeys.history_problems("consumption", rows, early)[0].startswith(
+    # A history that starts an hour late lacks that date's first hour.
+    late = _history(_FIRST + HOUR, 47)
+    assert journeys.history_problems("consumption", late, expected)[0].startswith(
         "first hour"
     )
     stale = Expected(
@@ -165,16 +175,33 @@ def test_the_first_and_newest_hours_must_be_where_the_import_left_them() -> None
     assert journeys.history_problems("consumption", rows, stale)[0].startswith(
         "newest hour"
     )
-    # A lane may complete the date: New Zealand midnight is the earliest first.
-    earliest, latest = expected.first_range
-    assert earliest == journeys.backfill_start(expected.imported_from)
-    assert earliest.astimezone(journeys.NZ).hour == 0
-    assert latest == first
+
+
+def test_the_target_and_the_windows_are_the_integrations() -> None:
+    # 00:30 on 10 October in New Zealand, in summer time: 90 dates back is
+    # in winter, so going back 90 days from the moment would miss a date.
+    now = datetime(2026, 10, 9, 11, 30, tzinfo=UTC)
+    today = nz_date(now)
+    target = today - timedelta(days=HISTORY_DAYS)
+    assert journeys.nz_date(now) == today
+    assert journeys.backfill_start(now) == local_midnight(target)
+    assert journeys.backfill_start(now) == datetime(2026, 7, 11, 12, tzinfo=UTC)
+    assert journeys.WINDOW_DATES == WINDOW_DAYS
+    assert journeys.RECENT_WINDOWS * WINDOW_DAYS == DAILY_DATES
+    for count in (journeys.RECENT_WINDOWS, journeys.FIRST_SYNC_WINDOWS):
+        dates = [today - timedelta(days=n) for n in range(count * WINDOW_DAYS)]
+        assert journeys.newest_windows(today, count) == [
+            (window.start_on.isoformat(), window.end_on.isoformat())
+            for window in windows_for(dates)
+        ]
+    # A first sync's windows reach back to the target, and no further.
+    assert journeys.newest_windows(today, journeys.FIRST_SYNC_WINDOWS)[-1][0] == (
+        target.isoformat()
+    )
 
 
 def test_problems_are_cut_short() -> None:
-    first = datetime(2026, 4, 17, 13, tzinfo=UTC)
-    rows = [Row(r.start, 0.0, 0.0) for r in _history(first, 20)]
+    rows = [Row(r.start, 0.0, 0.0) for r in _history(_FIRST, 20)]
     problems = journeys.history_problems("consumption", rows, None)
     assert len(problems) == journeys.SHOWN_PROBLEMS + 1
     assert problems[-1].startswith("and ")
@@ -208,6 +235,10 @@ _TRANSLATIONS = {
     "component.meridian_energy.config.create_entry.partial": "In the background.",
     "component.meridian_energy.config.abort.login_expired": "Expired.",
     "component.homeassistant.config.abort.reauth_successful": "Signed in again.",
+    "component.meridian_energy.issues.sync_failing.title": "Not updating",
+    "component.meridian_energy.issues.sync_failing.description": (
+        "{reason}\n\nGoes away."
+    ),
 }
 
 
@@ -401,22 +432,40 @@ def test_the_report_goes_to_the_temporary_directory(
 
 
 class _Client:
-    """A client whose REST answers are canned and recorded."""
+    """A client whose REST and websocket answers are canned and recorded."""
 
-    def __init__(self, answers: dict[str, Any] | None = None) -> None:
+    def __init__(
+        self, answers: dict[str, Any] | None = None, state: Path | None = None
+    ) -> None:
         self.answers = answers or {}
         self.sent: list[str] = []
+        self.data: list[dict[str, Any] | None] = []
         self.translated: list[tuple[str, str]] = []
+        self.issues: list[dict[str, Any]] = []
+        self.registry: list[dict[str, Any]] = []
+        # The recorder's backlog and statistics, an answer for each request in
+        # turn; the last answers every request after it.
+        self.backlogs: list[int] = [0]
+        self.periods: list[dict[str, Any]] = [{}]
+        self.instance = SimpleNamespace(state=state or Path("/nonexistent"))
 
     def rest(self, method: str, path: str, data: dict[str, Any] | None = None) -> Any:
-        del data
         self.sent.append(f"{method} {path}")
+        self.data.append(data)
         answer = self.answers.get(path)
         if isinstance(answer, Exception):
             raise answer
         return answer
 
     def ws(self, *messages: dict[str, Any]) -> list[Any]:
+        if messages[0]["type"] == "repairs/list_issues":
+            return [{"issues": self.issues}]
+        if messages[0]["type"] == "config/entity_registry/list":
+            return [self.registry]
+        if messages[0]["type"] == "recorder/info":
+            return [{"backlog": _next(self.backlogs)}]
+        if messages[0]["type"] == "recorder/statistics_during_period":
+            return [_next(self.periods)]
         assert messages[0]["type"] == "frontend/get_translations"
         (domain,) = messages[0]["integration"]
         category = messages[0]["category"]
@@ -431,6 +480,11 @@ class _Client:
                 }
             }
         ]
+
+
+def _next(answers: list[Any]) -> Any:
+    """Return the next canned answer; the last one answers every request after."""
+    return answers.pop(0) if len(answers) > 1 else answers[0]
 
 
 def _stop(stopped: list[str], state: Path) -> Any:
@@ -481,6 +535,256 @@ def test_the_scenario_and_journal_are_the_stand_ins(tmp_path: Path) -> None:
     # To the microsecond: two requests in the same second are told apart.
     since = datetime(2026, 7, 16, 12, 0, 0, 500000, tzinfo=UTC)
     assert [r["operation"] for r in journey.journal(since)] == ["b"]
+
+
+def test_a_syncs_windows_are_read_from_the_journal(tmp_path: Path) -> None:
+    journey = _journey(tmp_path)
+    standin = meridian_standin.StandIn(tmp_path)
+    now = datetime.now(UTC)
+    today = journeys.nz_date(now)
+    since = now - timedelta(seconds=1)
+    standin.journal(
+        {
+            "at": (since - timedelta(seconds=1)).isoformat(),
+            "operation": "measurements",
+            "direction": meridian_standin.CONSUMPTION,
+            "start_on": "2020-01-01",
+            "end_on": "2020-01-07",
+        }
+    )
+    for start_on, end_on in journeys.newest_windows(today, 3):
+        for direction in (meridian_standin.CONSUMPTION, meridian_standin.GENERATION):
+            record = {
+                "at": now.isoformat(),
+                "operation": "measurements",
+                "direction": direction,
+                "start_on": start_on,
+                "end_on": end_on,
+            }
+            standin.journal(record)
+            # A page after the first is the same window.
+            standin.journal({**record, "continuation": True})
+    standin.journal({"at": now.isoformat(), "operation": "GetAccounts"})
+    assert journey.windows(since) == journeys.newest_windows(today, 3)
+    journey.check_windows("the reload", since, 3)
+    journey.check_windows("the reload", since, 3, meridian_standin.GENERATION)
+    journey.check_windows("the first sync", since, 13)
+    passed, export, wanting = journey.result.checks
+    assert passed.ok
+    assert passed.name == (
+        "the reload: consumption asked for 3 windows of 7 dates back from today, "
+        "newest first, and no other"
+    )
+    assert passed.detail == (f"3 windows, {today} back to {today - timedelta(days=20)}")
+    assert export.ok
+    assert not wanting.ok
+    journey.check_windows("nothing", now + timedelta(seconds=1), 3)
+    assert journey.result.checks[-1].detail == "0 windows"
+
+
+def test_the_repair_notice_is_read_as_repairs_shows_it(tmp_path: Path) -> None:
+    client = _Client()
+    journey = _journey(tmp_path, client)
+    assert journey.notice("E1") is None
+    client.issues = [
+        {"domain": "other", "issue_id": "sync_failing_E1", "translation_key": "x"},
+        {
+            "domain": "meridian_energy",
+            "issue_id": "sync_failing_E2",
+            "translation_key": "sync_failing",
+            "translation_placeholders": {"reason": "Another entry"},
+        },
+        {
+            "domain": "meridian_energy",
+            "issue_id": "sync_failing_E1",
+            "translation_key": "sync_failing",
+            "translation_placeholders": {"reason": "No answer"},
+        },
+    ]
+    assert journey.notice("E1") == ("Not updating", "No answer\n\nGoes away.")
+    assert journey.notice("E1") == ("Not updating", "No answer\n\nGoes away.")
+    assert client.translated == [("meridian_energy", "issues")]
+
+
+def test_each_unit_must_have_its_history_complete(tmp_path: Path) -> None:
+    journey = _journey(tmp_path)
+    both = [
+        {"direction": "consumption", "history_complete": True},
+        {"direction": "generation", "history_complete": True},
+    ]
+    journey.check_complete({"units": both}, 2)
+    journey.check_complete({"units": both[:1]}, 2)
+    journey.check_complete(
+        {"units": [{"direction": "consumption", "history_complete": False}]}, 1
+    )
+    journey.check_complete({}, 1)
+    checks = journey.result.checks
+    assert [check.ok for check in checks] == [True, False, False, False]
+    assert checks[0].name == "each unit's history is complete, 2 in all"
+    assert checks[0].detail == "consumption: True, generation: True"
+    assert checks[-1].detail == "no units"
+
+
+def test_an_update_waits_out_the_last_ones_cooldown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    slept: list[float] = []
+    monkeypatch.setattr("scripts.journeys.time.sleep", slept.append)
+    path = "/api/services/homeassistant/update_entity"
+    client = _Client({path: []})
+    client.registry = [
+        {"entity_id": "sensor.b", "config_entry_id": "E1"},
+        {"entity_id": "sensor.a", "config_entry_id": "E1"},
+        {"entity_id": "sensor.c", "config_entry_id": "E1", "disabled_by": "user"},
+        {"entity_id": "sensor.0", "config_entry_id": "E2"},
+    ]
+    journey = _journey(tmp_path, client)
+    journey.update("E1")
+    assert slept == []
+    assert client.sent == [f"POST {path}"]
+    assert client.data == [{"entity_id": "sensor.a"}]
+    # Asked again at once: Home Assistant would run it only after 10 s.
+    journey.update("E1")
+    assert slept == [pytest.approx(journeys.UPDATE_COOLDOWN_S, abs=1)]
+    client.answers[path] = JourneyError("refused")
+    ended = journey.updated_at
+    with pytest.raises(JourneyError):
+        journey.update("E1")
+    assert journey.updated_at > ended
+
+
+def test_a_failed_first_sync_shows_in_the_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(journeys, "POLL_S", 0.01)
+    monkeypatch.setattr(journeys, "SYNC_TIMEOUT_S", 0.05)
+    entries = "/api/config/config_entries/entry?domain=meridian_energy"
+    diagnostics = "/api/diagnostics/config_entry/E1"
+    client = _Client(
+        {
+            entries: [{"entry_id": "E1", "state": "setup_in_progress"}],
+            diagnostics: {"data": {"coordinator": {"last_failure": None}}},
+        }
+    )
+    journey = _journey(tmp_path, client)
+    with pytest.raises(JourneyError, match="first sync to fail"):
+        journey.wait_failed("E1")
+    client.answers[entries] = [{"entry_id": "E1", "state": "loaded"}]
+    with pytest.raises(JourneyError, match="first sync to fail"):
+        journey.wait_failed("E1")
+    failure = {"key": "cannot_connect", "cause": "MeridianHttpError"}
+    client.answers[diagnostics] = {"data": {"coordinator": {"last_failure": failure}}}
+    assert journey.wait_failed("E1")["last_failure"] == failure
+
+
+def test_statistics_are_read_once_the_recorder_has_saved_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(journeys, "POLL_S", 0.01)
+    start = _FIRST.timestamp() * 1000
+    hour = {"start": start, "state": 0.5, "sum": 0.5}
+    later = {"start": start + 3_600_000, "state": 0.25, "sum": 0.75}
+    client = _Client()
+    # Writes still queued, then a read that changes under it, then two agree.
+    client.backlogs = [2, 0]
+    client.periods = [
+        {"meridian_energy:a": [hour]},
+        {"meridian_energy:a": [hour, later]},
+        {"meridian_energy:a": [hour, later]},
+    ]
+    journey = _journey(tmp_path, client)
+    rows = journey.statistics(["meridian_energy:b", "meridian_energy:a"])
+    assert rows == {
+        "meridian_energy:a": [
+            Row(_FIRST, 0.5, 0.5),
+            Row(_FIRST + HOUR, 0.25, 0.75),
+        ],
+        "meridian_energy:b": [],
+    }
+    assert client.periods == [{"meridian_energy:a": [hour, later]}]
+
+
+def _log_line(level: str, name: str, message: str, offset: str = "") -> str:
+    """Return a line as Home Assistant writes it to its log."""
+    return f"2026-11-08 12:00:00.123{offset} {level} (MainThread) [{name}] {message}\n"
+
+
+_OWN = "custom_components.meridian_energy"
+
+
+def test_the_integrations_own_lines_are_read_from_the_mark(tmp_path: Path) -> None:
+    journey = _journey(tmp_path, _Client(state=tmp_path))
+    log = tmp_path / "config" / journeys.LOG_FILE
+    assert journey.log_mark() == LogMark(0, 0)
+    assert journey.own_log(LogMark(0, 0)) == []
+    log.parent.mkdir()
+    log.write_text(_log_line("WARNING", f"{_OWN}.coordinator", "before the mark"))
+    mark = journey.log_mark()
+    assert mark.size == log.stat().st_size
+    with log.open("a") as out:
+        out.write(_log_line("DEBUG", f"{_OWN}.transport", "a request", "+13:00"))
+        out.write(_log_line("WARNING", "homeassistant.helpers.entity", "not its own"))
+        out.write(_log_line("ERROR", f"{_OWN}_other", "another integration's"))
+        out.write("Traceback (most recent call last):\n")
+        out.write(_log_line("ERROR", _OWN, "its own"))
+    assert journey.own_log(mark) == [("DEBUG", "a request"), ("ERROR", "its own")]
+
+
+def test_a_restart_moves_the_marked_log_aside(tmp_path: Path) -> None:
+    journey = _journey(tmp_path, _Client(state=tmp_path))
+    log = tmp_path / "config" / journeys.LOG_FILE
+    moved = log.with_name(f"{journeys.LOG_FILE}.1")
+    log.parent.mkdir()
+    log.write_text(_log_line("INFO", _OWN, "before the mark"))
+    mark = journey.log_mark()
+    with log.open("a") as out:
+        out.write(_log_line("INFO", _OWN, "while stopping"))
+    # Held open, so that no new file can take the marked one's inode.
+    with log.open("rb"):
+        log.replace(moved)
+        log.write_text(_log_line("INFO", _OWN, "after the start"))
+        assert journey.own_log(mark) == [
+            ("INFO", "while stopping"),
+            ("INFO", "after the start"),
+        ]
+        # A second start: the marked log is gone, and the new one is read whole.
+        log.replace(moved)
+        log.write_text(_log_line("INFO", _OWN, "after another start"))
+        assert journey.own_log(mark) == [("INFO", "after another start")]
+
+
+def test_the_lines_above_debug_must_be_those_expected(tmp_path: Path) -> None:
+    journey = _journey(tmp_path, _Client(state=tmp_path))
+    log = tmp_path / "config" / journeys.LOG_FILE
+    mark = journey.log_mark()
+    journey.check_log("unread", mark)
+    log.parent.mkdir()
+    with log.open("a") as out:
+        out.write(_log_line("DEBUG", _OWN, "a request"))
+        out.write(_log_line("ERROR", f"{_OWN}.coordinator", "Error fetching"))
+        out.write(_log_line("INFO", f"{_OWN}.coordinator", "recovered"))
+    lines = [("ERROR", "Error fetching"), ("INFO", "recovered")]
+    journey.check_log("the outage", mark, lines)
+    journey.check_log("the outage", mark, lines[::-1])
+    journey.check_log("the outage", mark)
+    quiet = journey.log_mark()
+    with log.open("a") as out:
+        out.write(_log_line("DEBUG", _OWN, "another request"))
+    journey.check_log("the restart", quiet)
+    unread, both, reordered, loud, calm = journey.result.checks
+    assert not unread.ok
+    assert unread.detail == "no line from it in home-assistant.log"
+    assert both.ok
+    assert both.name == (
+        'the outage: the integration logged only ERROR "Error fetching"; '
+        'INFO "recovered"'
+    )
+    assert not reordered.ok
+    assert not loud.ok
+    assert loud.name == "the outage: the integration logged nothing above debug level"
+    assert loud.detail == 'ERROR "Error fetching"; INFO "recovered"'
+    assert calm.ok
+    assert calm.detail == "nothing above debug level"
 
 
 def test_refused_requests_and_fake_errors_fail_the_check(tmp_path: Path) -> None:

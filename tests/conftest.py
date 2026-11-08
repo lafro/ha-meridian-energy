@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Generator
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import AsyncMock, PropertyMock, patch
 
 import pytest
@@ -12,7 +14,6 @@ from pytest_homeassistant_custom_component.syrupy import (
 from syrupy.assertion import SnapshotAssertion
 
 from custom_components.meridian_energy import coordinator as coordinator_module
-from custom_components.meridian_energy import lanes as lanes_module
 
 # ha_deprecations fails the run on any deprecation Home Assistant reports for
 # this integration; see that module.
@@ -25,63 +26,35 @@ def auto_enable_custom_integrations(enable_custom_integrations: None) -> None:
 
 
 @pytest.fixture(autouse=True)
-def recorder_wait_without_recorder(request: pytest.FixtureRequest) -> Generator[None]:
+def recorder_stand_in(request: pytest.FixtureRequest) -> Generator[SimpleNamespace]:
     """
-    Stand in for the first sync's recorder wait where no recorder runs.
+    Stand in for the statistics reads and writes where no recorder runs.
 
-    An entry's first sync waits for the recorder before it reads statistics,
-    and a direction with statistics reads its stored hours.
-    Tests that use ``recorder_mock`` run that wait for real; the others
-    patch the statistics they read, and have no recorder to wait for. The
-    module is patched as imported here: patched by name, it could not be
-    found in a run of test files that never import it themselves. Nor do
-    the others fill in older history after their walks (the lanes'
-    coverage): it compares what Meridian returns with the stored rows, and
-    the few stored hours such a test gives its walks are no history to
-    complete.
+    Tests that use ``recorder_mock`` read and write for real. For the
+    others, no hour is stored and every write is queued: ``stored`` and
+    ``write`` are the mocks, so a test can give stored hours or check what
+    was written.
     """
     if "recorder_mock" in request.fixturenames:
-        yield
+        yield SimpleNamespace(stored=None, write=None)
         return
+
+    async def no_hours(
+        _hass: Any, statistic_ids: set[str], *_span: Any
+    ) -> dict[str, frozenset[Any]]:
+        return {statistic_id: frozenset() for statistic_id in statistic_ids}
+
     with (
         patch.object(
             coordinator_module,
-            "async_wait_for_recorder",
-            new=AsyncMock(return_value=True),
-        ),
-        # The stored hours a direction with statistics reads once per sync.
+            "async_stored_hours",
+            new=AsyncMock(side_effect=no_hours),
+        ) as stored,
         patch.object(
-            coordinator_module, "async_stored_hours", new=AsyncMock(return_value={})
-        ),
-        patch.object(
-            coordinator_module.MeridianDataCoordinator,
-            "_async_cover_lanes",
-            new=AsyncMock(),
-        ),
+            coordinator_module, "async_write_hours", new=AsyncMock(return_value=True)
+        ) as write,
     ):
-        yield
-
-
-@pytest.fixture(autouse=True)
-def no_revision_pass(request: pytest.FixtureRequest) -> Generator[None]:
-    """
-    Keep each lane's monthly revision pass out of tests not about it.
-
-    A lane starts that pass on one day of the month, spread by its key, so
-    a test whose dates fall on that day for its synthetic account would see
-    its requests too. A test that asks for the ``revision_pass`` fixture
-    keeps the real day.
-    """
-    if "revision_pass" in request.fixturenames:
-        yield
-        return
-    with patch.object(lanes_module, "revision_day", return_value=0):
-        yield
-
-
-@pytest.fixture
-def revision_pass() -> None:
-    """Let lanes start their monthly revision pass on their own day."""
+        yield SimpleNamespace(stored=stored, write=write)
 
 
 @pytest.fixture(autouse=True)
@@ -89,9 +62,8 @@ def waits() -> Generator[AsyncMock]:
     """
     Make the coordinator's waits between requests return at once.
 
-    Requests are paced at least 1 s apart, a resend waits 2-5 s and a gateway
-    timeout's cooldown 75 s. The returned mock records each wait asked for,
-    so a test can check them.
+    Requests are paced at least 1 s apart and a resend waits 2-5 s. The
+    returned mock records each wait asked for, so a test can check them.
     """
     with patch.object(coordinator_module, "_async_wait", new=AsyncMock()) as wait:
         yield wait

@@ -41,7 +41,7 @@ uv run python scripts/live_ha.py stop                  # remove it all
 The journeys run the integration end to end in a real Home Assistant against a stand-in Meridian, with no real sign-in:
 
 ```bash
-uv run python scripts/journeys.py                      # the working tree, all four
+uv run python scripts/journeys.py                      # the working tree, all five
 uv run python scripts/journeys.py --ref v0.3.0b2       # or a release tag or commit
 uv run python scripts/journeys.py --only reauth restart  # some of them
 uv run python scripts/journeys.py --clean-up           # delete a left-over instance
@@ -51,12 +51,13 @@ It builds a disposable Home Assistant as the live test does (the newest release,
 
 | Journey | What it does |
 | --- | --- |
-| `first_setup` | Meridian's history times out; email and code create the entry within seconds all the same; the first sync fails, and once Meridian answers an update imports the 90 days |
+| `first_setup` | A property with a feed-in register; email and code create the entry within seconds; the first sync asks for 13 windows of each direction, back to midnight 90 dates ago, and completes both histories |
+| `outage` | Meridian answers 504 from the start; the entry is created all the same, its sensors unavailable; a repair notice after 3 failed updates; once Meridian answers, one update imports the 90 days and the notice goes |
 | `two_accounts` | A login with two accounts: no choice, both are followed |
 | `reauth` | Meridian ends the sign-in; the next update asks to reconnect; email code; history unbroken |
-| `restart` | Reload the entry and restart Home Assistant; each update asks again for the last 14 days at least; history unbroken |
+| `restart` | Reload the entry and restart Home Assistant; each update asks again for the last 21 dates and nothing older; history unbroken |
 
-Every journey also checks that its entry is loaded and its sensors have states; that each statistic has every hour, none zero, each the value the stand-in sent and each sum step equal to its hour; that every screen it met has its words (no raw keys); and that the stand-in refused nothing; the run checks that once more after Home Assistant has stopped. The run prints PASS or FAIL for each check and journey, writes a report with every check and every screen as the dialog shows it to the system's temporary directory, deletes the instance whatever happens, and exits non-zero if anything failed. It takes several minutes.
+Every journey also checks that its entry is loaded and its sensors have states; that each statistic has every hour, none zero, each the value the stand-in sent and each sum step equal to its hour; that every screen it met has its words (no raw keys); that the integration logged exactly the lines above debug level the journey expects; and that the stand-in refused nothing; the run checks that once more after Home Assistant has stopped. The run prints PASS or FAIL for each check and journey, writes a report with every check and every screen as the dialog shows it to the system's temporary directory, deletes the instance whatever happens, and exits non-zero if anything failed. It takes several minutes.
 
 Run the journeys before every beta and stable release, and in every pull request that changes sign-in, setup or the import; say in the pull request that they passed. They are not part of CI.
 

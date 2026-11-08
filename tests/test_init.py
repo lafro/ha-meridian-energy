@@ -25,6 +25,7 @@ from homeassistant.exceptions import (
     ConfigEntryError,
 )
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import issue_registry as ir
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
     snapshot_platform,
@@ -38,7 +39,6 @@ from custom_components.meridian_energy import (
     MeridianRuntimeData,
     async_migrate_entry,
     async_remove_config_entry_device,
-    async_remove_entry,
     async_setup_entry,
     async_unload_entry,
 )
@@ -53,8 +53,6 @@ from custom_components.meridian_energy.const import (
     CONF_REFRESH_TOKEN,
     CONFIG_ENTRY_VERSION,
     DOMAIN,
-    UNCONFIRMED_REPLAYS,
-    UNSAVED_COVERAGE,
 )
 from custom_components.meridian_energy.models import (
     AccountSyncResult,
@@ -65,9 +63,8 @@ from custom_components.meridian_energy.models import (
     MeridianSyncData,
     MeridianTokenSet,
     PropertySyncResult,
-    SyncMode,
 )
-from custom_components.meridian_energy.statistics import _energy_metadata, account_key
+from custom_components.meridian_energy.statistics import account_key, energy_metadata
 
 
 def _entry(
@@ -119,22 +116,11 @@ def _sync_data(*, feed_in: bool = False) -> MeridianSyncData:
             PropertySyncResult(
                 property_key="safe-property-key",
                 account_key=key,
-                consumption_rows=24,
-                generation_rows=0,
                 latest_reading=now,
                 estimated_rows=0,
-                sync_mode=SyncMode.TIP,
-                requested_since=now - timedelta(hours=24),
-                consumption_pages=1,
-                generation_pages=0,
-                consumption_received_rows=24,
-                generation_received_rows=0,
-                consumption_retained_rows=24,
-                generation_retained_rows=0,
                 oldest_estimated=None,
                 newest_estimated=None,
                 quality_counts=(("ACTUAL", 24),),
-                observed_rows_per_hour=1.0,
             ),
         ),
         account_results=(
@@ -153,9 +139,6 @@ def _sync_data(*, feed_in: bool = False) -> MeridianSyncData:
             ),
         ),
         synced_at=now,
-        sync_mode=SyncMode.TIP,
-        topology_refreshed=True,
-        topology_cache_age_seconds=0,
     )
 
 
@@ -326,33 +309,27 @@ async def test_unload_entry(hass) -> None:
 
 
 @pytest.mark.asyncio
-async def test_removing_an_entry_forgets_its_unconfirmed_replays(hass) -> None:
-    """
-    The oldest hours an entry kept for its next walks go with the entry.
-
-    They are kept across its reloads (``UNCONFIRMED_REPLAYS``), as are the
-    dates its coverage imports left unconfirmed (``UNSAVED_COVERAGE``);
-    another entry's stay, and a second removal finds nothing to forget.
-    """
+async def test_removing_an_entry_removes_its_repair_notice(hass) -> None:
+    """The notice that updates are failing goes with its entry; another's stays."""
     entry = _entry()
     other = _entry()
     for item in (entry, other):
         item.add_to_hass(hass)
-    hour = datetime(2026, 7, 1, tzinfo=UTC)
-    replays = hass.data.setdefault(DOMAIN, {}).setdefault(UNCONFIRMED_REPLAYS, {})
-    replays[entry.entry_id] = {("synthetic-key", "CONSUMPTION"): hour}
-    replays[other.entry_id] = {("synthetic-key-2", "CONSUMPTION"): hour}
-    unsaved = hass.data[DOMAIN].setdefault(UNSAVED_COVERAGE, {})
-    unsaved[entry.entry_id] = {("synthetic-key", "CONSUMPTION"): {hour.date(): hour}}
-    unsaved[other.entry_id] = {}
+        ir.async_create_issue(
+            hass,
+            DOMAIN,
+            f"sync_failing_{item.entry_id}",
+            is_fixable=False,
+            severity=ir.IssueSeverity.WARNING,
+            translation_key="sync_failing",
+            translation_placeholders={"reason": "Synthetic"},
+        )
+    registry = ir.async_get(hass)
 
     await hass.config_entries.async_remove(entry.entry_id)
 
-    assert replays == {other.entry_id: {("synthetic-key-2", "CONSUMPTION"): hour}}
-    assert unsaved == {other.entry_id: {}}
-    await async_remove_entry(hass, entry)
-    assert list(replays) == [other.entry_id]
-    assert list(unsaved) == [other.entry_id]
+    assert registry.async_get_issue(DOMAIN, f"sync_failing_{entry.entry_id}") is None
+    assert registry.async_get_issue(DOMAIN, f"sync_failing_{other.entry_id}")
 
 
 # What an entry before version 4 held: the accounts it was set up to import.
@@ -468,7 +445,7 @@ class TestPublicConfigEntryLifecycle:
         stat_id = "meridian_energy:consumption_migration_gate"
         ha_async_add_external_statistics(
             hass,
-            _energy_metadata(stat_id, "Migration gate"),
+            energy_metadata(stat_id, "Migration gate"),
             [{"start": datetime(2026, 8, 1, tzinfo=UTC), "state": 3.0, "sum": 9.0}],
         )
         instance = get_instance(hass)
@@ -634,17 +611,6 @@ class TestPublicConfigEntryLifecycle:
             assert len(first_coordinator._listeners) == 0
             reloaded_coordinator = entry.runtime_data.coordinator
             assert reloaded_coordinator is not first_coordinator
-            # What a new coordinator cannot tell from the recorder is the
-            # entry's, kept across its reloads.
-            assert reloaded_coordinator._unconfirmed is first_coordinator._unconfirmed
-            assert (
-                reloaded_coordinator._unsaved_coverage
-                is first_coordinator._unsaved_coverage
-            )
-            assert (
-                reloaded_coordinator._unsaved_coverage
-                is hass.data[DOMAIN][UNSAVED_COVERAGE][entry.entry_id]
-            )
             assert len(reloaded_coordinator._listeners) == 6
             assert len(er.async_entries_for_config_entry(registry, entry.entry_id)) == 8
 

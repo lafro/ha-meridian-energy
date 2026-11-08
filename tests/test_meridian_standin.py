@@ -139,6 +139,7 @@ def test_a_scenario_round_trips_and_keeps_defaults() -> None:
         measurements_status=504,
         measurements_page="html",
         failing_directions=("GENERATION",),
+        retry_after=120,
         session_ended=True,
     )
     assert Scenario.from_json(json.loads(json.dumps(scenario.to_json()))) == scenario
@@ -248,6 +249,25 @@ async def test_measurements_fail_as_the_scenario_says(
     _scenario(folder, Scenario())
     assert (await _post(MEASUREMENTS_URL, json=generation))[0] == 200
     assert [record["status"] for record in _journal(folder)] == [200, 503, 504, 200]
+
+
+@pytest.mark.parametrize("page", ["json", "html"])
+async def test_a_rate_limit_carries_its_wait(
+    standin: StandIn, folder: Path, page: str
+) -> None:
+    del standin
+    _scenario(
+        folder,
+        Scenario(measurements_status=429, measurements_page=page, retry_after=120),
+    )
+    async with (
+        aiohttp.ClientSession() as session,
+        session.post(
+            MEASUREMENTS_URL, json=_graphql(MEASUREMENTS_NAME, _window("A-TEST-1"))
+        ) as response,
+    ):
+        assert response.status == 429
+        assert response.headers["Retry-After"] == "120"
 
 
 async def test_an_ended_session_refuses_queries_and_the_refresh(

@@ -12,18 +12,15 @@ may carry a value from a request or an answer.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 from collections.abc import Iterator
-from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import patch
 
 import pytest
-from aiohttp import ClientPayloadError, SocketTimeoutError
 from homeassistant.config_entries import SOURCE_USER
 from homeassistant.const import CONF_EMAIL
 from homeassistant.core import HomeAssistant
@@ -33,11 +30,9 @@ from homeassistant.helpers.update_coordinator import UpdateFailed
 import custom_components.meridian_energy as integration_module
 from custom_components.meridian_energy import config_flow as config_flow_module
 from custom_components.meridian_energy import coordinator as coordinator_module
-from custom_components.meridian_energy import transport as transport_module
 from custom_components.meridian_energy.api import exception_chain
 from custom_components.meridian_energy.const import DOMAIN, FIREBASE_API_KEY
 
-from .kraken_fake import cursor
 from .meridian_http import (
     ACCOUNT_NUMBER,
     CUSTOM_TOKEN,
@@ -47,10 +42,6 @@ from .meridian_http import (
     REFRESH_TOKEN,
     FakeMeridianSession,
     Response,
-    StalledConnection,
-    account_data,
-    json_response,
-    stalled_session,
 )
 
 _NOW = datetime(2026, 7, 16, 12, 30, tzinfo=UTC)
@@ -119,96 +110,19 @@ class _Scenario:
 
     name: str
     answers: dict[str, Response] = field(default_factory=dict)
-    continuation: Response | None = None
-    # An operation whose connection is never made, through real aiohttp.
-    stalled: str | None = None
-    # "synced", "sync_failed" (the entry exists; its first sync failed), or
-    # the step of the form the flow shows.
-    outcome: str = "synced"
+    # Whether the first sync succeeds; when not, its failure's key and the
+    # root of its cause chain, through the real transport and client.
+    synced: bool = True
     error: str | None = None
-    # The root of the failed first sync's cause chain, through the real
-    # transport and client.
     root: str | None = None
-    # Text one of the integration's records must contain.
-    logged: str | None = None
-    # A warning the integration must log with its traceback attached, so
-    # the privacy checks cover the traceback too.
-    warned: str | None = None
-    # Whether the integration must log no warning or error at all.
-    quiet: bool = False
-
-
-_FIRST_PAGE = (
-    "grid import history, window 1 of 13, page 1 (account 1 of 1, property 1 of 1)"
-)
-_DISCOVERY_WARNING = (
-    "Meridian refused account discovery or returned data Home Assistant could "
-    "not use: {}"
-)
-
-
-def _graphql_error(code: str = "KT-CT-4321") -> Response:
-    return json_response(
-        {
-            "errors": [
-                {
-                    "message": "No property synthetic-property on account A-TEST-1",
-                    "extensions": {"errorCode": code},
-                }
-            ]
-        }
-    )
-
-
-def _malformed_page() -> Response:
-    node = {"startAt": "2026-07-16 noon for A-TEST-1", "endAt": "x", "unit": "kWh"}
-    return json_response(
-        {
-            "data": {
-                "account": {
-                    "id": "1",
-                    "property": {
-                        "measurements": {
-                            "pageInfo": {
-                                "hasPreviousPage": True,
-                                "startCursor": cursor(0),
-                            },
-                            "edges": [{"node": node}],
-                        }
-                    },
-                }
-            }
-        }
-    )
-
-
-def _unusable_account() -> Response:
-    """
-    Return the account with all its identifiers and a date it cannot read.
-
-    The standard message for that date would quote it, with the account
-    number beside it, in the warning's traceback.
-    """
-    account = account_data()
-    register = account["properties"][0]["meterPoints"][0]["registers"][0]
-    register.update({"isFeedIn": True, "activeFrom": "2026-13-45 for A-TEST-1"})
-    return json_response({"data": {"account": account}})
-
-
-def _with_identifiers(status: int) -> Response:
-    return Response(
-        json.dumps(
-            {"message": "Account A-TEST-1 from 203.0.113.7 failed", "status": status}
-        ).encode(),
-        status=status,
-        headers={"Content-Type": "application/json", "Retry-After": "120"},
-    )
 
 
 _SCENARIOS = [
     _Scenario("success"),
+    # A gateway's error page carrying the client's address and an account
+    # number, as the first answer to every measurements request.
     _Scenario(
-        "html_504_first_page",
+        "html_504",
         answers={
             "measurements": Response(
                 _HTML_504,
@@ -216,190 +130,9 @@ _SCENARIOS = [
                 headers={"Content-Type": "text/html", "CF-RAY": "8a1b2c3d4e5f6a7b"},
             )
         },
-        outcome="sync_failed",
-        error="upstream_timeout",
+        synced=False,
+        error="cannot_connect",
         root="MeridianHttpError",
-    ),
-    _Scenario(
-        "html_504_later_page",
-        continuation=Response(
-            _HTML_504, status=504, headers={"Content-Type": "text/html"}
-        ),
-        outcome="sync_failed",
-        error="upstream_timeout",
-        root="MeridianHttpError",
-    ),
-    _Scenario(
-        "no_answer_in_time",
-        answers={"measurements": Response(b"", error=TimeoutError())},
-        outcome="sync_failed",
-        error="upstream_timeout",
-        root="TimeoutError",
-    ),
-    _Scenario(
-        "no_connection_in_time",
-        stalled="measurements",
-        outcome="sync_failed",
-        error="cannot_connect",
-        root="ConnectionTimeoutError",
-    ),
-    _Scenario(
-        "body_stalled",
-        answers={
-            "measurements": Response(
-                b"",
-                headers={"Content-Type": "application/json", "CF-RAY": "8a1b2c3d"},
-                read_error=SocketTimeoutError("Timeout on reading data from socket"),
-            )
-        },
-        outcome="sync_failed",
-        error="upstream_timeout",
-        root="SocketTimeoutError",
-        # The answer had started: its status and headers were in.
-        logged=(
-            "error=SocketTimeoutError limit=75s status=200 content=json cf_ray=yes "
-            "headers_after="
-        ),
-    ),
-    _Scenario(
-        "body_cut_off",
-        answers={
-            "measurements": Response(
-                b"",
-                read_error=ClientPayloadError(
-                    "Response payload is not completed: <ContentLengthError: 400, "
-                    "message='Not enough data to satisfy content length header.'>"
-                ),
-            )
-        },
-        outcome="sync_failed",
-        error="cannot_connect",
-        root="ClientPayloadError",
-    ),
-    _Scenario(
-        "html_504_cut_off",
-        answers={
-            "measurements": Response(
-                b"",
-                status=504,
-                headers={"Content-Type": "text/html", "CF-RAY": "8a1b2c3d"},
-                read_error=ClientPayloadError("Response payload is not completed"),
-            )
-        },
-        outcome="sync_failed",
-        error="upstream_timeout",
-        root="ClientPayloadError",
-        # The transport's line keeps the status that had arrived.
-        logged="error=ClientPayloadError status=504 ",
-    ),
-    _Scenario(
-        "service_error_stalled",
-        answers={
-            "measurements": Response(
-                b"",
-                status=503,
-                headers={"Content-Type": "text/html"},
-                read_error=SocketTimeoutError("Timeout on reading data from socket"),
-            )
-        },
-        outcome="sync_failed",
-        error="upstream_unavailable",
-        root="SocketTimeoutError",
-        logged="error=SocketTimeoutError limit=75s status=503 ",
-    ),
-    _Scenario(
-        "service_error",
-        answers={"measurements": _with_identifiers(503)},
-        outcome="sync_failed",
-        error="upstream_unavailable",
-    ),
-    _Scenario(
-        "rejected_request",
-        answers={"measurements": _with_identifiers(400)},
-        outcome="sync_failed",
-        error="cannot_connect",
-    ),
-    _Scenario(
-        "rate_limited",
-        answers={"measurements": _with_identifiers(429)},
-        outcome="sync_failed",
-        error="rate_limited",
-    ),
-    _Scenario(
-        "maintenance_page",
-        answers={
-            "measurements": Response(
-                b"<html>Down for maintenance, A-TEST-1, 203.0.113.7</html>",
-                headers={"Content-Type": "text/html"},
-            )
-        },
-        outcome="sync_failed",
-        error="cannot_connect",
-        root="JSONDecodeError",
-    ),
-    _Scenario(
-        "graphql_error",
-        # A query over Kraken's limits, which fails the first sync.
-        answers={"measurements": _graphql_error("KT-CT-1188")},
-        outcome="sync_failed",
-        error="invalid_data",
-    ),
-    _Scenario(
-        # Every window refused before any reading, as for a supply to come:
-        # the first sync completes with no history, and says so with the
-        # code alone.
-        "supply_not_started",
-        answers={"measurements": _graphql_error()},
-        logged=(
-            "Meridian rejected a window before returning any reading (KT-CT-4321); "
-            "this is taken as no usage history yet (direction=CONSUMPTION)"
-        ),
-    ),
-    _Scenario(
-        "malformed_history",
-        answers={"measurements": _malformed_page()},
-        outcome="sync_failed",
-        error="invalid_data",
-    ),
-    _Scenario(
-        "discovery_gateway_error",
-        answers={
-            "accountsList": Response(
-                _HTML_504, status=504, headers={"Content-Type": "text/html"}
-            )
-        },
-        outcome="discovery_retry",
-        error="cannot_connect",
-    ),
-    _Scenario(
-        "discovery_graphql_error",
-        answers={"accountsList": _graphql_error()},
-        outcome="discovery_retry",
-        error="invalid_data",
-        warned=_DISCOVERY_WARNING.format(
-            "Meridian GraphQL operation accountsList failed (KT-CT-4321)"
-        ),
-    ),
-    _Scenario(
-        # Errors without a code, as for a failure inside Meridian's service:
-        # Meridian did not answer, which the form says, with a debug line.
-        "discovery_service_failure",
-        answers={
-            "accountsList": json_response(
-                {"errors": [{"message": "No property synthetic-property on A-TEST-1"}]}
-            )
-        },
-        outcome="discovery_retry",
-        error="cannot_connect",
-        logged="Meridian account discovery failed: error=MeridianGraphQLError status=-",
-        quiet=True,
-    ),
-    _Scenario(
-        "discovery_unusable_account",
-        answers={"account": _unusable_account()},
-        outcome="discovery_retry",
-        error="invalid_data",
-        warned=_DISCOVERY_WARNING.format("Invalid Meridian register date"),
     ),
 ]
 
@@ -446,25 +179,21 @@ def _assert_private(
         assert not runs, checked
 
 
-def _assert_logged(records: list[logging.LogRecord], scenario: _Scenario) -> None:
-    """Fail unless the records hold what the scenario says must be logged."""
-    # The transport described every answer it read.
-    assert any(
-        record.getMessage().startswith("Meridian response: operation=")
+def _assert_request_lines(records: list[logging.LogRecord]) -> None:
+    """Fail unless each measurements request logged its line, by day offsets."""
+    lines = [
+        record.getMessage()
         for record in records
-    )
-    if scenario.logged is not None:
-        assert any(scenario.logged in record.getMessage() for record in records)
-    if scenario.warned is not None:
-        (warning,) = [
-            record
-            for record in records
-            if record.levelno == logging.WARNING
-            and record.getMessage() == scenario.warned
-        ]
-        assert warning.exc_info is not None
-    if scenario.quiet:
-        assert not [record for record in records if record.levelno >= logging.WARNING]
+        if record.getMessage().startswith("Meridian request: operation=measurements")
+    ]
+    assert lines
+    for line in lines:
+        assert re.fullmatch(
+            r"Meridian request: operation=measurements grid_import window="
+            r"-?\d+\.\.-?\d+d page=\d status=(\d+|-) content=\w+ "
+            r"(bytes=\d+|error=\w+) elapsed=\d+\.\ds",
+            line,
+        ), line
 
 
 def _root_name(err: BaseException) -> str:
@@ -485,8 +214,7 @@ def _assert_failed_privately(failure: Exception | None, scenario: _Scenario) -> 
     for value in (failure.translation_placeholders or {}).values():
         for text in _PRIVATE:
             assert text not in value
-    if scenario.root is not None:
-        assert _root_name(failure) == scenario.root
+    assert _root_name(failure) == scenario.root
 
 
 async def _sign_in(hass: HomeAssistant) -> dict[str, Any]:
@@ -505,7 +233,6 @@ async def _sign_in(hass: HomeAssistant) -> dict[str, Any]:
 
 
 @pytest.mark.parametrize("scenario", _SCENARIOS, ids=lambda item: item.name)
-@pytest.mark.asyncio
 async def test_setup_and_first_sync_logs_carry_no_private_values(
     hass: HomeAssistant,
     meridian: FakeMeridianSession,
@@ -513,45 +240,21 @@ async def test_setup_and_first_sync_logs_carry_no_private_values(
     scenario: _Scenario,
 ) -> None:
     caplog.set_level(logging.DEBUG, logger=_INTEGRATION)
-    if scenario.continuation is not None:
-        # Two channels: the newest week needs a second page.
-        meridian.kraken.channels = 2
-    async with AsyncExitStack() as stack:
-        stalled = await stack.enter_async_context(stalled_session())
-        stack.enter_context(
-            patch.object(transport_module, "CONNECT_TIMEOUT_SECONDS", 0.05)
-        )
+    meridian.hook = lambda operation, _variables: scenario.answers.get(operation)
 
-        def answer(
-            operation: str, variables: dict[str, Any]
-        ) -> Response | StalledConnection | None:
-            if operation == scenario.stalled:
-                return StalledConnection(stalled)
-            if operation == "measurements" and variables.get("before"):
-                return scenario.continuation
-            return scenario.answers.get(operation)
+    result = await _sign_in(hass)
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    entry = result["result"]
+    await hass.async_block_till_done(wait_background_tasks=True)
+    coordinator = entry.runtime_data.coordinator
+    failure = coordinator.last_exception
+    assert await hass.config_entries.async_unload(entry.entry_id)
+    await hass.async_block_till_done()
 
-        meridian.hook = answer
-        result = await _sign_in(hass)
-        if scenario.outcome in {"synced", "sync_failed"}:
-            assert result["type"] is FlowResultType.CREATE_ENTRY
-            entry = result["result"]
-            await hass.async_block_till_done(wait_background_tasks=True)
-            coordinator = entry.runtime_data.coordinator
-            failure = coordinator.last_exception
-            assert await hass.config_entries.async_unload(entry.entry_id)
-            await hass.async_block_till_done()
-
-    if scenario.outcome == "synced":
-        assert coordinator.last_update_success
-    elif scenario.outcome == "sync_failed":
-        assert not coordinator.last_update_success
+    assert coordinator.last_update_success is scenario.synced
+    if not scenario.synced:
         _assert_failed_privately(failure, scenario)
-    else:
-        assert result["type"] is FlowResultType.FORM
-        assert result["step_id"] == scenario.outcome
-        assert result["errors"] == {"base": scenario.error}
-    _assert_logged(_integration_records(caplog), scenario)
+    _assert_request_lines(_integration_records(caplog))
     _assert_private(_integration_records(caplog), meridian)
 
 

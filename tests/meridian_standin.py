@@ -37,8 +37,9 @@ send). ``installed-<pid>`` marks each process the stand-in is installed in.
 The scenario is read from ``scenario.json`` in the folder on each request,
 so the runner can change it between steps without any API (``Scenario``):
 the login's accounts and which have a feed-in register, measurements that
-fail with a status (a JSON error, or an HTML page as a gateway sends), and
-a session Meridian has ended (every authenticated request refused with 401
+fail with a status (a JSON error, or an HTML page as a gateway sends, with
+a Retry-After header when asked, as for a rate limit), and a session
+Meridian has ended (every authenticated request refused with 401
 and the session refresh rejected with 400).
 
 The data is a function of the hour alone (``hour_reading``, ``hour_cost``),
@@ -135,9 +136,10 @@ class Scenario:
 
     ``measurements_status``, when set, is the status measurements requests
     for ``failing_directions`` get: with a JSON error body, or with
-    ``measurements_page`` "html", a gateway's HTML page. ``session_ended``
-    refuses every authenticated request (401) and rejects the session
-    refresh (400), as when Meridian ends the sign-in.
+    ``measurements_page`` "html", a gateway's HTML page; ``retry_after``,
+    when set, adds a Retry-After header of that many seconds, as a 429
+    carries. ``session_ended`` refuses every authenticated request (401) and
+    rejects the session refresh (400), as when Meridian ends the sign-in.
     """
 
     accounts: tuple[str, ...] = ("A-TEST-1",)
@@ -145,6 +147,7 @@ class Scenario:
     measurements_status: int | None = None
     measurements_page: str = "json"
     failing_directions: tuple[str, ...] = (CONSUMPTION, GENERATION)
+    retry_after: int | None = None
     session_ended: bool = False
 
     @classmethod
@@ -152,6 +155,7 @@ class Scenario:
         """Return the scenario a JSON object describes; missing keys keep defaults."""
         default = cls()
         status = data.get("measurements_status")
+        retry_after = data.get("retry_after")
         page = str(data.get("measurements_page", default.measurements_page))
         if page not in {"json", "html"}:
             raise ValueError("measurements_page is json or html")
@@ -166,6 +170,7 @@ class Scenario:
                 str(item)
                 for item in data.get("failing_directions", default.failing_directions)
             ),
+            retry_after=None if retry_after is None else int(retry_after),
             session_ended=bool(data.get("session_ended", default.session_ended)),
         )
 
@@ -347,17 +352,23 @@ def _graphql_answer(
         and scenario.measurements_status is not None
         and variables.get("readingDirectionType") in scenario.failing_directions
     ):
+        waited = (
+            {}
+            if scenario.retry_after is None
+            else {"Retry-After": str(scenario.retry_after)}
+        )
         if scenario.measurements_page == "html":
             page: Response = http.Response(
                 _GATEWAY_PAGE,
                 status=scenario.measurements_status,
-                headers={"Content-Type": "text/html"},
+                headers={"Content-Type": "text/html", **waited},
             )
             return page
         error: Response = http.json_response(
             {"errors": [{"message": "synthetic service error"}]},
             status=scenario.measurements_status,
         )
+        error.headers.update(waited)
         return error
     return None
 

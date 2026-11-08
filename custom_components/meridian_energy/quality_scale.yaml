@@ -76,8 +76,8 @@ rules:
     status: exempt
     comment: The entry follows every active or dormant account on its login, so there are no settings to reconfigure; a different login is a new entry.
   repair-issues:
-    status: todo
-    comment: Authentication failures use reauthentication and transient cloud failures recover through the coordinator. An import refused because older statistics have no running total it could continue (statistics_refused), which needs the user to delete those statistics, is not yet raised as a repair issue; it is reported by one log warning per statistic and in diagnostics.
+    status: done
+    comment: A repair notice says updates are failing after three failed updates in a row, or at once when the login has no account to follow, and goes away by itself at the next update that works. An ended sign-in uses reauthentication instead.
   stale-devices: done
 
   # Platinum
