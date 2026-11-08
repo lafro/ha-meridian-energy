@@ -9,10 +9,11 @@ before what was rewritten. Every value is synthetic.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections import Counter
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as day_start
@@ -197,34 +198,46 @@ async def test_a_first_write_of_90_days_is_one_call_per_statistic(
         _assert_steps(rows)
 
 
+@pytest.mark.parametrize(
+    ("values", "metadata", "statistic_id"),
+    [
+        pytest.param(_energy, _energy_meta, ENERGY_ID, id="energy"),
+        pytest.param(_cost, _cost_meta, COST_ID, id="cost"),
+    ],
+)
 async def test_an_estimate_rewritten_inside_the_span(
-    recorder_mock: Any, hass: HomeAssistant
+    recorder_mock: Any,
+    hass: HomeAssistant,
+    values: Callable[[datetime, int], dict[datetime, Decimal]],
+    metadata: Callable[[], StatisticMetaData],
+    statistic_id: str,
 ) -> None:
     """
     The span starts at the first hour that changed, and runs to the newest.
 
     The hours before it are stored as given, so they are not written again.
+    A change of one hundredth, a cent of cost, is a change.
     """
     del recorder_mock
-    readings = _energy(START, 74)
+    readings = values(START, 74)
     assert await async_write_hours(
-        hass, [(_energy_meta(), _between(readings, START, START + 72 * HOUR))]
+        hass, [(metadata(), _between(readings, START, START + 72 * HOUR))]
     )
     await async_wait_recording_done(hass)
-    before = await _stored(hass, ENERGY_ID)
+    before = await _stored(hass, statistic_id)
     changed = START + 60 * HOUR
     # Meridian's actual reading replaces its estimate; two hours are new.
-    readings[changed] += Decimal("0.5")
+    readings[changed] += Decimal("0.01")
     recent = _between(readings, START + 48 * HOUR, START + 74 * HOUR)
 
     with _spy_writes() as spy:
-        assert await async_write_hours(hass, [(_energy_meta(), recent)])
+        assert await async_write_hours(hass, [(metadata(), recent)])
     await async_wait_recording_done(hass)
 
     assert _written(spy) == {
-        ENERGY_ID: [START + HOUR * offset for offset in range(60, 74)]
+        statistic_id: [START + HOUR * offset for offset in range(60, 74)]
     }
-    rows = await _stored(hass, ENERGY_ID)
+    rows = await _stored(hass, statistic_id)
     assert rows[:60] == before[:60]
     _assert_states(rows, readings)
     _assert_steps(rows)
@@ -236,10 +249,12 @@ async def test_an_older_window_fills_in_behind_newer_rows(
     """
     Older windows rewrite every newer row, so every later sum follows on.
 
-    The 21 newest dates come first, then two older windows of 7, as the
-    fill asks for them. Each import is slow and no test wait comes between
-    the writes: only the write's own barrier lets it read the rows the one
-    before queued, and without it the newer rows would keep sums from zero.
+    The 21 newest dates come first, then two older windows, as the fill
+    asks for them. Day 68 is never given: it lies inside the later writes'
+    spans and stays a gap, with no rows. Each import is slow and no test
+    wait comes between the writes: only the write's own barrier lets it
+    read the rows the one before queued, and without it the newer rows
+    would keep sums from zero.
     """
     del recorder_mock
     energy, cost = _energy(START, 2160), _cost(START, 2160)
@@ -253,7 +268,7 @@ async def test_an_older_window_fills_in_behind_newer_rows(
         "homeassistant.components.recorder.tasks.statistics.import_statistics",
         side_effect=slow_import,
     ):
-        for first_day, days in ((69, 21), (62, 7), (55, 7)):
+        for first_day, days in ((69, 21), (62, 6), (55, 7)):
             window_start = START + DAY * first_day
             window_end = window_start + DAY * days
             assert await async_write_hours(
@@ -265,9 +280,15 @@ async def test_an_older_window_fills_in_behind_newer_rows(
             )
         await async_wait_recording_done(hass)
 
+    gap_start, gap_end = START + DAY * 68, START + DAY * 69
     for statistic_id, values in ((ENERGY_ID, energy), (COST_ID, cost)):
         rows = await _stored(hass, statistic_id)
-        _assert_states(rows, _between(values, START + DAY * 55, START + DAY * 90))
+        assert not [start for start, *_ in rows if gap_start <= start < gap_end]
+        _assert_states(
+            rows,
+            _between(values, START + DAY * 55, gap_start)
+            | _between(values, gap_end, START + DAY * 90),
+        )
         _assert_steps(rows)
         assert all(
             later_sum is not None
@@ -277,23 +298,60 @@ async def test_an_older_window_fills_in_behind_newer_rows(
         )
 
 
+@pytest.mark.parametrize(
+    "one_call", [pytest.param(False, id="two-calls"), pytest.param(True, id="one-call")]
+)
+async def test_hours_neither_given_nor_stored_stay_out(
+    recorder_mock: Any, hass: HomeAssistant, one_call: bool
+) -> None:
+    """
+    Days 7 to 9, inside the span but never given, get no rows.
+
+    Days 10 to 15 are written, then days 0 to 6 behind them; or both
+    windows come in one mapping in one call.
+    """
+    del recorder_mock
+    readings = _energy(START, 16 * 24)
+    newer = _between(readings, START + 10 * DAY, START + 16 * DAY)
+    older = _between(readings, START, START + 7 * DAY)
+
+    if one_call:
+        assert await async_write_hours(hass, [(_energy_meta(), older | newer)])
+    else:
+        assert await async_write_hours(hass, [(_energy_meta(), newer)])
+        assert await async_write_hours(hass, [(_energy_meta(), older)])
+    await async_wait_recording_done(hass)
+
+    rows = await _stored(hass, ENERGY_ID)
+    _assert_states(rows, older | newer)
+    _assert_steps(rows)
+
+
+@pytest.mark.parametrize(
+    "gap",
+    [
+        pytest.param(timedelta(days=40), id="40-days"),
+        pytest.param(timedelta(days=4 * 365), id="4-years"),
+    ],
+)
 async def test_a_re_add_continues_the_sums_of_kept_rows(
-    recorder_mock: Any, hass: HomeAssistant
+    recorder_mock: Any, hass: HomeAssistant, gap: timedelta
 ) -> None:
     """
     Kept rows more than 14 days before the span still carry its sums on.
 
     The newest kept row with a running sum is found by searching back past
-    the 14 days read, passing over a newer row without a sum. The kept rows
-    are left as they were.
+    the 14 days read, with no limit, passing over a newer row without a
+    sum. The kept rows are left as they were.
     """
     del recorder_mock
-    kept = _chained(_energy(START, 240), base=1000.0)
+    kept_start = START - gap
+    kept = _chained(_energy(kept_start, 240), base=1000.0)
     await _seed(hass, _energy_meta(), kept)
-    no_sum: StatisticData = {"start": START + 11 * DAY, "state": 2.0}
+    no_sum: StatisticData = {"start": kept_start + 11 * DAY, "state": 2.0}
     await _seed(hass, _energy_meta(), [no_sum])
     before = await _stored(hass, ENERGY_ID)
-    new = _energy(START + 40 * DAY, 72)
+    new = _energy(START, 72)
 
     assert await async_write_hours(hass, [(_energy_meta(), new)])
     await async_wait_recording_done(hass)
@@ -347,6 +405,38 @@ async def test_a_seam_inside_the_range_read_heals(
     }
     healed = await _stored(hass, ENERGY_ID)
     assert healed[:150] == before[:150]
+    _assert_states(healed, readings)
+    _assert_steps(healed)
+
+
+async def test_a_row_without_a_sum_first_in_the_rows_read_heals(
+    recorder_mock: Any, hass: HomeAssistant
+) -> None:
+    """
+    The first row read has no row before it to step from, but no sum either.
+
+    It lies exactly 14 days before the hours given, which match what is
+    stored, and starts the span all the same.
+    """
+    del recorder_mock
+    readings = _energy(START, 960)
+    rows = _chained(readings)
+    del rows[384]["sum"]
+    await _seed(hass, _energy_meta(), rows)
+
+    with _spy_writes() as spy:
+        assert await async_write_hours(
+            hass,
+            [(_energy_meta(), _between(readings, START + 30 * DAY, START + 40 * DAY))],
+        )
+    await async_wait_recording_done(hass)
+
+    assert _written(spy) == {
+        ENERGY_ID: [START + HOUR * offset for offset in range(384, 960)]
+    }
+    healed = await _stored(hass, ENERGY_ID)
+    assert healed[384][0] == START + 16 * DAY
+    assert healed[384][2] is not None
     _assert_states(healed, readings)
     _assert_steps(healed)
 
@@ -448,9 +538,10 @@ async def test_energy_and_cost_are_written_independently(
     """
     Each statistic has its own span and its own predecessor.
 
-    The energy is stored as given, so it is not written. The cost misses a
-    day Meridian did not price: the new cost follows on from the newest
-    cost row before it, and the day neither given nor stored stays out.
+    The energy is stored as given, so it is not written. The cost has no
+    rows for a day Meridian did not price, which lies before the cost's
+    span: the new cost follows on from the newest cost row before that day,
+    and the day stays without rows.
     """
     del recorder_mock
     energy, cost = _energy(START, 120), _cost(START, 120)
@@ -546,3 +637,82 @@ async def test_no_hours_given_waits_for_nothing(
 
     barrier.assert_not_called()
     spy.assert_not_called()
+
+
+async def test_a_statistic_given_twice_is_refused(
+    recorder_mock: Any, hass: HomeAssistant
+) -> None:
+    """A unit's hours come in one mapping per statistic: two are refused."""
+    del recorder_mock
+    readings = _energy(START, 48)
+
+    with (
+        _spy_writes() as spy,
+        pytest.raises(ValueError, match="Each statistic may be given once per call"),
+    ):
+        await async_write_hours(
+            hass,
+            [
+                (_energy_meta(), _between(readings, START, START + DAY)),
+                (_energy_meta(), _between(readings, START + DAY, START + 2 * DAY)),
+            ],
+        )
+    await async_wait_recording_done(hass)
+
+    spy.assert_not_called()
+    assert await _stored(hass, ENERGY_ID) == []
+
+
+async def test_energy_and_cost_are_queued_in_one_loop_iteration(
+    recorder_mock: Any, hass: HomeAssistant
+) -> None:
+    """
+    No await comes between the writes, so a cancellation can't split them.
+
+    A callback that schedules itself again counts the event loop's
+    iterations; each write notes the count when it is queued. Here the
+    recorder's executor jobs are done before they are awaited, so each is
+    made to take an iteration first, as it does in Home Assistant: a read
+    between the two writes then shows too.
+    """
+    del recorder_mock
+    loop = asyncio.get_running_loop()
+    instance = get_instance(hass)
+    real_job = instance.async_add_executor_job
+    iterations = 0
+    queued: list[tuple[str, int]] = []
+
+    def count() -> None:
+        nonlocal iterations, handle
+        iterations += 1
+        handle = loop.call_soon(count)
+
+    async def yielding_job(*args: Any) -> Any:
+        await asyncio.sleep(0)
+        return await real_job(*args)
+
+    def note(*args: Any) -> None:
+        queued.append((args[1]["statistic_id"], iterations))
+        async_add_external_statistics(*args)
+
+    handle = loop.call_soon(count)
+    try:
+        with (
+            patch.object(instance, "async_add_executor_job", yielding_job),
+            patch.object(statistics_module, "async_add_external_statistics", note),
+        ):
+            assert await async_write_hours(
+                hass,
+                [
+                    (_energy_meta(), _energy(START, 48)),
+                    (_cost_meta(), _cost(START, 48)),
+                ],
+            )
+    finally:
+        handle.cancel()
+    await async_wait_recording_done(hass)
+
+    assert [statistic_id for statistic_id, _iteration in queued] == [ENERGY_ID, COST_ID]
+    # The count ran: the barrier and the reads took iterations before.
+    assert queued[0][1] > 2
+    assert queued[0][1] == queued[1][1]

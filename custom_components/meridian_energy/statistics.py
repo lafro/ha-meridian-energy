@@ -428,8 +428,12 @@ async def async_write_hours(
 
     Each statistic comes with its hours' states, keyed by UTC hour start.
     One barrier first waits up to 30 s for the recorder's earlier work, so
-    the reads include the writes queued before; on a timeout nothing is
-    read or written, and this returns False. Then, for each statistic:
+    the reads normally include the writes queued before. On MySQL or
+    MariaDB an import that met a lock error queues itself again behind that
+    barrier and can be saved after the reads; the seam it leaves heals at
+    the next write whose read covers that hour. On a timeout nothing is
+    read or written, and this returns False. True means the rows were
+    queued, not that they were saved. Then, for each statistic:
 
     1. read its stored rows from 14 days before its earliest hour on;
     2. start the span at the earlier of its first hour not stored as given
@@ -444,8 +448,18 @@ async def async_write_hours(
     transaction) per statistic. A dropped write heals at a later one, which
     finds the stored rows differ. An "Adjust sum" in the span, or anywhere
     in the rows read (where it is a seam), is overwritten.
+
+    Each statistic is given at most once per call; a caller merges a
+    unit's hours into one mapping. Callers must not write one statistic
+    from two calls at once: each reads the stored rows before the other's
+    are saved, and the later one leaves a seam that only a later write
+    whose read covers it heals. The coordinator's refresh lock serialises
+    its writes.
     """
     given = [(metadata, hours) for metadata, hours in statistics if hours]
+    ids = [metadata["statistic_id"] for metadata, _hours in given]
+    if len(set(ids)) != len(ids):
+        raise ValueError("Each statistic may be given once per call")
     if not given:
         return True
     if not await _async_run_removal(hass, []):
