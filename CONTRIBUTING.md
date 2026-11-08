@@ -24,7 +24,7 @@ uv run python scripts/check_versions.py
 
 ## Live test
 
-To try the integration against the real Meridian, run a disposable Home Assistant:
+To try the real Meridian, run a disposable Home Assistant:
 
 ```bash
 uv run python scripts/live_ha.py start                 # the working tree
@@ -32,7 +32,7 @@ uv run python scripts/live_ha.py start --ref v0.3.0b1  # or a release tag or com
 uv run python scripts/live_ha.py stop                  # remove it all
 ```
 
-`start` builds and onboards a new Home Assistant (the newest release, or `--ha-version`) in its own temporary folder. Before it reports ready, it checks that the instance listens on 127.0.0.1 only, loads nothing that discovers or announces devices, and has the Marketplace turned off. Open the printed link and add the integration with your own MyMeridian email; it logs at debug level. Every program on that computer, its browser included (and, in principle, a web page open in it), is signed in to the instance without a password, so run `stop` as soon as you are done: it removes the entries, stops Home Assistant and deletes the folder with its database, log and stored session. Never commit anything from a live test.
+`start` builds and onboards a new Home Assistant (the newest release, or `--ha-version`) in its own temporary folder. Before reporting ready, it checks that the instance listens on 127.0.0.1 only, loads nothing that discovers or announces devices, and has the Marketplace turned off. Open the printed link and add the integration with your own MyMeridian email; it logs at debug level. Every program on that computer, its browser included (and, in principle, a web page open in it), is signed in to the instance without a password, so run `stop` as soon as you are done: it removes the entries, stops Home Assistant and deletes the folder with its database, log and stored session. Never commit anything from a live test.
 
 ## Journeys
 
@@ -50,15 +50,15 @@ A run builds its own disposable Home Assistant, as the live test does, on port 8
 | Journey | What it does |
 | --- | --- |
 | `first_setup` | A feed-in register and an account in credit: the entry at once; the first sync asks 13 windows per direction back to midnight 90 dates ago, completing both histories; every figure has a value |
-| `figures` | Billing period, day totals and prices fail at the first sync: the update works, the bill shows unknown and the log says so; reloads bring every figure |
+| `figures` | Billing period, day totals and prices fail at the first sync: the update works, the bill shows unknown and the log says so; reloads bring every figure; a restart with the prices failing leaves only them unknown |
 | `outage` | Meridian times out from the start: the entry loads, sensors unavailable; a notice after 3 failed updates; once Meridian answers, one update imports 90 dates and the notice goes |
 | `two_accounts` | Two accounts on one login, both followed |
 | `reauth` | Meridian ends the sign-in; reconnecting with a new code keeps the history unbroken |
 | `restart` | Reload, then restart: each first sync asks only for the last 21 dates; no hour changes |
 
-Every journey also checks its entry and sensors; that each statistic has every hour, none zero, with the value sent and consistent sums; that every screen has its words; that the integration's log above debug level is exactly as expected, with no warning from Home Assistant's recorder, websocket API or sensors; and that the stand-in refused nothing. The run prints PASS or FAIL for each check, writes a report to the system's temporary directory, deletes the instance and exits non-zero if anything failed.
+Every journey also checks its entry and sensors; that each statistic has every hour, none zero, with the value sent and consistent sums; that every screen has its words; that the integration's log above debug level is exactly as expected, with no warning from Home Assistant's recorder, websocket API or sensors; and that the stand-in refused nothing. The run prints PASS or FAIL for each check, writes a report, deletes the instance and exits non-zero if anything failed.
 
-Run the journeys before every beta and stable release, and in every pull request that changes sign-in, setup or the import; say in it that they passed; CI doesn't run them.
+Run the journeys before every release, betas included, and in every pull request that changes sign-in, setup or the import; say in it that they passed; CI doesn't run them.
 
 ## Pull requests
 
@@ -69,4 +69,4 @@ Run the journeys before every beta and stable release, and in every pull request
 
 Pull requests must pass the required checks, among them a secret scan and a check for private terms (skipped for forks and Dependabot, which get no repository secrets). Merges are squashed.
 
-Developer notes, release steps included, are in [`docs/`](docs/README.md).
+Developer notes and release steps are in [`docs/`](docs/README.md).
