@@ -40,7 +40,6 @@ from custom_components.meridian_energy.api import (
 from custom_components.meridian_energy.const import (
     INITIAL_BACKFILL,
     POLL_BUDGET_SECONDS,
-    SETUP_IMPORT_BUDGET_SECONDS,
     UPDATE_INTERVAL,
 )
 from custom_components.meridian_energy.coordinator import MeridianDataCoordinator
@@ -932,18 +931,17 @@ def _quarter(start: date) -> MeridianBillingPeriod:
 
 
 @pytest.mark.asyncio
-async def test_a_partial_setup_with_a_quarterly_period_completes_its_bill_totals(
+async def test_a_partial_first_import_with_a_quarterly_period_completes_its_bill_totals(
     recorder_mock, hass: HomeAssistant
 ) -> None:
     """
-    Setup keeps 7 weeks, as its 8th fails; the billing period started 95 days back.
+    The first sync keeps 7 weeks, as its 8th fails; the period started 95 days back.
 
-    Setup asks for no billing period, and the entry's first sync, which
-    learns it, asks for no older history: so the entry's first coverage
-    reaches back to the period's midnight already. The updates after it
-    fill every date from there, the failed week's a day at a time. The bill
-    totals are complete, and the lane reaches its target, only once no hour
-    from that midnight on is missing.
+    The first sync learns the billing period and asks for no older history:
+    so the entry's first coverage reaches back to the period's midnight
+    already. The updates after it fill every date from there, the failed
+    week's a day at a time. The bill totals are complete, and the lane
+    reaches its target, only once no hour from that midnight on is missing.
     """
     del recorder_mock
     number = "A-TEST-PS"
@@ -958,30 +956,16 @@ async def test_a_partial_setup_with_a_quarterly_period_completes_its_bill_totals
     client.async_get_measurements = AsyncMock(
         side_effect=service.async_get_measurements
     )
-    setup = MeridianDataCoordinator(hass, client)
-    with (
-        patch.object(coordinator_module, "_utcnow", return_value=NOW),
-        patch.object(coordinator_module.random, "uniform", return_value=3.5),
-    ):
-        data = await setup.async_fetch_and_import(
-            setup_import=True, time_budget=SETUP_IMPORT_BUDGET_SECONDS
-        )
-    await async_wait_recording_done(hass)
+    entry = MeridianDataCoordinator(hass, client)
+    data = await _sync(hass, entry, NOW)
     assert data.units_degraded == 1
-    client.async_get_billing_period.assert_not_awaited()
+    assert data.coverage_windows == 0
+    client.async_get_billing_period.assert_awaited_once()
     service.fail = {}
-    entry = MeridianDataCoordinator(
-        hass,
-        client,
-        topology=setup.accounts,
-        topology_at=NOW,
-        reconciled_at=NOW,
-        memory=setup.memory,
-    )
 
     updates: list[tuple[int, bool, bool]] = []
     at = NOW
-    for update in range(5):
+    for update in range(4):
         at = NOW + timedelta(minutes=5) + update * HOUR
         kraken.now = at
         data = await _sync(hass, entry, at)
@@ -995,7 +979,6 @@ async def test_a_partial_setup_with_a_quarterly_period_completes_its_bill_totals
         )
 
     assert updates == [
-        (0, False, False),
         (COVERAGE_WINDOWS, False, False),
         (COVERAGE_WINDOWS, False, False),
         (1, True, True),

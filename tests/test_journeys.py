@@ -346,41 +346,6 @@ def test_field_labels_come_from_the_handlers_words() -> None:
     )
 
 
-def test_preselected_reads_a_fields_default() -> None:
-    result = {
-        "data_schema": [
-            {"name": "other", "default": ["X"]},
-            {"name": "selected_accounts", "default": ["A-1"]},
-            {"name": "empty"},
-        ]
-    }
-    assert journeys.preselected(result, "selected_accounts") == ["A-1"]
-    assert journeys.preselected(result, "empty") == []
-    assert journeys.preselected(result, "missing") == []
-
-
-def test_offered_reads_a_select_fields_options() -> None:
-    result = {
-        "data_schema": [
-            {"name": "other"},
-            {
-                "name": "selected_accounts",
-                "selector": {
-                    "select": {
-                        "options": [
-                            {"value": "A-1", "label": "one"},
-                            {"value": "A-2", "label": "two"},
-                        ]
-                    }
-                },
-            },
-        ]
-    }
-    assert journeys.offered(result, "selected_accounts") == ["A-1", "A-2"]
-    assert journeys.offered(result, "missing") == []
-    assert journeys.offered({}, "selected_accounts") == []
-
-
 # --------------------------------------------------------------------- report
 
 
@@ -391,7 +356,7 @@ def test_a_journey_passes_only_with_checks_all_passed_and_no_error() -> None:
     assert result.ok
     result.checks.append(journeys.Check("b", ok=False, detail="x"))
     assert not result.ok
-    stopped = JourneyResult("retry", "Retry", [journeys.Check("a", ok=True)])
+    stopped = JourneyResult("reauth", "Reauth", [journeys.Check("a", ok=True)])
     stopped.error = "JourneyError: timed out"
     assert not stopped.ok
 
@@ -405,8 +370,8 @@ def test_the_report_lists_every_check_and_screen() -> None:
         seconds=12.4,
     )
     failed = JourneyResult(
-        "retry",
-        "Retry",
+        "reauth",
+        "Reauth",
         [journeys.Check("sums", ok=False, detail="a|b")],
         error="JourneyError: timed out",
     )
@@ -416,7 +381,7 @@ def test_the_report_lists_every_check_and_screen() -> None:
     assert "## PASS: First-time setup (`first_setup`, 12 s)" in text
     assert "| PASS | the entry is loaded | loaded |" in text
     assert "- **form `user`**: Connect" in text
-    assert "## FAIL: Retry (`retry`, 0 s)" in text
+    assert "## FAIL: Reauth (`reauth`, 0 s)" in text
     assert "Stopped: JourneyError: timed out" in text
     assert "| FAIL | sums | a/b |" in text
 
@@ -680,7 +645,10 @@ def test_the_journeys_never_take_the_live_tests_port_or_folder() -> None:
     args = journeys.parse([])
     assert args.port == journeys.DEFAULT_PORT != live_ha.DEFAULT_PORT
     assert journeys.NAME != live_ha.DEFAULT_NAME
-    assert journeys.parse(["--only", "retry", "reauth"]).only == ["retry", "reauth"]
+    assert journeys.parse(["--only", "restart", "reauth"]).only == [
+        "restart",
+        "reauth",
+    ]
     with pytest.raises(SystemExit):
         journeys.parse(["--only", "nonsense"])
 
@@ -901,7 +869,7 @@ def test_a_run_reports_and_exits_non_zero_when_a_journey_fails(
         return live_ha.Instance(tmp_path, 8125, _Process(), "2026.10.4")  # type: ignore[arg-type]
 
     def run(self: journeys.Run, name: str) -> JourneyResult:
-        result = JourneyResult(name, name, [journeys.Check("c", ok=name != "retry")])
+        result = JourneyResult(name, name, [journeys.Check("c", ok=name != "reauth")])
         self.results.append(result)
         return result
 
@@ -912,7 +880,7 @@ def test_a_run_reports_and_exits_non_zero_when_a_journey_fails(
     monkeypatch.setattr(live_ha, "config_dir", lambda _state: tmp_path / "config")
     monkeypatch.setattr(journeys.Run, "run", run)
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
-    assert journeys.main(["--only", "first_setup", "retry"]) == 1
+    assert journeys.main(["--only", "first_setup", "reauth"]) == 1
     assert launched["name"] == "journeys"
     assert launched["args"] == (None, None, 8125)
     assert json.loads(launched["site_files"]["meridian_standin/settings.json"]) == {

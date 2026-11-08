@@ -209,7 +209,7 @@ def parse_datetime(value: Any, context: str) -> datetime:
         parsed = datetime.fromisoformat(value)
     except ValueError:
         # The standard message quotes the string, or names its year and month,
-        # and a failed setup import logs the traceback: keep the value out.
+        # and a failed account discovery logs the traceback: keep the value out.
         raise ValueError(f"Invalid timestamp for {context}") from None
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         raise ValueError(f"Naive timestamp for {context}")

@@ -38,11 +38,9 @@ from custom_components.meridian_energy import statistics as statistics_module
 from custom_components.meridian_energy.const import (
     CONF_FIREBASE_USER_ID,
     CONF_REFRESH_TOKEN,
-    CONF_SELECTED_ACCOUNTS,
     DOMAIN,
     FIRST_SYNC_RETRY_SCHEDULE,
     POLL_BUDGET_SECONDS,
-    SETUP_IMPORT_BUDGET_SECONDS,
 )
 from custom_components.meridian_energy.coordinator import MeridianDataCoordinator
 from custom_components.meridian_energy.models import (
@@ -220,7 +218,7 @@ async def test_a_dropped_write_fails_its_unit_and_the_next_sync_heals_it(
     assert dropped == [energy_id]
     assert coordinator._measurement_cache == cache
     assert coordinator._frontier == frontier
-    assert coordinator.memory.unconfirmed == {}
+    assert coordinator._unconfirmed == {}
     (unit,) = coordinator.unit_diagnostics()
     assert unit["status"] == STATUS_FAILED
     assert unit["last_failure"]["reason"] == "statistics_write"
@@ -346,7 +344,7 @@ async def test_a_retried_initial_import_writes_the_cost_its_first_attempt_droppe
     saved = await _rows(hass, energy_id)
     assert saved[0][0] <= (NOW - 89 * DAY).timestamp()
     assert await _rows(hass, cost_id) == []
-    assert coordinator.memory.unconfirmed == {
+    assert coordinator._unconfirmed == {
         (key, "CONSUMPTION"): datetime.fromtimestamp(saved[0][0], UTC)
     }
 
@@ -354,24 +352,24 @@ async def test_a_retried_initial_import_writes_the_cost_its_first_attempt_droppe
 
     assert data.sync_mode is SyncMode.INITIAL
     await _assert_cost_follows_energy(hass, energy_id, cost_id, saved[0][0])
-    assert coordinator.memory.unconfirmed == {}
+    assert coordinator._unconfirmed == {}
 
 
 @pytest.mark.asyncio
-async def test_setup_hands_the_hours_it_left_half_saved_to_the_entry(
+async def test_a_first_sync_that_succeeded_heals_a_unit_from_the_same_hour(
     recorder_mock, hass: HomeAssistant
 ) -> None:
     """
-    A unit that failed in a setup that succeeded is healed from the same hour.
+    A unit that failed in a first sync that succeeded is healed from the same hour.
 
-    With two properties, setup succeeds once one of them has imported, here
-    while the recorder dropped the other's cost. The entry's coordinator
-    takes over the oldest hour that replay wrote (``SyncMemory``), so its
-    backfill of that cost, an hour after setup, reaches back to it rather
-    than to its own 90 days.
+    With two properties, the first sync succeeds once one of them has
+    imported, here while the recorder dropped the other's cost. The
+    coordinator keeps the oldest hour that replay wrote, so its backfill of
+    that cost, an hour later, reaches back to it rather than to its own 90
+    days: no hour of usage is left without its cost.
     """
     del recorder_mock
-    number = "A-TEST-SETUP-DROP"
+    number = "A-TEST-FIRST-DROP"
     other = "synthetic-property-2"
     account = MeridianAccount(
         number=number,
@@ -393,35 +391,25 @@ async def test_setup_hands_the_hours_it_left_half_saved_to_the_entry(
     client.async_get_billing_period = AsyncMock(return_value=None)
     client.async_get_measurements = AsyncMock(side_effect=kraken.async_get_measurements)
     energy_id, cost_id = consumption_ids(property_key(number, other))
-    setup = MeridianDataCoordinator(hass, client, topology=(account,))
+    coordinator = MeridianDataCoordinator(hass, client)
 
-    kraken.now = NOW
-    with (
-        patch.object(coordinator_module, "_utcnow", return_value=NOW),
-        _dropping_once(cost_id) as dropped,
-    ):
-        await setup.async_fetch_and_import(
-            setup_import=True, time_budget=SETUP_IMPORT_BUDGET_SECONDS
-        )
-    await async_wait_recording_done(hass)
+    with _dropping_once(cost_id) as dropped:
+        data = await _sync(hass, coordinator, kraken, NOW)
 
     assert dropped == [cost_id]
+    assert data.units_failed == 1
     saved = await _rows(hass, energy_id)
     assert await _rows(hass, cost_id) == []
-    entry = MeridianDataCoordinator(
-        hass,
-        client,
-        topology=(account,),
-        topology_at=NOW,
-        reconciled_at=NOW,
-        memory=setup.memory,
-    )
+    assert coordinator._unconfirmed
 
     for at in (NOW + HOUR, NOW + 2 * HOUR):
-        await _sync(hass, entry, kraken, at)
+        await _sync(hass, coordinator, kraken, at)
 
-    await _assert_cost_follows_energy(hass, energy_id, cost_id, saved[0][0])
-    assert entry.memory.unconfirmed == {}
+    # The coverage lane may have reached on back to New Zealand midnight.
+    oldest = (await _rows(hass, energy_id))[0][0]
+    assert oldest <= saved[0][0]
+    await _assert_cost_follows_energy(hass, energy_id, cost_id, oldest)
+    assert coordinator._unconfirmed == {}
 
 
 @pytest.mark.asyncio
@@ -463,7 +451,7 @@ async def test_a_long_outage_retried_writes_the_cost_its_first_attempt_dropped(
     assert {row[0] for row in costs if row[0] >= saved[0][0]} == after
     assert _bad_steps(energy) == []
     assert _bad_steps(costs) == []
-    assert coordinator.memory.unconfirmed == {}
+    assert coordinator._unconfirmed == {}
 
 
 @pytest.mark.asyncio
@@ -505,7 +493,7 @@ async def test_a_deep_replay_cancelled_while_confirming_is_written_again(
             await task
     await async_wait_recording_done(hass)
 
-    unconfirmed = coordinator.memory.unconfirmed
+    unconfirmed = coordinator._unconfirmed
     assert unconfirmed[(key, "CONSUMPTION")] <= NOW - 89 * DAY
     reloaded = MeridianDataCoordinator(
         hass, coordinator.client, unconfirmed=unconfirmed
@@ -526,8 +514,8 @@ async def test_a_reload_still_writes_the_cost_a_deep_replay_left_unsaved(
     The entry keeps a deep replay's unconfirmed hour across a reload.
 
     The entry's first sync is an initial import, whose cost the recorder
-    drops. The entry is then reloaded, as the user, a reauthentication or a
-    reconfiguration does, which builds a new coordinator: that one finds the
+    drops. The entry is then reloaded, as the user or a reauthentication
+    does, which builds a new coordinator: that one finds the
     usage saved up to now, so its first sync is a 14-day restart, and left
     the cost of the 76 days before with no row, for good. The hour is kept
     for the entry (``hass.data[DOMAIN]["unconfirmed_replays"]``), and every
@@ -548,9 +536,8 @@ async def test_a_reload_still_writes_the_cost_a_deep_replay_left_unsaved(
             "email": "person@example.com",
             CONF_REFRESH_TOKEN: "synthetic-refresh",
             CONF_FIREBASE_USER_ID: "synthetic-user",
-            CONF_SELECTED_ACCOUNTS: [number],
         },
-        version=3,
+        version=4,
         minor_version=1,
     )
     entry.add_to_hass(hass)
@@ -581,7 +568,7 @@ async def test_a_reload_still_writes_the_cost_a_deep_replay_left_unsaved(
 
     await async_wait_recording_done(hass)
     await _assert_cost_follows_energy(hass, energy_id, cost_id, saved[0][0])
-    assert reloaded.memory.unconfirmed == {}
+    assert reloaded._unconfirmed == {}
 
 
 @pytest.mark.parametrize(
@@ -662,7 +649,7 @@ async def test_a_refused_replay_fails_as_refused_and_is_not_retried_soon(
         if record.levelno == logging.WARNING
         and record.name.startswith("custom_components.meridian_energy")
     ] == [statistics_module.__name__, coordinator_module.__name__]
-    assert coordinator.memory.unconfirmed == {}
+    assert coordinator._unconfirmed == {}
     (unit,) = coordinator.unit_diagnostics()
     assert unit["status"] == STATUS_FAILED
     assert unit["last_failure"]["reason"] == "statistics_refused"

@@ -874,8 +874,8 @@ async def test_a_week_refused_inside_the_history_is_imported_later(
     A week refused right after a complete week is not the start of the history.
 
     Meridian still has the refused week's newest day, so the refusal was not
-    about dates before the supply. Setup keeps the newer weeks, and the
-    updates after it fill in the rest, reconciliation and coverage, once
+    about dates before the supply. The first import keeps the newer weeks,
+    and the updates after it fill in the rest, reconciliation and coverage, once
     Meridian answers: the 90 days, every running sum consistent.
     """
     del recorder_mock
@@ -888,7 +888,7 @@ async def test_a_week_refused_inside_the_history_is_imported_later(
     energy_id, cost_id = consumption_ids(property_key(number, PROPERTY))
 
     with patch.object(coordinator_module, "_utcnow", return_value=NOW):
-        data = await coordinator.async_fetch_and_import(setup_import=True)
+        data = await coordinator.async_fetch_and_import()
     await async_wait_recording_done(hass)
 
     assert data.units_degraded == 1
@@ -914,7 +914,6 @@ async def test_a_week_refused_inside_the_history_is_imported_later(
     assert _bad_steps(await _rows(hass, cost_id)) == []
 
 
-@pytest.mark.parametrize("setup_import", [True, False], ids=["setup", "after-setup"])
 @pytest.mark.parametrize("channels", [1, 2])
 @pytest.mark.parametrize("ended", [15, 60], ids=["ended-15d", "ended-60d"])
 @pytest.mark.asyncio
@@ -923,16 +922,13 @@ async def test_a_history_that_ended_weeks_ago_stores_what_one_request_would(
     hass: HomeAssistant,
     channels: int,
     ended: int,
-    setup_import: bool,
 ) -> None:
     """
     A supply that ended weeks ago: its first import stores its 90 days in full.
 
     The newest weeks have no readings, and come before any reading, so they
     are no start of a history: the same rows, hours and running sums as one
-    request for the 90 days, imported into another statistic. So it goes at
-    setup, and for an account added after it, such as a closed one added
-    through Reconfigure, whose first import is an update's.
+    request for the 90 days, imported into another statistic.
     """
     del recorder_mock
     since = NOW - INITIAL_BACKFILL
@@ -944,7 +940,7 @@ async def test_a_history_that_ended_weeks_ago_stores_what_one_request_would(
     )
     coordinator, _client = _coordinator(hass, "windowed", kraken)
     with patch.object(coordinator_module, "_utcnow", return_value=NOW):
-        data = await coordinator.async_fetch_and_import(setup_import=setup_import)
+        data = await coordinator.async_fetch_and_import()
     unbounded = await kraken.async_get_measurements(
         account_number="A-TEST-1",
         property_id=PROPERTY,

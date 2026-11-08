@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
 AUTH_GRAPHQL_CODES = frozenset(
     {"KT-CT-1111", "KT-CT-1112", "KT-CT-1120", "KT-CT-1124", "KT-CT-1143"}
@@ -22,6 +25,18 @@ def graphql_error_code(error: dict[str, Any]) -> str:
     if not isinstance(code, str) or _ERROR_CODE_PATTERN.fullmatch(code) is None:
         return UNKNOWN_ERROR_CODE
     return code
+
+
+def is_service_failure(codes: Iterable[str]) -> bool:
+    """
+    Return whether GraphQL errors are all without a code.
+
+    Such an error, as for a failure inside Meridian's service, says nothing
+    about the request: it counts as Meridian not answering, not as a
+    refusal. An error without a code is recorded as UNKNOWN_ERROR_CODE, so
+    codes is never empty.
+    """
+    return set(codes) <= {UNKNOWN_ERROR_CODE}
 
 
 ACCOUNTS_QUERY = """

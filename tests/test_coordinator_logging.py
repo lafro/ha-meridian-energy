@@ -33,11 +33,6 @@ from custom_components.meridian_energy.models import (
     MeridianTokenSet,
     SyncMode,
 )
-from custom_components.meridian_energy.statistics import (
-    consumption_ids,
-    generation_ids,
-    property_key,
-)
 from custom_components.meridian_energy.transport import MeridianHttpError
 
 from . import meridian_http
@@ -478,8 +473,7 @@ async def test_sync_summary_counts_http_requests_and_their_median_times(
     Requests are counted as sent, not as calls the coordinator made.
 
     The account list and the account each send a request, and an expired
-    session sends a refresh first. Measurements get a median of their own,
-    which the setup time limit is tuned from.
+    session sends a refresh first. Measurements get a median of their own.
     """
     caplog.set_level(logging.DEBUG, logger="custom_components.meridian_energy")
     clock = _RequestClock()
@@ -508,23 +502,23 @@ async def test_sync_summary_counts_http_requests_and_their_median_times(
             new=AsyncMock(return_value=(24, 24)),
         ),
     ):
-        data = await coordinator.async_fetch_and_import(setup_import=True)
+        data = await coordinator.async_fetch_and_import()
 
-    # The refresh (0 s), the account list and the account (1 s each), and
-    # three windows in each direction (30 s and 50 s each): the history began
-    # 2 days ago, so the two windows before the newest are empty.
-    assert data.request_count == 9
+    # The refresh (0 s), the account list and the account (1 s each), three
+    # windows in each direction (30 s and 50 s each), and the billing period
+    # (0 s): the history began 2 days ago, so the two windows before the
+    # newest are empty.
+    assert data.request_count == 10
     assert data.direction_count == 2
     assert data.median_request_seconds == pytest.approx(30.0)
     assert data.median_measurements_seconds == pytest.approx(40.0)
-    assert coordinator.request_count == 9
-    assert coordinator.median_request_seconds == pytest.approx(30.0)
+    assert coordinator.request_count == 10
     (record,) = _records(caplog, "Meridian sync completed:")
     assert record.levelno == logging.DEBUG
     message = record.getMessage()
     assert "mode=initial " in message
     assert (
-        " directions=2 requests=9 median_request=30.0s median_measurements=40.0s "
+        " directions=2 requests=10 median_request=30.0s median_measurements=40.0s "
         "pages=6 "
     ) in message
     assert (
@@ -560,11 +554,10 @@ async def test_a_failed_sync_counts_its_failed_request(hass) -> None:
         await coordinator.async_fetch_and_import()
 
     assert coordinator.request_count == 1
-    assert coordinator.median_request_seconds == pytest.approx(2.0)
 
 
 @pytest.mark.asyncio
-async def test_a_sync_that_sent_no_request_has_no_median(hass) -> None:
+async def test_a_sync_that_sent_no_request_counts_none(hass) -> None:
     client = MagicMock()
     client.async_get_accounts = AsyncMock(side_effect=MeridianConnectionError)
     coordinator = MeridianDataCoordinator(hass, client)
@@ -573,68 +566,6 @@ async def test_a_sync_that_sent_no_request_has_no_median(hass) -> None:
         await coordinator.async_fetch_and_import()
 
     assert coordinator.request_count == 0
-    assert coordinator.median_request_seconds is None
-
-
-@pytest.mark.asyncio
-async def test_setup_import_can_leave_out_billing(hass) -> None:
-    """
-    The setup import fetches no billing metadata and computes no bill totals.
-
-    Its coordinator is discarded once the entry exists, so that work only
-    added a request and a recorder wait that could fail a finished import.
-    """
-    client = _paged_client()
-    coordinator = MeridianDataCoordinator(hass, client)
-    with (
-        patch.object(coordinator_module, "_utcnow", return_value=_NOW),
-        patch.object(
-            coordinator_module,
-            "async_latest_numeric_statistic_start",
-            new=AsyncMock(return_value=None),
-        ),
-        patch.object(
-            coordinator_module,
-            "async_replay",
-            new=AsyncMock(return_value=(24, 24)),
-        ),
-        patch.object(
-            coordinator_module, "async_account_period_totals", new=AsyncMock()
-        ) as totals,
-    ):
-        data = await coordinator.async_fetch_and_import(setup_import=True)
-
-    assert data.account_results == ()
-    client.async_get_billing_period.assert_not_awaited()
-    totals.assert_not_awaited()
-    assert coordinator.last_request is not None
-    assert coordinator.last_request.operation == "measurements"
-
-
-@pytest.mark.asyncio
-async def test_coordinator_reports_the_newest_hour_it_imported(hass) -> None:
-    """The setup checks these hours are readable before the entry exists."""
-    client = _paged_client(feed_in=True)
-    coordinator = MeridianDataCoordinator(hass, client)
-    key = property_key(_ACCOUNT, _PROPERTY)
-    importer = AsyncMock(side_effect=[(24, 24), (0, 0)])
-    with (
-        patch.object(coordinator_module, "_utcnow", return_value=_NOW),
-        patch.object(
-            coordinator_module,
-            "async_latest_numeric_statistic_start",
-            new=AsyncMock(return_value=None),
-        ),
-        patch.object(coordinator_module, "async_replay", importer),
-    ):
-        await coordinator.async_fetch_and_import(setup_import=True)
-
-    # Generation wrote nothing (its running sum had no numeric baseline), so
-    # there is nothing of it to look for.
-    assert coordinator.imported_newest == {
-        consumption_ids(key)[0]: _NOW.replace(minute=0) - timedelta(hours=1)
-    }
-    assert generation_ids(key)[0] not in coordinator.imported_newest
 
 
 @pytest.mark.asyncio
@@ -644,10 +575,11 @@ async def test_first_sync_waits_for_the_recorder_before_reading_statistics(
     """
     An entry's first sync reads no statistics until the recorder has caught up.
 
-    Rows that setup, or the entry's earlier coordinator, queued may still be
-    unsaved: read then, the sync would find no history and import over them
-    with running sums from zero. It waits in two passes, so an import the
-    recorder had to queue again behind the first is saved too.
+    Rows the entry's earlier coordinator queued, before a reload or a
+    restart, may still be unsaved: read then, the sync would find no history
+    and import over them with running sums from zero. It waits in two
+    passes, so an import the recorder had to queue again behind the first
+    is saved too.
     """
     client = _paged_client()
     client.async_get_billing_period = AsyncMock(return_value=None)
@@ -760,29 +692,3 @@ async def test_first_sync_stops_and_retries_while_the_recorder_is_behind(
     latest.assert_not_awaited()
     client.async_get_accounts.assert_not_awaited()
     client.async_get_measurements.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_setup_import_leaves_the_recorder_wait_to_the_flow(hass) -> None:
-    """The flow waits for the recorder itself just before it starts the import."""
-    client = _paged_client()
-    coordinator = MeridianDataCoordinator(hass, client)
-    with (
-        patch.object(coordinator_module, "_utcnow", return_value=_NOW),
-        patch.object(
-            coordinator_module, "async_wait_for_recorder", new=AsyncMock()
-        ) as wait,
-        patch.object(
-            coordinator_module,
-            "async_latest_numeric_statistic_start",
-            new=AsyncMock(return_value=None),
-        ),
-        patch.object(
-            coordinator_module,
-            "async_replay",
-            new=AsyncMock(return_value=(24, 24)),
-        ),
-    ):
-        await coordinator.async_fetch_and_import(setup_import=True)
-
-    wait.assert_not_awaited()

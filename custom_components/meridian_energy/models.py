@@ -6,10 +6,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
 from enum import StrEnum
-from typing import TYPE_CHECKING, Any
-
-if TYPE_CHECKING:
-    from .units import SyncMemory
+from typing import Any
 
 
 class SyncMode(StrEnum):
@@ -62,26 +59,6 @@ class MeridianAccount:
     number: str
     status: str
     properties: tuple[MeridianProperty, ...]
-
-
-@dataclass(frozen=True, slots=True)
-class SetupHandoff:
-    """
-    What a finished setup hands its new entry, in memory only.
-
-    The accounts the flow found, and when its import's sync started: the
-    entry's setup then makes no request, and its first sync continues the
-    history setup imported instead of reconciling 14 days of it again. And
-    what the import's coordinator remembers of each direction (``memory``):
-    how its sync went, and the rows it imported in the last 14 days. After
-    setup went on without history (``imported`` false), only the accounts,
-    as of ``imported_at``: the first sync imports the history as new.
-    """
-
-    accounts: tuple[MeridianAccount, ...]
-    imported_at: datetime
-    memory: SyncMemory | None = None
-    imported: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -211,7 +188,7 @@ class PropertySyncResult:
 
 @dataclass(frozen=True, slots=True)
 class AccountSyncResult:
-    """Non-sensitive billing and sync summary for one selected account."""
+    """Non-sensitive billing and sync summary for one account."""
 
     account_key: str
     billing_period: MeridianBillingPeriod | None

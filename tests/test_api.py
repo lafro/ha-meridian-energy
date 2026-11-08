@@ -279,6 +279,64 @@ async def test_validate_otp_maps_rate_limit() -> None:
     assert raised.value.retry_after == 123
 
 
+@pytest.mark.parametrize("status", [400, 404, 429, 503])
+@pytest.mark.asyncio
+async def test_validate_otp_reads_the_refused_codes_name_before_its_status(
+    status: int,
+) -> None:
+    """
+    A refused code names itself whatever the status, HTTP 429 included.
+
+    Too many tries may come with 429: read as a rate limit, the form would
+    tell the user to wait, when only a new code helps.
+    """
+    client = MeridianApiClient(MagicMock())
+    client._async_json_request = AsyncMock(
+        side_effect=_MeridianHttpError(
+            status, {"code": "OTP_TOO_MANY_ATTEMPTS"}, retry_after=60
+        )
+    )
+
+    with pytest.raises(MeridianOtpError) as raised:
+        await client.async_validate_otp("person@example.com", "123456", "journey")
+
+    assert raised.value.code == "OTP_TOO_MANY_ATTEMPTS"
+
+
+@pytest.mark.parametrize(
+    ("payload", "error_type"),
+    [
+        ({"code": "SOMETHING_ELSE"}, MeridianRateLimitError),
+        ({"code": 7}, MeridianRateLimitError),
+        ({}, MeridianRateLimitError),
+    ],
+)
+@pytest.mark.asyncio
+async def test_validate_otp_takes_a_429_without_a_code_name_as_a_rate_limit(
+    payload: dict[str, object], error_type: type[Exception]
+) -> None:
+    client = MeridianApiClient(MagicMock())
+    client._async_json_request = AsyncMock(
+        side_effect=_MeridianHttpError(429, payload, retry_after=60)
+    )
+
+    with pytest.raises(error_type):
+        await client.async_validate_otp("person@example.com", "123456", "journey")
+
+
+@pytest.mark.asyncio
+async def test_validate_otp_names_an_unknown_refusal_by_its_code() -> None:
+    client = MeridianApiClient(MagicMock())
+    client._async_json_request = AsyncMock(
+        side_effect=_MeridianHttpError(400, {"code": "SOMETHING_ELSE"})
+    )
+
+    with pytest.raises(MeridianOtpError) as raised:
+        await client.async_validate_otp("person@example.com", "123456", "journey")
+
+    assert raised.value.code == "SOMETHING_ELSE"
+
+
 @pytest.mark.parametrize(
     ("status", "error_type"),
     [

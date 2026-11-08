@@ -24,6 +24,7 @@ from custom_components.meridian_energy.const import (
     FIRST_SYNC_RETRY_SECONDS,
     MAX_WINDOW_PAGES,
     PAGE_SIZE,
+    READING_CONSUMPTION,
 )
 from custom_components.meridian_energy.coordinator import MeridianDataCoordinator
 from custom_components.meridian_energy.models import (
@@ -35,6 +36,7 @@ from custom_components.meridian_energy.models import (
     MeridianProperty,
     RequestContext,
 )
+from custom_components.meridian_energy.statistics import property_key
 
 from .kraken_fake import FakeKraken
 from .walks import fetch_since
@@ -257,15 +259,49 @@ async def test_prepare_topology_counts_its_request_from_one(hass) -> None:
 
 
 @pytest.mark.asyncio
-async def test_prepare_topology_rejects_missing_selected_accounts(hass) -> None:
+async def test_prepare_topology_retries_a_login_with_no_account(hass) -> None:
+    """No active or dormant account leaves setup to retry, and caches nothing."""
+    client = MagicMock()
+    client.async_get_accounts = AsyncMock(return_value=())
+    coordinator = MeridianDataCoordinator(hass, client)
+
+    with pytest.raises(ConfigEntryNotReady) as raised:
+        await coordinator.async_prepare_topology()
+
+    assert raised.value.translation_key == "no_accounts"
+    assert coordinator.accounts == ()
+    assert coordinator._topology_cached_at is None
+
+
+@pytest.mark.asyncio
+async def test_an_update_fails_while_a_login_has_no_account(hass) -> None:
+    """
+    An update that finds no account fails, and asks again in the next one.
+
+    The accounts it cached before stay, so the statistics it imported are
+    kept, and so is what it remembers of them.
+    """
     client = MagicMock()
     client.async_get_accounts = AsyncMock(return_value=(_account(),))
+    unit = (property_key("A-SYNTHETIC", "property"), READING_CONSUMPTION)
+    replayed_from = datetime(2026, 1, 1, tzinfo=UTC)
     coordinator = MeridianDataCoordinator(
-        hass, client, selected_accounts=frozenset({"A-OTHER"})
+        hass, client, unconfirmed={unit: replayed_from}
     )
+    await coordinator.async_prepare_topology()
+    billing = MeridianBillingPeriod(None, None, False, None, None, None, None)
+    coordinator._billing_periods["A-SYNTHETIC"] = billing
+    client.async_get_accounts.return_value = ()
 
-    with pytest.raises(ConfigEntryNotReady):
-        await coordinator.async_prepare_topology()
+    coordinator._topology_cached_at = None
+
+    with pytest.raises(UpdateFailed) as raised:
+        await coordinator.async_fetch_and_import()
+
+    assert raised.value.translation_key == "no_accounts"
+    assert coordinator.accounts == (_account(),)
+    assert coordinator._unconfirmed == {unit: replayed_from}
+    assert coordinator._billing_periods == {"A-SYNTHETIC": billing}
 
 
 @pytest.mark.asyncio

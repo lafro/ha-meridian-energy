@@ -34,8 +34,6 @@ from .api import (
 )
 from .const import (
     BILLING_CACHE_INTERVAL,
-    CONF_AUTO_ADD_ACCOUNTS,
-    CONF_SELECTED_ACCOUNTS,
     COST_LAG_MARGIN,
     DEEP_WALK_BUDGET_SECONDS,
     DOMAIN,
@@ -63,7 +61,7 @@ from .const import (
     TRANSIENT_STATUSES,
     UPDATE_INTERVAL,
 )
-from .graphql import QUERY_LIMIT_CODES, UNKNOWN_ERROR_CODE
+from .graphql import QUERY_LIMIT_CODES, is_service_failure
 from .lanes import (
     COVERAGE,
     COVERAGE_PAUSE_SECONDS,
@@ -95,7 +93,6 @@ from .models import (
     WindowWalk,
 )
 from .statistics import (
-    REPLAY_ALLOWANCE_SECONDS,
     StatisticsAnchorError,
     StatisticsWriteError,
     account_key,
@@ -116,7 +113,6 @@ from .units import (
     STATUS_DEGRADED,
     STATUS_FAILED,
     STATUS_OK,
-    SyncMemory,
     UnitFailure,
     UnitState,
     larger_mode,
@@ -186,11 +182,10 @@ def _upstream_key(err: MeridianUpstreamError) -> str:
 
 
 # What a failed measurements request leads to: one resend after a short
-# pause; after a gateway timeout, the window's newest day alone once the
-# cooldown has passed; after a query over Kraken's limits, the window's days
-# one at a time; or the end of the direction's walk.
+# pause; after a query over Kraken's limits, the window's days one at a
+# time; or the end of the direction's walk, which after a gateway timeout
+# leaves the window's newest day alone to the next update (``_defer_ladder``).
 _RESEND = "retry"
-_PROBE = "probe_1d"
 _SPLIT = "split_1d"
 _STOP = "stop"
 # The failure keys a unit waiting after a failure reports in polling, with
@@ -268,30 +263,6 @@ def _failure_reason(err: BaseException) -> str:
 async def _async_wait(seconds: float) -> None:
     """Wait before a request: pacing, a cooldown or a resend's pause."""
     await asyncio.sleep(seconds)
-
-
-class _Progress:
-    """
-    How many of a sync's planned windows are done, reported as a fraction.
-
-    A window counts once it has been fetched, and so do the windows a walk
-    no longer needs when it stops early, at the start of the history say.
-    """
-
-    def __init__(self, report: Callable[[float], None]) -> None:
-        self._report = report
-        self.planned = 0
-        self.done = 0.0
-
-    def add(self, windows: float) -> None:
-        """
-        Count windows as done, and report the fraction done.
-
-        A window fetched day by day counts a share of one for each day.
-        """
-        if windows:
-            self.done += windows
-            self._report(min(1.0, self.done / max(1, self.planned)))
 
 
 class _PageLog:
@@ -450,6 +421,10 @@ class _RecorderBehindError(Exception):
     """The recorder had not saved the work queued before a first sync."""
 
 
+class _NoAccountsError(Exception):
+    """Meridian listed no active or dormant account for the login."""
+
+
 class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
     """Fetch Meridian data and import it into the recorder."""
 
@@ -473,31 +448,16 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         client: MeridianApiClient,
         *,
         config_entry: ConfigEntry | None = None,
-        selected_accounts: frozenset[str] | None = None,
-        auto_add_accounts: bool = False,
-        topology: tuple[MeridianAccount, ...] | None = None,
-        topology_at: datetime | None = None,
-        reconciled_at: datetime | None = None,
-        memory: SyncMemory | None = None,
         unconfirmed: dict[CacheKey, datetime] | None = None,
         unsaved: dict[CacheKey, dict[date, datetime]] | None = None,
     ) -> None:
         """
-        Create a coordinator, optionally with what setup already knows.
+        Create a coordinator for every active or dormant account of a login.
 
-        ``topology`` is the accounts the setup flow found, cached as of
-        ``topology_at`` (now by default), so neither the setup import nor the
-        entry's setup asks Meridian for them again. ``reconciled_at`` is when
-        the setup import's sync started: the entry's first sync then counts
-        it as the last reconciliation, and continues directions with
-        statistics in the mode the cadence asks for, the hourly update at
-        first, instead of a 14-day restart or a new 90-day import.
-        ``memory`` is what the setup import's coordinator remembered of each
-        direction (``SyncMemory``). ``unconfirmed`` is where the coordinator
-        keeps the oldest hour of each unit's deep replay that was not
-        confirmed (``_note_unconfirmed``), updated in place: its owner keeps
-        it across coordinators, the setup flow across its attempts and an
-        entry across its reloads, as a new coordinator cannot tell those
+        ``unconfirmed`` is where the coordinator keeps the oldest hour of
+        each unit's deep replay that was not confirmed
+        (``_note_unconfirmed``), updated in place: its owner, an entry,
+        keeps it across its reloads, as a new coordinator cannot tell those
         hours from the recorder. ``unsaved`` is where it keeps, likewise, the
         dates of each lane whose coverage import was not confirmed, with
         when each is tried again (``lanes.LaneState.unsaved``): an entry
@@ -512,16 +472,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         )
         self.client = client
         self._config_entry = config_entry
-        self._selected_accounts = selected_accounts
-        self._auto_add_accounts = auto_add_accounts
-        self._topology: tuple[MeridianAccount, ...] | None = topology
-        self._topology_cached_at: datetime | None = (
-            None if topology is None else topology_at or _utcnow()
-        )
-        # A topology handed over by setup is filtered and pruned when first
-        # read, as a fetched one is.
-        self._topology_seeded = topology is not None
-        self._reconciled_at = reconciled_at
+        self._topology: tuple[MeridianAccount, ...] | None = None
+        self._topology_cached_at: datetime | None = None
         self._billing_periods: dict[str, MeridianBillingPeriod] = {}
         self._billing_cached_at: dict[str, datetime] = {}
         self._billing_unavailable: set[str] = set()
@@ -540,9 +492,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         self._active_directions: set[CacheKey] = set()
         self._seen_directions: set[CacheKey] = set()
         self._initial_refresh_complete = False
-        self._last_targeted_reconciliation = self._last_full_reconciliation = (
-            reconciled_at
-        )
+        self._last_targeted_reconciliation: datetime | None = None
+        self._last_full_reconciliation: datetime | None = None
         # The newest stored hour of each energy and cost statistic: read from
         # the recorder once, then moved on by each import.
         self._frontier: dict[str, datetime] = {}
@@ -553,29 +504,23 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         # What each unit's history covers, and the work that completes it,
         # beyond what the recorder holds (``lanes.LaneState``).
         self._lanes: dict[CacheKey, LaneState] = {}
-        self._restore(memory)
         self._topology_fresh = False
         self._first_sync_failures = self._rate_limits = 0
         self._coverage_rate_limit = self._coverage_not_before = None
         self.last_request: RequestContext | None = None
         self._requests = RequestTally()
-        self._imported_newest: dict[str, datetime] = {}
         # Causes of an INFO line already logged by this coordinator: each is
         # logged once at INFO, then at DEBUG.
         self._reported: set[str] = set()
-        # The sync in progress: whether it is the setup import, when its time
-        # budget ends, how its windows went and when it may send next.
-        self._setup_import = False
+        # The sync in progress: when its time budget ends, how its windows
+        # went and when it may send next.
         # When it started, and the time its imports took, which its budget
         # does not count (``_async_uncounted``); and when it may resend.
         self._started_at = self._uncounted = self._resend_not_before = 0.0
         self._deadline: float | None = None
-        # The setup attempt's own time limit, which moves on with the budget.
-        self._time_limit: asyncio.Timeout | None = None
         # The pause between two requests of the lanes' coverage, at random
         # within these bounds, while it runs; else the usual pacing.
         self._pause: tuple[float, float] | None = None
-        self._progress: _Progress | None = None
         self._calls_started = self._measurement_requests = 0
         self._last_measurements_start = self._last_measurements_end = None
         self._cooldown_until: dict[str, float] = {}
@@ -583,28 +528,11 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         self._windows_ok = self._windows_empty = self._windows_failed = 0
         self._coverage_windows = self._revision_windows = 0
         self._history_start = False
-        # The setup import's units that started failing, warned about once
-        # the import is known to go on (``_report_failing``).
-        self._unreported: set[CacheKey] = set()
-
-    def _restore(self, memory: SyncMemory | None) -> None:
-        """Take over what another coordinator remembered of each direction."""
-        if memory is None:
-            return
-        memory = memory.copy()
-        self._unit_states.update(memory.unit_states)
-        self._measurement_cache.update(
-            (key, dict(rows)) for key, rows in memory.measurements.items()
-        )
-        self._row_density.update(memory.row_density)
-        self._backfill_attempted.update(memory.searched)
-        self._unconfirmed.update(memory.unconfirmed)
-        self._lanes.update(memory.lanes)
 
     @property
     def accounts(self) -> tuple[MeridianAccount, ...]:
-        """Return the selected, cached account topology."""
-        return self._filtered_topology()
+        """Return the cached accounts, none before they were first fetched."""
+        return self._topology or ()
 
     @property
     def request_count(self) -> int:
@@ -612,40 +540,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         return self._requests.sent
 
     @property
-    def median_request_seconds(self) -> float | None:
-        """Return the median time of that sync's requests that ended, if any."""
-        return self._requests.median_seconds()
-
-    @property
-    def imported_newest(self) -> dict[str, datetime]:
-        """
-        Return the newest hour each energy statistic was given in the last sync.
-
-        Keyed by statistic ID; only statistics that were written appear. The
-        setup flow reads these rows back before it creates the entry.
-        """
-        return dict(self._imported_newest)
-
-    @property
-    def memory(self) -> SyncMemory:
-        """
-        Return a copy of what this coordinator remembers of each direction.
-
-        The setup flow hands it to the new entry once the import succeeded:
-        no rollback has run, so it matches what is stored.
-        """
-        return SyncMemory(
-            unit_states=self._unit_states,
-            measurements=self._measurement_cache,
-            row_density=self._row_density,
-            searched=frozenset(self._backfill_attempted),
-            unconfirmed=self._unconfirmed,
-            lanes=self._lanes,
-        ).copy()
-
-    @property
     def billing_metadata_unavailable_count(self) -> int:
-        """Return how many selected accounts have a failed billing refresh."""
+        """Return how many accounts have a failed billing refresh."""
         return len(self._billing_unavailable)
 
     @property
@@ -665,10 +561,10 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         direction. ``retry_in_s`` is how long a failed unit waits before it
         is tried again, or a degraded one's reconciliation: none until a
         first sync has succeeded, since every attempt until then tries each
-        unit (``_async_plan_unit``), the first after setup's import
-        included. ``not_reached`` is how many updates in a row ran out of
-        time before its first request; ``last_failure`` gives the reason,
-        the error's class, its HTTP status and its age. ``reaches_target``
+        unit (``_async_plan_unit``). ``not_reached`` is how many updates in
+        a row ran out of time before its first request; ``last_failure``
+        gives the reason, the error's class, its HTTP status and its age.
+        ``reaches_target``
         says the unit's history reaches back to its target with no hour
         missing that Meridian may still have, as its last coverage found
         (``lanes.reaches_target``), so no after a start until the update
@@ -677,10 +573,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         yes or no, never a number of days, which would tell how long the
         history is.
         """
-        try:
-            accounts = self.accounts
-        except ValueError:
-            return []
+        accounts = self.accounts
         now = _utcnow()
         waits = self._initial_refresh_complete
         units: list[dict[str, Any]] = []
@@ -726,18 +619,21 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
 
     async def async_prepare_topology(self) -> None:
         """
-        Renew the stored session and cache the selected account topology.
+        Renew the stored session and cache every active or dormant account.
 
         This is the only Meridian work done during config-entry setup. Errors
         are raised as config-entry exceptions so Home Assistant starts
-        reauthentication or retries setup with its own backoff. Right after
-        the setup flow, the accounts it found are cached already, and no
-        request is made: the session the flow validated is renewed by the
-        first sync.
+        reauthentication or retries setup with its own backoff, as it does
+        when the login has no account to follow.
         """
         self._begin_calls()
         try:
             await self._async_get_topology(_utcnow())
+        except _NoAccountsError as err:
+            raise ConfigEntryNotReady(
+                translation_domain=DOMAIN,
+                translation_key="no_accounts",
+            ) from err
         except MeridianAuthenticationError as err:
             raise ConfigEntryAuthFailed(
                 translation_domain=DOMAIN,
@@ -771,24 +667,10 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
     async def async_fetch_and_import(  # noqa: C901 - one branch per failure kind
         self,
         *,
-        setup_import: bool = False,
         time_budget: float | None = None,
-        time_limit: asyncio.Timeout | None = None,
-        progress: Callable[[float], None] | None = None,
     ) -> MeridianSyncData:
         """
-        Fetch Meridian data and import statistics for setup or polling.
-
-        The setup import passes ``setup_import=True``. Its coordinator is
-        discarded once the entry exists, so billing metadata and bill totals
-        would only add a request, and a recorder wait, that could fail a
-        finished import; the entry's first sync fetches them. And the flow
-        has just waited for the recorder itself, before every attempt and in
-        two passes, as the first sync does, so this sync does not. Only the
-        setup import asks for a week again, by its days, after a gateway
-        timeout, once the cooldown has passed: in polling, the next poll is
-        the retry. Nor does the setup import fill in older history: the
-        entry's updates do, a few weeks at each (``_async_cover_lanes``).
+        Fetch Meridian data and import statistics.
 
         With ``time_budget`` (seconds), no measurements request after the
         first starts once less than 80 s of it remain: ``RunBudgetError`` is
@@ -796,10 +678,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         updates fetch the rest. An update that walks a direction back
         further than 14 days has 900 s instead (``_extend_budget``). The
         time each unit's import takes, waiting for the recorder to save and
-        confirm it, is not counted; ``time_limit``, the setup attempt's own
-        ``asyncio.timeout``, moves on with the budget (``_async_uncounted``).
-        ``progress`` is called with the fraction of the planned measurement
-        windows done, after each one.
+        confirm it, is not counted (``_async_uncounted``).
 
         Until a first sync has succeeded, one that Meridian failed, or whose
         statistics Home Assistant did not confirm (``statistics_write``), is
@@ -816,17 +695,17 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         # A wait after a rate limit holds for the update after it alone.
         self.update_interval = UPDATE_INTERVAL
         try:
-            data = await self._async_fetch_and_import_data(
-                setup_import=setup_import,
-                time_budget=time_budget,
-                time_limit=time_limit,
-                progress=progress,
-            )
+            data = await self._async_fetch_and_import_data(time_budget=time_budget)
         except _RecorderBehindError as err:
             raise UpdateFailed(
                 translation_domain=DOMAIN,
                 translation_key="recorder_busy",
                 retry_after=FIRST_SYNC_RETRY_SECONDS if first_sync else None,
+            ) from err
+        except _NoAccountsError as err:
+            raise UpdateFailed(
+                translation_domain=DOMAIN,
+                translation_key="no_accounts",
             ) from err
         except MeridianAuthenticationError as err:
             raise ConfigEntryAuthFailed(
@@ -837,11 +716,9 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             raise UpdateFailed(
                 translation_domain=DOMAIN,
                 translation_key="rate_limited",
-                retry_after=self._rate_limit_wait(err, setup_import=setup_import),
+                retry_after=self._rate_limit_wait(err),
             ) from err
         except RunBudgetError as err:
-            if setup_import:
-                raise
             raise UpdateFailed(
                 translation_domain=DOMAIN,
                 translation_key="upstream_timeout",
@@ -907,7 +784,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         if limit is None:
             self._rate_limits = 0
             return
-        wait = timedelta(seconds=self._rate_limit_wait(limit, setup_import=False))
+        wait = timedelta(seconds=self._rate_limit_wait(limit))
         self._coverage_not_before = data.synced_at + wait
         self.update_interval = max(UPDATE_INTERVAL, wait)
 
@@ -928,38 +805,24 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         self._first_sync_failures += 1
         return wait
 
-    def _rate_limit_wait(
-        self, err: MeridianRateLimitError, *, setup_import: bool
-    ) -> float:
+    def _rate_limit_wait(self, err: MeridianRateLimitError) -> float:
         """
         Return how long to wait after a rate limit.
 
-        The setup flow shows Meridian's own wait. Polling waits that long
-        the first time, and twice as long for each rate limit in a row, up
-        to a day: Kraken's in-band rate limit, which gives no wait of its
-        own, so waits 1 h, then 2 h, 4 h and on.
+        Meridian's own wait the first time, and twice as long for each rate
+        limit in a row, up to a day: Kraken's in-band rate limit, which
+        gives no wait of its own, so waits 1 h, then 2 h, 4 h and on.
         """
-        if setup_import:
-            return err.retry_after
         self._rate_limits += 1
         doubled = err.retry_after * 2 ** min(5, self._rate_limits - 1)
         return float(min(MAX_RETRY_AFTER_SECONDS, doubled))
 
     async def _async_fetch_and_import_data(
-        self,
-        *,
-        setup_import: bool,
-        time_budget: float | None,
-        time_limit: asyncio.Timeout | None,
-        progress: Callable[[float], None] | None,
+        self, *, time_budget: float | None
     ) -> MeridianSyncData:
         """Complete one sync and return its privacy-safe operational summary."""
         self._begin_calls()
-        self._time_limit = time_limit
-        self._imported_newest = {}
-        self._setup_import = setup_import
-        self._progress = None if progress is None else _Progress(progress)
-        if not (setup_import or self._initial_refresh_complete):
+        if not self._initial_refresh_complete:
             await self._async_wait_for_recorder()
         # Timed from here: a wait for a busy recorder is Home Assistant's,
         # and must not read as a slow Meridian sync in diagnostics.
@@ -973,7 +836,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             accounts, topology_refreshed = await self._async_get_topology(now)
             self._topology_fresh = topology_refreshed
             mode = (
-                await self._async_startup_mode(accounts, now)
+                await self._async_startup_mode(accounts)
                 if not self._initial_refresh_complete
                 else self._select_sync_mode(now)
             )
@@ -987,13 +850,11 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 )
                 self._topology_fresh = topology_refreshed
                 results = await self._async_sync_accounts(accounts, mode, now)
-            self._settle_run(setup_import=setup_import)
+            self._settle_run()
 
             self._initial_refresh_complete = True
             self._record_sync_cadence(mode, now)
-            account_results = (
-                () if setup_import else await self._async_account_results(accounts, now)
-            )
+            account_results = await self._async_account_results(accounts, now)
             outcomes = Counter(unit.outcome for unit in self._run_units)
 
             data = MeridianSyncData(
@@ -1028,98 +889,52 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         self._log_sync_summary(data)
         return data
 
-    def _settle_run(self, *, setup_import: bool) -> None:
+    def _settle_run(self) -> None:
         """
-        Decide whether a sync succeeded, and warn about units that started failing.
+        Decide whether a sync succeeded.
 
         A sync succeeds when at least one unit fetched and imported, in full
-        or its newer windows only; the setup import, when every unit did, or
-        when at least one property did so for every direction it has and
-        found readings for one of them, each with its newest window in full
-        at least: the entry's updates import the rest. A property with no
-        readings in its 90 days, as one whose supply ended, imported no
-        history: counted, it would create the entry with none while the
-        active property failed. Otherwise the first unit's failure fails
+        or its newer windows only. Otherwise the first unit's failure fails
         it, as any failure failed every sync before 0.3.0, or, when every
-        unit waited after an earlier failure, that failure. In setup it is
-        the failure of the first unit that did not import its newest
-        window, which is what kept setup from succeeding: a unit degraded
-        after its newest window did not, and its failure would hide that
-        one, such as a service error after which the form offers to
-        continue without history. ``last_request`` names the failed request
-        of the unit whose failure is raised, not a later unit's. A refused
-        replay (``StatisticsAnchorError``) fails it only when no unit failed
-        otherwise: no retry clears a refusal, so it
-        would hold a failed first sync to the hourly update
-        (``async_fetch_and_import``) while another unit's failure, one
-        Meridian may soon recover from, is tried again after 10 minutes.
-        A sync with no units at all, an account without properties say,
-        succeeds. A setup import that fails because its time budget ran out
-        after its size ladder went on past a gateway timeout fails with
-        that timeout: it is what cost the time, so the failure form and its
-        warning describe that timeout rather than the budget. In setup, each
-        unit that started failing logs its one WARNING here, once the import
-        is known to go on, since a setup attempt that fails logs its own; an
-        hourly update has logged it already (``_report_failing``).
+        unit waited after an earlier failure, that failure.
+        ``last_request`` names the failed request of the unit whose failure
+        is raised, not a later unit's. A refused replay
+        (``StatisticsAnchorError``) fails it only when no unit failed
+        otherwise: no retry clears a refusal, so it would hold a failed
+        first sync to the hourly update (``async_fetch_and_import``) while
+        another unit's failure, one Meridian may soon recover from, is tried
+        again after 10 minutes. A sync with no units at all, an account
+        without properties say, succeeds.
         """
         units = self._run_units
-        imported = [
-            unit for unit in units if unit.outcome in {STATUS_OK, STATUS_DEGRADED}
-        ]
-        if setup_import:
-            properties: dict[str, list[_Unit]] = {}
-            for unit in units:
-                properties.setdefault(unit.cache_key[0], []).append(unit)
-            succeeded = all(unit.imported_newest for unit in units) or any(
-                all(unit.imported_newest for unit in group)
-                and any(unit.found_readings for unit in group)
-                for group in properties.values()
+        if not units or any(
+            unit.outcome in {STATUS_OK, STATUS_DEGRADED} for unit in units
+        ):
+            return
+        failed = _failed_unit(units)
+        if failed is not None and failed.error is not None:
+            if failed.walk is not None and failed.walk.call is not None:
+                # Other units' requests may have come after it: the failure
+                # raised names its own.
+                self.last_request = failed.walk.call
+            raise failed.error
+        raise _UnitsDeferredError(
+            next(
+                (
+                    unit.state.last_failure
+                    for unit in units
+                    if unit.state.last_failure is not None
+                ),
+                None,
             )
-        else:
-            succeeded = not units or bool(imported)
-        if succeeded:
-            for unit in units:
-                if unit.cache_key in self._unreported:
-                    self._warn_unit_failing(unit, setup_import=True)
-            self._unreported.clear()
-        if not succeeded:
-            failed = _failed_unit(units, setup_import=setup_import)
-            if failed is not None and failed.error is not None:
-                if failed.walk is not None and failed.walk.call is not None:
-                    # Other units' requests may have come after it: the
-                    # failure raised names its own.
-                    self.last_request = failed.walk.call
-                timeout = next(
-                    (
-                        unit.walk.gateway_timeout
-                        for unit in units
-                        if unit.walk is not None
-                        and unit.walk.gateway_timeout is not None
-                    ),
-                    None,
-                )
-                if isinstance(failed.error, RunBudgetError) and timeout is not None:
-                    # Raised as it came, with its own cause, as the failure
-                    # warning names: not from the budget it left too short.
-                    raise timeout
-                raise failed.error
-            raise _UnitsDeferredError(
-                next(
-                    (
-                        unit.state.last_failure
-                        for unit in units
-                        if unit.state.last_failure is not None
-                    ),
-                    None,
-                )
-            )
+        )
 
     async def _async_wait_for_recorder(self) -> None:
         """
         Wait until the recorder has saved the work queued before this first sync.
 
-        The setup import's rows, or those of the entry's coordinator before a
-        reload, may still be queued: setup waits for them a minute at most.
+        The rows of the entry's coordinator before a reload may still be
+        queued.
         Read before they are saved, this sync would find no history, start
         the running sums from zero again and import over rows still to be
         saved, which breaks the sums at the first hour they differ, for
@@ -1141,7 +956,6 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         self.last_request = None
         self._deadline = None
         self._uncounted = 0.0
-        self._time_limit = None
         self._pause = None
         self._measurement_requests = 0
         self._last_measurements_start = self._last_measurements_end = None
@@ -1157,7 +971,6 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         self._revision_windows = 0
         self._history_start = False
         self._run_units = []
-        self._unreported = set()
 
     def _note_call(
         self,
@@ -1286,32 +1099,32 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
     async def _async_get_topology(
         self, now: datetime, *, force: bool = False
     ) -> tuple[tuple[MeridianAccount, ...], bool]:
+        """
+        Return every account to follow, and whether Meridian was asked again.
+
+        Meridian is asked once the accounts are a day old, or when a sync
+        found one of them gone. An empty list is not cached: the accounts
+        and what is kept for them stay as they were, and the next update
+        asks again.
+        """
         expired = (
             self._topology_cached_at is None
             or now - self._topology_cached_at >= TOPOLOGY_CACHE_INTERVAL
         )
-        if self._topology_seeded and not force and not expired:
-            # The accounts setup found: filtered and pruned as fetched ones
-            # are, but not refreshed, so a topology error still refreshes them.
-            self._topology_seeded = False
-            self._include_new_accounts()
-            accounts = self._filtered_topology()
-            self._prune_topology_state(accounts)
-            return accounts, False
-        if force or self._topology is None or expired:
-            self._topology_seeded = False
-            call = self._note_call("accounts")
-            self._topology = await self.client.async_get_accounts()
-            self._note_call_done(call)
-            self._topology_cached_at = now
-            self._include_new_accounts()
-            accounts = self._filtered_topology()
-            self._prune_topology_state(accounts)
-            return accounts, True
-        return self._filtered_topology(), False
+        if self._topology is not None and not force and not expired:
+            return self._topology, False
+        call = self._note_call("accounts")
+        accounts = await self.client.async_get_accounts()
+        self._note_call_done(call)
+        if not accounts:
+            raise _NoAccountsError
+        self._topology = accounts
+        self._topology_cached_at = now
+        self._prune_topology_state(accounts)
+        return accounts, True
 
     def _prune_topology_state(self, accounts: tuple[MeridianAccount, ...]) -> None:
-        """Discard runtime caches for accounts and directions no longer selected."""
+        """Discard what is kept for accounts and directions Meridian dropped."""
         account_numbers = {account.number for account in accounts}
         property_directions: set[CacheKey] = set()
         statistic_ids: set[str] = set()
@@ -1383,64 +1196,23 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         self._active_directions = property_directions
         self._seen_directions.update(property_directions)
 
-    def _filtered_topology(self) -> tuple[MeridianAccount, ...]:
-        """Return only accounts explicitly selected for this config entry."""
-        if self._topology is None:
-            return ()
-        if self._selected_accounts is None:
-            return self._topology
-        selected = tuple(
-            account
-            for account in self._topology
-            if account.number in self._selected_accounts
-        )
-        if not selected:
-            raise ValueError("None of the selected Meridian accounts are available")
-        return selected
-
-    def _include_new_accounts(self) -> None:
-        """Include newly discovered accounts when the user selected all accounts."""
-        if not self._auto_add_accounts or self._topology is None:
-            return
-        selected_accounts = frozenset(account.number for account in self._topology)
-        if selected_accounts == self._selected_accounts:
-            return
-        self._selected_accounts = selected_accounts
-        if self._config_entry is not None:
-            self.hass.config_entries.async_update_entry(
-                self._config_entry,
-                data={
-                    **self._config_entry.data,
-                    CONF_SELECTED_ACCOUNTS: sorted(selected_accounts),
-                    CONF_AUTO_ADD_ACCOUNTS: True,
-                },
-            )
-
     async def _async_startup_mode(
-        self, accounts: tuple[MeridianAccount, ...], now: datetime | None = None
+        self, accounts: tuple[MeridianAccount, ...]
     ) -> SyncMode:
         """
         Distinguish a new install from a restart without changing IDs.
 
-        The first sync after setup continues what setup imported: with every
-        statistic present, or searched in full by setup and found empty
-        (``_searched_by_setup``), it is in the mode the cadence asks for,
-        counted from the setup import's sync, rather than a 14-day restart.
+        A direction without statistics, as after setup, makes it the 90-day
+        import; with every statistic present, it is a 14-day restart.
         """
         has_all_statistics = True
         for account in accounts:
             for property_data in account.properties:
                 key = property_key(account.number, property_data.id)
-                for direction, (energy_id, _) in _directions(key, property_data):
+                for _direction, (energy_id, _) in _directions(key, property_data):
                     await self._async_cache_statistic(energy_id)
-                    has_all_statistics &= self._known_statistics[
-                        energy_id
-                    ] or self._searched_by_setup((key, direction))
-        if not has_all_statistics:
-            return SyncMode.INITIAL
-        if self._reconciled_at is not None:
-            return self._cadence_mode(now or _utcnow())
-        return SyncMode.RESTART
+                    has_all_statistics &= self._known_statistics[energy_id]
+        return SyncMode.RESTART if has_all_statistics else SyncMode.INITIAL
 
     def _topology_cache_age(self, now: datetime) -> float:
         if self._topology_cached_at is None:
@@ -1497,17 +1269,11 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                             disambiguate=disambiguate,
                         )
                     )
-        if self._progress is not None:
-            self._progress.planned = sum(
-                unit.walk.planned for unit in units if unit.walk is not None
-            )
-            self._progress.done = 0
         if any(unit.walk is not None and unit.deep(now) for unit in units):
             self._extend_budget()
         try:
             await self._async_run_units(units, now)
-            if not self._setup_import:
-                await self._async_cover_lanes(units, now)
+            await self._async_cover_lanes(units, now)
         finally:
             self._keep_unsaved(units, now)
         return tuple(
@@ -1528,10 +1294,10 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         every update. So it has 900 s instead. It is known before the first
         request (``_Unit.deep``), except for a quiet direction, whose walk
         goes back only once its newest window has readings again
-        (``_async_walk_step``). The setup import has its own budget. The
-        time imports took before is still not counted (``_async_uncounted``).
+        (``_async_walk_step``). The time imports took before is still not
+        counted (``_async_uncounted``).
         """
-        if self._deadline is not None and not self._setup_import:
+        if self._deadline is not None:
             self._deadline = max(
                 self._deadline,
                 self._started_at + DEEP_WALK_BUDGET_SECONDS + self._uncounted,
@@ -1583,11 +1349,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         property none of whose newest windows was fetched yet, then the
         rest, each in the order ``newest`` holds. So a property whose newest
         window came back empty, as one whose supply ended, lets the other
-        properties' newest windows go before its other direction's. That
-        holds in setup too, where every count is 0, as each attempt builds a
-        new coordinator: there the time budget can allow only a few
-        requests, and a property counts only once all its directions have
-        their newest windows (``_settle_run``).
+        properties' newest windows go before its other direction's.
         """
         at = monotonic()
         ready = [unit for unit in newest if not self._cooldown_left(unit, at)]
@@ -1615,10 +1377,10 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
 
         Those that can send at once first, then the one whose property's
         cooldown ends soonest. Among those, the units of a property whose
-        walks returned readings in this sync, so in setup an active
-        property's weeks go before those of one that has none, as one whose
-        supply ended. Then a unit whose newest window is not yet fetched in
-        full, as one that waited for a cooldown or is asked for by day,
+        walks returned readings in this sync, so an active property's weeks
+        go before those of one that has none, as one whose supply ended.
+        Then a unit whose newest window is not yet fetched in full, as one
+        that waited for a cooldown or is asked for by day,
         before those on older windows, and one that has fetched none of it
         first, so each unit's first window comes early: the size ladder of
         one direction's newest week does not hold up the other's. Then the
@@ -1818,8 +1580,6 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         """
         walk = unit.walk
         assert walk is not None  # noqa: S101 - only fetched units finish
-        if self._progress is not None:
-            self._progress.add(walk.remaining())
         state = unit.state
         if isinstance(walk.error, RunBudgetError) and not walk.attempted:
             unit.outcome = STATUS_DEFERRED
@@ -2587,21 +2347,9 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         backup, say), and up to 60 s before that when the last replay of
         its statistics was not confirmed. Counted, it would leave too little
         of the budget for the windows other units still have to fetch, which
-        would then fail as if Meridian had been slow (``time_budget``). The
-        setup attempt's own time limit (``time_limit``) moves on with the
-        budget: while the import runs, it leaves at least
-        ``REPLAY_ALLOWANCE_SECONDS``, so it does not cut short a replay that
-        started near its end, and then it is as far off as it was before the
-        import. That limit runs on the event loop's clock, so the import is
-        timed by that clock for it.
+        would then fail as if Meridian had been slow (``time_budget``).
         """
         started = monotonic()
-        loop = asyncio.get_running_loop()
-        loop_started = loop.time()
-        limit = self._time_limit
-        ends = None if limit is None or limit.expired() else limit.when()
-        if limit is not None and ends is not None:
-            limit.reschedule(max(ends, loop_started + REPLAY_ALLOWANCE_SECONDS))
         try:
             yield
         finally:
@@ -2609,8 +2357,6 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             self._uncounted += took
             if self._deadline is not None:
                 self._deadline += took
-            if limit is not None and ends is not None and not limit.expired():
-                limit.reschedule(ends + loop.time() - loop_started)
 
     def _note_failure(
         self, unit: _Unit, failure: UnitFailure, now: datetime, *, imported: bool
@@ -2700,15 +2446,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         self._note_recovered(unit, recovered=recovered)
 
     def _note_recovered(self, unit: _Unit, *, recovered: bool) -> None:
-        """
-        Say once that a unit that failed or was degraded works again.
-
-        Not for one that failed earlier in this setup import, before the
-        accounts were refreshed: that failure never warned (``_unreported``).
-        """
-        if unit.cache_key in self._unreported:
-            self._unreported.discard(unit.cache_key)
-        elif recovered:
+        """Say once that a unit that failed or was degraded works again."""
+        if recovered:
             _LOGGER.info(
                 "Meridian usage history updates for one direction are working "
                 "again (direction=%s account=%s property=%s)",
@@ -2719,19 +2458,12 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
 
     def _report_failing(self, unit: _Unit) -> None:
         """
-        Warn about a unit that started failing, at once or once setup goes on.
+        Warn about a unit that started failing, at once.
 
-        An hourly update warns at once, so a rate limit or a refresh of the
-        accounts that ends or restarts the sync later cannot lose it. The
-        setup import warns only once the import is known to go on, since a
-        setup attempt that fails logs its own (``_settle_run``); until then
-        the unit is remembered for the whole sync, a refresh of the
-        accounts included.
+        At once, so a rate limit or a refresh of the accounts that ends or
+        restarts the sync later cannot lose it.
         """
-        if self._setup_import:
-            self._unreported.add(unit.cache_key)
-        else:
-            self._warn_unit_failing(unit, setup_import=False)
+        self._warn_unit_failing(unit)
 
     def _note_quiet(self, unit: _Unit, *, clean: bool) -> None:
         """
@@ -2750,24 +2482,20 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         elif clean:
             unit.state.quiet_frontier = frontier
 
-    def _warn_unit_failing(self, unit: _Unit, *, setup_import: bool) -> None:
+    def _warn_unit_failing(self, unit: _Unit) -> None:
         """
         Log one WARNING for a unit that started failing, without identifiers.
 
-        After a setup import, the entry's first update tries the unit again,
-        which then logs no second warning while it still fails: setup hands
-        it the unit's state (``SyncMemory``). Until a first sync after a
-        restart or a reload has succeeded, each of its attempts tries every
-        unit again, 10 minutes after the first failed, or with the hourly
-        update once one succeeded: the next update, either way.
+        Until a first sync after setup, a restart or a reload has succeeded,
+        each of its attempts tries every unit again, 10 minutes after the
+        first failed, or with the hourly update once one succeeded: the next
+        update, either way.
         """
         failure = unit.state.last_failure
         retry_at = unit.state.next_try
         assert failure is not None  # noqa: S101 - set when the unit failed
         assert retry_at is not None  # noqa: S101 - set when the unit failed
-        if setup_import:
-            when = "by the first update after setup"
-        elif not self._initial_refresh_complete:
+        if not self._initial_refresh_complete:
             when = "by the next update"
         else:
             when = f"in about {_hours_until(retry_at, failure.at)} h"
@@ -3185,7 +2913,6 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         rows, cost_rows = written
         if rows:
             newest = max(item.start.astimezone(UTC) for item in measurements)
-            self._imported_newest[energy_id] = newest
             self._advance_frontier(energy_id, newest)
         if cost_rows:
             without_cost = {
@@ -3224,8 +2951,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         usage, since nothing later reaches back that far. So the retry, and
         every walk until a replay from that hour is confirmed, reaches back
         to it (``_requested_since``), in this coordinator and in those its
-        owner builds next with the same mapping (``unconfirmed``): the
-        setup flow's next attempt, or the entry's after a reload. A restart
+        owner builds next with the same mapping (``unconfirmed``), as the
+        entry's after a reload. A restart
         of Home Assistant forgets it. A replay within the last 14 days needs
         none of this: the cache it compares with has not moved on, so the
         next run offers the same rows from the same hour.
@@ -3278,34 +3005,11 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         energy_latest = self._latest_statistics[energy_statistic_id]
         if self._initial_refresh_complete:
             return requested_mode
-        if (
-            energy_latest is not None and self._reconciled_at is not None
-        ) or self._searched_by_setup(cache_key):
-            # After setup, a direction with statistics continues with the
-            # mode the cadence asks for (``_async_startup_mode``), even one
-            # whose readings ended more than 14 days ago: the frontier rule
-            # reaches back to its newest stored hour, so a new 90-day import
-            # would only repeat what setup just did. So does one setup
-            # searched in full and found empty: readings that come later
-            # queue its initial import (``_record_direction_fetch``).
-            return self._cadence_mode(now or _utcnow())
         if energy_latest is None or energy_latest < (now or _utcnow()) - (
             REVISION_OVERLAP
         ):
             return SyncMode.INITIAL
         return SyncMode.RESTART
-
-    def _searched_by_setup(self, cache_key: CacheKey) -> bool:
-        """
-        Return whether the setup import just searched a direction in full.
-
-        Setup hands over the directions whose initial import searched every
-        window it planned (``SyncMemory.searched``), with when it ran
-        (``reconciled_at``). A restart or a reload has no such record, so it
-        searches a direction without statistics again, as it cannot tell it
-        from one no setup searched, such as an account added later.
-        """
-        return self._reconciled_at is not None and cache_key in self._backfill_attempted
 
     async def _async_cache_statistic(self, statistic_id: str) -> None:
         """Cache whether Recorder has current numeric history for a statistic."""
@@ -3380,7 +3084,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         than 14 days and was not confirmed, every walk of the unit, whatever
         its mode, reaches back to the oldest hour it wrote, even more than
         90 days back (``_note_unconfirmed``): a new coordinator, as after a
-        failed setup attempt or a reload, reads the frontier from the
+        reload, reads the frontier from the
         recorder, which usage saved without its cost has moved on.
         """
         since = self._mode_since(cache_key, mode, now)
@@ -3558,13 +3262,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             now=now,
             log=_PageLog(mode=mode, direction=direction, position=position, now=now),
         )
-        return _UnitWalk(
-            walk,
-            request,
-            plan_windows(since, now),
-            setup=self._setup_import,
-            state=state,
-        )
+        return _UnitWalk(walk, request, plan_windows(since, now), state=state)
 
     def _walk_result(self, walk: _UnitWalk) -> MeasurementFetchResult:
         """Return what a walk fetched, noting the history start and older rows."""
@@ -3656,17 +3354,12 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         """
         Fetch one window of a walk, or plan its days after a failure that allows.
 
-        After a gateway timeout of a window longer than a day, the setup
-        import waits out the cooldown and asks for its newest day alone, the
-        probe (``_ladder``). The probe answered, the window's other days
-        follow one at a time, and the walk goes back to weeks; a second week
-        that needs the ladder keeps days for the rest of the walk. A probe
-        that fails as well shows that the window's size is not what fails,
-        and the walk stops. A query over Kraken's limits splits the walk into
-        days once. Polling stops at a unit's first gateway timeout, and its
-        next update probes the window holding that week's newest date; a
-        second window that times out after a probe came back keeps days for
-        the updates after it (``_defer_ladder``).
+        A query over Kraken's limits splits the walk into days once (``_ladder``).
+        A walk stops at a unit's first gateway timeout, and its next update
+        probes the window holding that week's newest date, asking for that
+        day alone; a second window that times out after a probe came back
+        keeps days for the updates after it (``_defer_ladder``). A probe
+        that fails as well shows that the window's size is not what fails.
         """
         splits = walk.splits
         window, weight, probe = walk.next_window()
@@ -3694,12 +3387,10 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 # no longer owe it. One the time budget stopped before it
                 # went out is still owed.
                 walk.state.probe_on = None
-        if probe and walk.state is not None and not walk.setup:
+        if probe and walk.state is not None:
             # The newest day of a window an earlier update could not fetch
             # came back: size was the lever (``_defer_ladder``).
             walk.state.ladder(window.end_on, walk.today)
-        if self._progress is not None:
-            self._progress.add(weight)
         goes_on = not refused and self._take_window(
             walk.walk, rows, walk.request.direction, weight
         )
@@ -3731,44 +3422,20 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         """
         direction = walk.request.direction
         if _is_gateway(err):
-            if window.days == 1:
-                if probe:
-                    # In polling no probe that came back is remembered here:
-                    # an update probes a window only when none is
-                    # (``_defer_ladder``), and only that probe can come back.
-                    self._log_once(
-                        "size_not_the_lever",
-                        "Meridian did not answer a request for one day of usage "
-                        "history in time either, so smaller requests do not help; "
-                        "this direction stops for this update (direction=%s)",
-                        direction,
-                    )
-                return False
-            if not self._setup_import:
+            if window.days > 1:
                 self._defer_ladder(walk, window)
-                return False
-            walk.gateway_timeout = err
-            walk.laddered += 1
-            if walk.laddered > 1 and not walk.days_only:
-                walk.days_only = True
+            elif probe:
+                # No probe that came back is remembered here: an update
+                # probes a window only when none is (``_defer_ladder``), and
+                # only that probe can come back.
                 self._log_once(
-                    "days_kept",
-                    "A second week of usage history needed requests by day; the "
-                    "rest of this import asks for one day at a time (direction=%s)",
+                    "size_not_the_lever",
+                    "Meridian did not answer a request for one day of usage "
+                    "history in time either, so smaller requests do not help; "
+                    "this direction stops for this update (direction=%s)",
                     direction,
                 )
-            self._log_once(
-                "probe_after_cooldown",
-                "Meridian did not answer a request for a week of usage history in "
-                "time; after a pause, it is asked for the week's newest day alone "
-                "(direction=%s window=%d/%d)",
-                direction,
-                window.index,
-                window.count,
-            )
-            walk.split(window, weight, probe=True)
-            self._splits += 1
-            return True
+            return False
         if _is_query_limit(err) and window.days > 1 and not walk.query_split:
             walk.query_split = walk.days_only = True
             self._log_once(
@@ -3794,12 +3461,11 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         same window at an earlier update, this is the second window that
         needs requests by day: later updates ask for every window starting
         on or before the newer of the two dates by day
-        (``UnitState.days_kept``), as setup keeps days after a second such
-        week. Asking for those windows whole again would time out again,
-        and a walk would never get past the first. Both are remembered for
-        a week from the update that learned them, whichever window's dates
-        they are: a probe of the second week or an older one is remembered
-        as long as one of the newest.
+        (``UnitState.days_kept``). Asking for those windows whole again
+        would time out again, and a walk would never get past the first.
+        Both are remembered for a week from the update that learned them,
+        whichever window's dates they are: a probe of the second week or an
+        older one is remembered as long as one of the newest.
         """
         state = walk.state
         if state is None:
@@ -3925,7 +3591,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         refusal of that date as well, or no readings for it, confirms the
         start;
         readings mean the refusal was of another kind, and the sync fails,
-        for the setup retry or the next update to fetch the window again,
+        for the next update to fetch the window again,
         rather than keep the newer dates alone for good. A refusal of the
         walk's oldest date needs no confirmation: it leaves out that one date
         at most. Each date counts as one more window requested in
@@ -4262,10 +3928,9 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         time limit), no request goes to the property for a cooldown of 75 s,
         or as long as the failed request took: the service may still be
         working on it. So it is after a resend that timed out. It is never
-        resent as it was: the setup import asks for the window's newest day
-        alone after the cooldown (``_async_walk_step``), and polling leaves
-        it to the next poll, so a struggling service is not asked twice
-        every hour. Another passing failure (HTTP 408, 502, 503 or 520-523,
+        resent as it was: the next update asks for the window's newest day
+        alone (``_async_walk_step``), so a struggling service is not asked
+        twice every hour. Another passing failure (HTTP 408, 502, 503 or 520-523,
         or a network error) is resent after 2-5 s, when 80 s of the budget
         remain, unless it was a resend (``resent``). A rate limit, a GraphQL
         error, a client error or data that cannot be used is never resent.
@@ -4340,7 +4005,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
 
 
 # What a failed request that is not resent leads to in its walk, for the
-# failed page's debug line: _PROBE, _SPLIT or _STOP.
+# failed page's debug line: _SPLIT or _STOP.
 type _Actions = Callable[[Exception, MeasurementWindow], str]
 
 
@@ -4361,9 +4026,9 @@ class _UnitWalk:
     """
     One direction's walk in a sync: the windows still to fetch, and its ladder.
 
-    Windows are fetched newest first, each with a share of the sync's
-    progress: one for a window, a fraction of it for each day of a window
-    fetched day by day. ``completed_on`` is the oldest date of the windows
+    Windows are fetched newest first, each with a weight: one for a window,
+    a fraction of it for each day of a window fetched day by day.
+    ``completed_on`` is the oldest date of the windows
     fetched and kept so far, which, newest first and stopping at the first
     failure, are one block back from today; a window whose rows failed
     their checks is not kept. ``probe`` says the next window is a probe:
@@ -4378,22 +4043,18 @@ class _UnitWalk:
         request: _WalkRequest,
         windows: tuple[MeasurementWindow, ...],
         *,
-        setup: bool,
         state: UnitState | None = None,
     ) -> None:
         self.walk = walk
         self.request = request._replace(actions=self.action)
-        self.planned = len(windows)
         self.queue: deque[tuple[MeasurementWindow, float]] = deque(
             (window, 1.0) for window in windows
         )
         self.newest = windows[0] if windows else None
-        self.setup = setup
         self.state = state
         self.probe = False
         # Whether the walk has planned the probe an earlier update left it.
         self.probed = False
-        self.laddered = 0
         # Windows asked for by their days because of what an earlier update
         # left: the probe it owed, or the days it kept.
         self.splits = 0
@@ -4402,9 +4063,6 @@ class _UnitWalk:
         self.completed_on: date | None = None
         self.ended = False
         self.error: Exception | None = None
-        # A gateway timeout the setup import's ladder went on after, which
-        # cost the walk the time of its cooldown.
-        self.gateway_timeout: MeridianError | None = None
         self.call: RequestContext | None = None
         # Whether any request of the walk was sent.
         self.attempted = False
@@ -4438,13 +4096,9 @@ class _UnitWalk:
         """Return the New Zealand date the walk's windows end on."""
         return self.request.now.astimezone(_NZ).date()
 
-    def remaining(self) -> float:
-        """Return the progress the windows still to fetch would add."""
-        return sum(weight for _window, weight in self.queue)
-
     def next_window(self) -> tuple[MeasurementWindow, float, bool]:
         """
-        Take the next window to fetch, its share of the progress, and its probe flag.
+        Take the next window to fetch, its weight, and its probe flag.
 
         A window longer than a day is fetched day by day when the walk keeps
         days, when an earlier hourly update kept days for it
@@ -4497,27 +4151,19 @@ class _UnitWalk:
 
     def action(self, err: Exception, window: MeasurementWindow) -> str:
         """Return what a failure not resent leads to, for its debug line."""
-        if window.days > 1 and (
-            (_is_gateway(err) and self.setup)
-            or (_is_query_limit(err) and not self.query_split)
-        ):
-            return _PROBE if _is_gateway(err) else _SPLIT
+        if window.days > 1 and _is_query_limit(err) and not self.query_split:
+            return _SPLIT
         return _STOP
 
 
-def _failed_unit(units: list[_Unit], *, setup_import: bool) -> _Unit | None:
+def _failed_unit(units: list[_Unit]) -> _Unit | None:
     """
     Return the unit whose failure a failed sync raises (``_settle_run``).
 
     The first unit that failed, a refused replay (``StatisticsAnchorError``)
-    only when no other did. In setup, only a unit that did not import its
-    newest window counts, if any failed: one degraded after its newest
-    window did not keep setup from succeeding, and its failure would hide
-    the one that did.
+    only when no other did.
     """
     failures = [unit for unit in units if unit.walk is not None and unit.error]
-    if setup_import:
-        failures = [unit for unit in failures if not unit.imported_newest] or failures
     return next(
         (
             unit
@@ -4596,32 +4242,6 @@ class _Unit:
             self.mode is SyncMode.INITIAL or self.since < now - REVISION_OVERLAP
         )
 
-    @property
-    def imported_newest(self) -> bool:
-        """
-        Return whether the unit imported at least its newest window in full.
-
-        In full, or with what it could fetch of it: a walk that ended
-        without a failure, as at the start of the history, or whose newest
-        window came back whole before it stopped.
-        """
-        return self.outcome == STATUS_OK or (
-            self.outcome == STATUS_DEGRADED
-            and self.walk is not None
-            and self.walk.newest_done
-        )
-
-    @property
-    def found_readings(self) -> bool:
-        """
-        Return whether the unit's walk returned readings, or it wrote rows.
-
-        Estimates for hours still to come are no readings (``WindowRows``).
-        """
-        return self.rows > 0 or (
-            self.walk is not None and self.walk.walk.oldest_seen is not None
-        )
-
     def found_new(self, measurements: tuple[MeridianMeasurement, ...]) -> bool:
         """
         Return whether a walk's readings hold any newer than its frontier.
@@ -4630,8 +4250,8 @@ class _Unit:
         returned has moved it on since. A first import has none, so its
         readings are new when its newest window has some: one whose newest
         window is empty, as for a supply that ended, found nothing newer
-        than its older readings, and the entry's first update after setup
-        asks for that window alone.
+        than its older readings, and the next update asks for that window
+        alone.
         """
         if self.frontier is not None:
             frontier = self.frontier
@@ -5036,7 +4656,7 @@ def _is_refusal(
     if rows.inside or (oldest_seen is not None and rows.window.end > oldest_seen):
         return False
     if isinstance(err, MeridianGraphQLError):
-        return bool(set(err.codes) - {UNKNOWN_ERROR_CODE}) and not (
+        return not is_service_failure(err.codes) and not (
             QUERY_LIMIT_CODES.intersection(err.codes) or _is_topology_error(err)
         )
     return isinstance(err, MeridianRejectedError)

@@ -122,6 +122,10 @@ _HTTP_SERVER_ERROR = 500
 # Statuses a gateway in front of Meridian's API sends when the origin did not
 # answer in time: its own 504, and Cloudflare's 524.
 _GATEWAY_TIMEOUT_STATUSES = frozenset({504, 524})
+# The codes Meridian gives a login code it refused.
+_OTP_CODES = frozenset(
+    {"OTP_EXPIRED", "OTP_INVALID", "OTP_NOT_FOUND", "OTP_TOO_MANY_ATTEMPTS"}
+)
 _LOGGER = logging.getLogger(__name__)
 _NZ = ZoneInfo("Pacific/Auckland")
 # The measurements query goes out under the web app's name and URL (see
@@ -313,12 +317,21 @@ class MeridianApiClient:
                 authenticated=False,
             )
         except _MeridianHttpError as err:
+            # A refused code names itself whatever the status, as too many
+            # tries may come with HTTP 429; only an answer without one is a
+            # rate limit or a failure of the service.
+            code = err.payload.get("code")
+            if isinstance(code, str) and code in _OTP_CODES:
+                raise MeridianOtpError(
+                    code, "Meridian rejected the login code"
+                ) from err
             if err.status == _HTTP_TOO_MANY_REQUESTS:
                 raise MeridianRateLimitError(err.retry_after) from err
             if err.status == _HTTP_REQUEST_TIMEOUT or err.status >= _HTTP_SERVER_ERROR:
                 raise _connection_error(err) from err
-            code = str(err.payload.get("code") or "OTP_INVALID")
-            raise MeridianOtpError(code, "Meridian rejected the login code") from err
+            raise MeridianOtpError(
+                str(code or "OTP_INVALID"), "Meridian rejected the login code"
+            ) from err
 
         custom_token = response.get("customToken")
         if not isinstance(custom_token, str) or not custom_token:
