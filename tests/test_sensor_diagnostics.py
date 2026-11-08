@@ -286,7 +286,9 @@ async def test_sensor_values_and_device_identifier_are_redacted(hass) -> None:
         )
     )
     assert sensors["total_due"].native_value == Decimal(0)
-    assert sensors["total_due"].extra_state_attributes == {"credit": Decimal("12.5")}
+    credit = sensors["total_due"].extra_state_attributes
+    assert credit == {"credit": 12.5}
+    assert isinstance(credit["credit"], float)
     for key in (*_PRICES, "bill_usage", "bill_estimate", "last_bill", "last_payment"):
         assert sensors[key].native_value is None, key
     assert sensors["billing_period_start"].native_value is None

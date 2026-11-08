@@ -156,7 +156,11 @@ DESCRIPTIONS = (
         key="total_due",
         translation_key="total_due",
         value_fn=lambda _data, result: result.total_due,
-        attrs_fn=lambda result: {"credit": result.credit},
+        # A state's attributes must be JSON: Home Assistant can't write a
+        # Decimal.
+        attrs_fn=lambda result: {
+            "credit": None if result.credit is None else round(float(result.credit), 2)
+        },
     ),
     MeridianSensorDescription(
         key="last_bill",
