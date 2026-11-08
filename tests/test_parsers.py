@@ -210,6 +210,33 @@ def test_a_balance_that_does_not_read_is_refused(account: dict[str, Any]) -> Non
         parse_balance(account)
 
 
+@pytest.mark.parametrize(
+    "cents", [10**13, -(10**13), 10**400], ids=["1E+13", "-1E+13", "1E+400"]
+)
+@pytest.mark.parametrize("field", ["balance", "payment"])
+def test_a_balance_or_payment_past_1e12_cents_is_refused(
+    field: str, cents: int
+) -> None:
+    """Far past any account's, and past what a sensor can show at 10**400."""
+
+    def account(amount: int) -> dict[str, Any]:
+        payment = {"amount": amount, "paymentDate": "2026-07-10", "status": "CLEARED"}
+        return {
+            "balance": amount if field == "balance" else -100,
+            "bills": _edges(),
+            "payments": _edges(payment if field == "payment" else {}),
+        }
+
+    limit = 10**13 - 1 if cents > 0 else -(10**13 - 1)
+    within = parse_balance(account(limit))
+    read = (
+        within.balance_cents if field == "balance" else within.payments[0].amount_cents
+    )
+    assert read == limit
+    with pytest.raises(ValueError, match="out of range"):
+        parse_balance(account(cents))
+
+
 @pytest.fixture(autouse=True)
 def fresh_rate_log() -> None:
     """Each test starts with no unreadable price field logged yet."""
@@ -230,6 +257,31 @@ def fresh_rate_log() -> None:
         ("$2.00 /day + GST", "from $0.30 /kWh", (None, None)),
         ("$2.00 /day $0.30 /kWh", "$0.30 /kWh, $0.25 /kWh off-peak", (None, None)),
         ("212.500 c/day extra", "31.41 c/kWh more", (None, None)),
+        # Up to 1E+12 in either unit; past it, too large to divide or to show.
+        pytest.param(
+            "$1" + "0" * 12 + " /day",
+            "1" + "0" * 12 + " c/kWh",
+            (Decimal("1E12"), Decimal("1E10")),
+            id="at-the-limit",
+        ),
+        pytest.param(
+            "$1" + "0" * 13 + " /day",
+            "1" + "0" * 13 + " c/kWh",
+            (None, None),
+            id="past-the-limit",
+        ),
+        pytest.param(
+            "$" + "9" * 400 + " /day",
+            "9" * 400 + " c/kWh",
+            (None, None),
+            id="past-a-float",
+        ),
+        pytest.param(
+            "$1" + "0" * 1_000_000 + " /day",
+            "1" + "0" * 1_000_003 + " c/kWh",
+            (None, None),
+            id="too-large-to-divide",
+        ),
     ],
 )
 def test_prices_read_dollars_or_cents_per_their_band_unit(
