@@ -128,13 +128,18 @@ _NAMES = {
     "balance": "balance",
     "prices": "prices",
 }
-# The INFO lines when a kind of figure is lost, and when it is back.
+# The INFO lines when a kind of figure is lost, by what it leaves unknown,
+# and when it is back.
 _EXTRA_LOST = {
     "accounts": "Meridian Energy couldn't refresh the list of accounts; it keeps "
     "using the one it has",
     "billing": "Meridian Energy couldn't get the billing period; the billing "
     "period sensors show unknown until it can",
+    "billing_bill": "Meridian Energy couldn't get the billing period; the billing "
+    "period and bill sensors show unknown until it can",
     "days": "Meridian Energy couldn't get the bill's day totals; the 'so far' "
+    "sensors show unknown until it can",
+    "days_all": "Meridian Energy couldn't get the bill's day totals; the bill "
     "sensors show unknown until it can",
     "balance": "Meridian Energy couldn't get the balance; Total due, Last bill "
     "and Last payment show unknown until it can",
@@ -296,7 +301,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         self._topology_cached_at: datetime | None = None
         self._extras: dict[tuple[str, str], _Extra] = {}
         self._memory: dict[UnitKey, _Memory] = {}
-        self._extras_lost: set[str] = set()
+        # Each kind lost, and the key of the INFO line that said so.
+        self._extras_lost: dict[str, str] = {}
         self._synced = False
         self._first_sync_failures = self._rate_limits = self._failed_updates = 0
         self._rate_limit: MeridianRateLimitError | None = None
@@ -940,9 +946,9 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         except MeridianError, ValueError:
             if self._topology is None:
                 raise
-            self._note_extra("accounts", ok=False)
+            self._note_extra("accounts", "accounts")
             return self._topology
-        self._note_extra("accounts", ok=True)
+        self._note_extra("accounts", None)
         if not accounts:
             raise _NoAccountsError
         self._topology = accounts
@@ -970,14 +976,19 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             key: extra for key, extra in self._extras.items() if key[1] in numbers
         }
 
-    def _note_extra(self, kind: str, *, ok: bool) -> None:
-        """Log at INFO once when an extra request is lost, and once when it is back."""
-        if ok and kind in self._extras_lost:
-            self._extras_lost.discard(kind)
-            _LOGGER.info(_EXTRA_BACK[kind])
-        elif not ok and kind not in self._extras_lost:
-            self._extras_lost.add(kind)
-            _LOGGER.info(_EXTRA_LOST[kind])
+    def _note_extra(self, kind: str, lost: str | None) -> None:
+        """
+        Log at INFO when a kind is lost, and once when it is back.
+
+        ``lost`` is the key of the line that says what is unknown, None when
+        nothing is; a kind already lost logs again only when that changes.
+        """
+        if lost is None:
+            if self._extras_lost.pop(kind, None) is not None:
+                _LOGGER.info(_EXTRA_BACK[kind])
+        elif self._extras_lost.get(kind) != lost:
+            self._extras_lost[kind] = lost
+            _LOGGER.info(_EXTRA_LOST[lost])
 
     def _property_result(
         self, account: MeridianAccount, property_data: MeridianProperty
@@ -1040,31 +1051,36 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         self, accounts: tuple[MeridianAccount, ...], failed: set[str], now: datetime
     ) -> tuple[AccountSyncResult, ...]:
         """Return every account's figures, then log each kind lost or back."""
-        lost: set[str] = set()
+        lost: dict[str, str] = {}
         results = [
             await self._async_account_result(account, failed, now, lost)
             for account in accounts
         ]
         for kind in _INTERVALS:
             if kind in lost:
-                self._note_extra(kind, ok=False)
+                self._note_extra(kind, lost[kind])
             elif not any(
                 extra.failing
                 for (name, _number), extra in self._extras.items()
                 if name == kind
             ):
-                self._note_extra(kind, ok=True)
+                self._note_extra(kind, None)
         return tuple(results)
 
     async def _async_account_result(
-        self, account: MeridianAccount, failed: set[str], now: datetime, lost: set[str]
+        self,
+        account: MeridianAccount,
+        failed: set[str],
+        now: datetime,
+        lost: dict[str, str],
     ) -> AccountSyncResult:
         """
         Return an account's figures, asking for those that are due.
 
-        A billing period is withheld once it has ended, and asked for again
-        at the first update after its end. ``lost`` gathers the kinds that
-        failed and show unknown.
+        A billing period is withheld once it has ended. It is asked for again
+        at the first update after its end, and every 6 hours until a new one
+        comes. ``lost`` gathers the kinds that failed and show unknown, each
+        with the key of the line that says what is unknown.
         """
         number = account.number
         today = nz_date(now)
@@ -1078,17 +1094,19 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         end = period.end if period is not None else None
         if end is not None and today > end:
             period = None
+            if billing.due is not None:
+                billing.due = min(billing.due, now + BILL_DAYS_INTERVAL)
         elif end is not None and billing.at == now and billing.due is not None:
             billing.due = min(billing.due, local_midnight(end + _DAY))
-        if billing.failing and period is None:
-            lost.add("billing")
         bill = await self._async_bill(account, period, failed, now, lost)
+        if billing.failing and period is None:
+            lost["billing"] = "billing_bill" if bill == BillFigures() else "billing"
         extra = await self._async_extra(
             "balance", number, now, partial(self.client.async_get_balance, number)
         )
         balance: MeridianBalance | None = extra.kept("balance", now)
         if extra.failing and balance is None:
-            lost.add("balance")
+            lost["balance"] = "balance"
         price_sensors, prices = await self._async_prices(account, now, lost)
         result = AccountSyncResult(
             account_key=account_key(number),
@@ -1119,7 +1137,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         period: MeridianBillingPeriod | None,
         failed: set[str],
         now: datetime,
-        lost: set[str],
+        lost: dict[str, str],
     ) -> BillFigures:
         """
         Return the bill's figures, asking for its day totals when due.
@@ -1153,10 +1171,11 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         if extra is None:
             return BillFigures()
         bill: _Bill | None = extra.value
-        kept = extra.kept("days", now) is not None
+        current = bill is not None and nz_date(now) <= bill.end
+        kept = current and extra.kept("days", now) is not None
         if extra.failing and not kept:
-            lost.add("days")
-        if bill is None or nz_date(now) > bill.end:
+            lost["days"] = "days" if current else "days_all"
+        if bill is None or not current:
             return BillFigures()
         return bill.figures if kept else BillFigures(estimate=bill.figures.estimate)
 
@@ -1204,7 +1223,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         return _Bill(start_on, end_on, figures)
 
     async def _async_prices(
-        self, account: MeridianAccount, now: datetime, lost: set[str]
+        self, account: MeridianAccount, now: datetime, lost: dict[str, str]
     ) -> tuple[bool | None, MeridianPrices | None]:
         """
         Return whether an account has price sensors, and their prices.
@@ -1229,7 +1248,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             return False, None
         prices: MeridianPrices | None = extra.kept("prices", now)
         if extra.failing and prices is None:
-            lost.add("prices")
+            lost["prices"] = "prices"
         return True, prices
 
 
