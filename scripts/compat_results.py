@@ -17,10 +17,12 @@ Outcomes: ``passed``; ``snapshot-differences``, when only syrupy snapshots
 differ (the expected output stored for the pinned harness, not a break);
 ``broken``, for any other failure, a crash, or no record at all.
 
-A result (``schema`` 1) has ``integration``, ``integration_version``,
-``target`` (``main`` or ``release``), ``tag``, ``ref``, ``channel``
-(``stable``, ``beta`` or ``minimum``), ``homeassistant``, ``harness``,
-``python``, ``outcome``, ``retried``, ``broken_tests``, ``snapshot_tests``,
+A result (``schema`` 1) is the ``result.json`` that each target uploads as
+the artifact ``compat-result-<target>-<channel>`` (kept 90 days). It has
+``integration``, ``integration_version``, ``target`` (``main`` or
+``release``), ``tag``, ``ref``, ``channel`` (``stable``, ``beta`` or
+``minimum``), ``homeassistant``, ``harness``, ``python``, ``outcome``,
+``retried``, ``broken_tests`` and ``snapshot_tests`` (at most 20 each),
 ``deprecations`` (a list, or ``null`` when the ref cannot report them) and
 ``run_url``. Only the standard library is used.
 """
