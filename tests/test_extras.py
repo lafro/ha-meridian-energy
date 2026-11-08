@@ -520,17 +520,22 @@ async def test_two_properties_get_no_price_sensors_and_one_bill(
     )
 
 
+@pytest.mark.parametrize(("cents", "credit"), [(1250, Decimal("12.5")), (0, None)])
 async def test_a_credit_shows_nothing_due_and_the_credit(
-    hass: HomeAssistant, session: FakeMeridianSession
+    hass: HomeAssistant,
+    session: FakeMeridianSession,
+    cents: int,
+    credit: Decimal | None,
 ) -> None:
-    session.balance = {**session.balance, "balance": 1250}
+    """A balance of nothing is no credit."""
+    session.balance = {**session.balance, "balance": cents}
     coordinator = coordinator_for(hass, session)
 
     data = await sync(coordinator, NOW, session)
 
     (result,) = data.account_results
     assert result.total_due == Decimal(0)
-    assert result.credit == Decimal("12.5")
+    assert result.credit == credit
 
 
 async def test_a_period_without_dates_asks_for_no_days(
