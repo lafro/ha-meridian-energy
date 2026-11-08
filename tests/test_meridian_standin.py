@@ -141,6 +141,8 @@ def test_a_scenario_round_trips_and_keeps_defaults() -> None:
     scenario = Scenario(
         accounts=("A-TEST-1", "A-TEST-2"),
         feed_in=("A-TEST-2",),
+        credit=("A-TEST-1",),
+        failing_figures=("billingPeriods", "days", "prices"),
         measurements_status=504,
         measurements_page="html",
         failing_directions=("GENERATION",),
@@ -151,6 +153,8 @@ def test_a_scenario_round_trips_and_keeps_defaults() -> None:
     assert Scenario.from_json({}) == Scenario()
     with pytest.raises(ValueError, match="json or html"):
         Scenario.from_json({"measurements_page": "xml"})
+    with pytest.raises(ValueError, match="failing_figures are among"):
+        Scenario.from_json({"failing_figures": ["balance"]})
 
 
 @pytest.mark.parametrize(
@@ -287,6 +291,55 @@ async def test_the_other_figures_are_answered_and_day_requests_journalled(
     ]
     assert journal[-1]["frequency"] == "DAY_INTERVAL"
     assert _refused(folder) == []
+
+
+async def test_figures_fail_and_an_account_is_in_credit_as_the_scenario_says(
+    standin: StandIn, folder: Path
+) -> None:
+    del standin
+    _scenario(
+        folder,
+        Scenario(
+            accounts=("A-TEST-1", "A-TEST-2"),
+            credit=("A-TEST-2",),
+            failing_figures=("billingPeriods", "days", "prices"),
+        ),
+    )
+    first, last = meridian_standin.billing_month(datetime.now(UTC))
+    days = _window("A-TEST-1") | {
+        "startOn": first.isoformat(),
+        "endOn": last.isoformat(),
+        "readingFrequencyType": "DAY_INTERVAL",
+        "last": 31,
+    }
+    account = {"accountNumber": "A-TEST-1", "propertyId": property_id("A-TEST-1")}
+    for url, body in (
+        (GRAPHQL_URL, _graphql("billingPeriods", account)),
+        (MEASUREMENTS_URL, _graphql(MEASUREMENTS_NAME, days)),
+        (web_app_url(GRAPHQL_URL, PRICES_NAME), _graphql(PRICES_NAME, account)),
+    ):
+        status, answer = await _post(url, json=body)
+        assert status == 503
+        assert json.loads(answer)["errors"]
+    hours = _graphql(MEASUREMENTS_NAME, _window("A-TEST-1"))
+    assert (await _post(MEASUREMENTS_URL, json=hours))[0] == 200
+    balances = []
+    for number in ("A-TEST-1", "A-TEST-2"):
+        status, answer = await _post(
+            web_app_url(GRAPHQL_URL, BALANCE_NAME),
+            json=_graphql(BALANCE_NAME, {"accountNumber": number}),
+        )
+        assert status == 200
+        balances.append(json.loads(answer)["data"]["account"]["balance"])
+    assert balances == [-4000, 1250]
+    assert [record["status"] for record in _journal(folder)] == [
+        503,
+        503,
+        503,
+        200,
+        200,
+        200,
+    ]
 
 
 async def test_measurements_fail_as_the_scenario_says(

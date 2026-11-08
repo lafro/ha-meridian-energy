@@ -26,8 +26,9 @@ Each journey drives Home Assistant through its REST and websocket APIs, as
 the frontend would, with the owner's token, and checks what came of it: the
 screens met, the config entry, its devices and sensors, the measurements
 windows the stand-in answered, repair notices, every line the integration
-logged above debug level, and its statistics hour by hour against what the
-stand-in sent. ``--only`` runs some
+logged above debug level, any warning Home Assistant's recorder, websocket
+API or sensor platform logged, and its statistics hour by hour against what
+the stand-in sent. ``--only`` runs some
 of them, in their usual order. Each check and each journey is printed as
 PASS or FAIL, and a report (markdown) with every check and every screen, as
 Home Assistant shows it, is written to the system's temporary directory. The
@@ -103,6 +104,23 @@ FIGURES = (
     "daily_charge",
     "anytime_price",
 )
+# Without a feed-in register: no export and no credit so far.
+FIGURES_WITHOUT_FEED_IN = tuple(
+    key for key in FIGURES if key not in {"bill_export", "bill_credit"}
+)
+BILL = ("bill_usage", "bill_cost", "bill_estimate")
+# Total due's credit when the stand-in has the account in credit, in dollars.
+CREDIT = standin.CREDIT_CENTS / 100
+# What the integration says when Meridian's own figures fail.
+BILLING_LOST = (
+    "Meridian Energy couldn't get the billing period; the billing period and bill "
+    "sensors show unknown until it can"
+)
+DAYS_LOST = (
+    "Meridian Energy couldn't get the bill's day totals; the bill sensors show "
+    "unknown until it can"
+)
+PRICES_UNANSWERED = "Meridian Energy couldn't get the prices; it asks again in a day"
 # The repair notice appears after this many failed updates in a row.
 NOTICE_AFTER = 3
 # The outage's answer to every measurements request, from a gateway.
@@ -134,6 +152,15 @@ LOG_LINE = re.compile(
     r"\(.*?\) \[(?P<name>[^\]]+)\] (?P<message>.*)$"
 )
 _FAKES = ("meridian_http.py", "kraken_fake.py")
+# Home Assistant's loggers whose warnings fail a journey: they say when a
+# state the integration wrote could not be recorded or shown, as when it
+# can't be written as JSON.
+WATCHED_LOGGERS = (
+    "homeassistant.components.recorder",
+    "homeassistant.components.websocket_api",
+    "homeassistant.components.sensor",
+)
+WARNING_LEVELS = frozenset({"WARNING", "ERROR", "CRITICAL"})
 
 
 class JourneyError(Exception):
@@ -731,8 +758,17 @@ class Journey:
         return LogMark(found.st_ino, found.st_size)
 
     def own_log(self, since: LogMark) -> list[tuple[str, str]]:
+        """Return the integration's log lines after ``since``: level, message."""
+        own = f"custom_components.{DOMAIN}"
+        return [
+            (level, message)
+            for name, level, message in self.log_lines(since)
+            if name == own or name.startswith(f"{own}.")
+        ]
+
+    def log_lines(self, since: LogMark) -> list[tuple[str, str, str]]:
         """
-        Return the integration's log lines after ``since``: level, message.
+        Return every log line after ``since``: logger, level, message.
 
         From the instance's log, where the integration logs at debug level.
         When a start has moved the marked log to ``LOG_FILE.1`` since, its
@@ -750,13 +786,11 @@ class Journey:
                     texts.append(log.read().decode(errors="replace"))
             except FileNotFoundError:
                 continue
-        own = f"custom_components.{DOMAIN}"
         return [
-            (line["level"], line["message"])
+            (line["name"], line["level"], line["message"])
             for text in texts
             for line in map(LOG_LINE.match, text.splitlines())
             if line is not None
-            and (line["name"] == own or line["name"].startswith(f"{own}."))
         ]
 
     def check_log(
@@ -766,7 +800,8 @@ class Journey:
         Check the integration's log lines above debug level since ``since``.
 
         They must be ``expected``, in order, and no other. Its debug lines
-        must be there too, so a log that could not be read fails.
+        must be there too, so a log that could not be read fails. Home
+        Assistant's watched loggers must have logged no warning either.
         """
         lines = self.own_log(since)
         loud = [(level, message) for level, message in lines if level != "DEBUG"]
@@ -781,6 +816,37 @@ class Journey:
             (shown(loud) or "nothing above debug level")
             if lines
             else f"no line from it in {LOG_FILE}",
+        )
+        self.check_warnings(when, since)
+
+    def check_warnings(
+        self, when: str, since: LogMark, *, every_logger: bool = False
+    ) -> None:
+        """Check that no watched logger, or none at all, logged a warning or worse."""
+        found = [
+            (name, level, message)
+            for name, level, message in self.log_lines(since)
+            if level in WARNING_LEVELS
+            and (
+                every_logger
+                or any(
+                    name == watched or name.startswith(f"{watched}.")
+                    for watched in WATCHED_LOGGERS
+                )
+            )
+        ]
+        self.check(
+            f"{when}: "
+            + (
+                "nothing logged a warning"
+                if every_logger
+                else "Home Assistant's recorder, websocket API and sensor logged "
+                "no warning"
+            ),
+            not found,
+            "; ".join(
+                f"{level} [{name}] {message}" for name, level, message in found[:3]
+            ),
         )
 
     def _log_file(self) -> Path:
@@ -942,6 +1008,36 @@ class Journey:
             for item in registry
             if item.get("config_entry_id") == entry_id and not item.get("disabled_by")
         }
+
+    def sensor(self, entry_id: str, key: str) -> dict[str, Any] | None:
+        """Return the state of the entry's enabled sensor with this key, or None."""
+        (registry,) = self.client.ws({"type": "config/entity_registry/list"})
+        entity = next(
+            (
+                item["entity_id"]
+                for item in registry
+                if item.get("config_entry_id") == entry_id
+                and item.get("translation_key") == key
+                and not item.get("disabled_by")
+            ),
+            None,
+        )
+        if entity is None:
+            return None
+        state: dict[str, Any] = self.client.rest("GET", f"/api/states/{entity}")
+        return state
+
+    def check_unknown(self, when: str, entry_id: str, figures: Iterable[str]) -> None:
+        """Check that each of these figures' sensors shows unknown."""
+        states = self.sensor_states(entry_id)
+        wanted = sorted(figures)
+        self.check(
+            f"{when}: "
+            + ", ".join(key.replace("_", " ") for key in wanted)
+            + " show unknown",
+            all(states.get(key) == "unknown" for key in wanted),
+            ", ".join(f"{key} {states.get(key)}" for key in wanted),
+        )
 
     def check_figures(self, entry_id: str, figures: Iterable[str]) -> None:
         """Check that each of the account's figures has a sensor with a value."""
@@ -1156,9 +1252,11 @@ def first_setup(j: Journey) -> None:
     13 windows of each direction, newest first, back to New Zealand midnight
     90 dates ago, imports them, and logs nothing above debug level. Every
     figure from Meridian has a value, the export and credit so far included.
+    The account is in credit: Total due is 0 and its credit a number, and
+    nothing in Home Assistant logs a warning about any state.
     """
     account = "A-JOURNEY-1"
-    j.scenario(Scenario(accounts=(account,), feed_in=(account,)))
+    j.scenario(Scenario(accounts=(account,), feed_in=(account,), credit=(account,)))
     mark = j.log_mark()
     done, started, ended = j.set_up("journey-1@example.com")
     entry_id = _created_at_once(j, done, ended - started)
@@ -1174,7 +1272,61 @@ def first_setup(j: Journey) -> None:
     now = datetime.now(UTC)
     j.check_entry(entry_id, {account: Expected(ended, now, now)}, feed_in=(account,))
     j.check_figures(entry_id, FIGURES)
+    due = j.sensor(entry_id, "total_due") or {}
+    credit = due.get("attributes", {}).get("credit")
+    j.check(
+        "in credit, Total due is 0 and its credit a number",
+        due.get("state") == "0" and credit == CREDIT,
+        f"{due.get('state')}, credit {credit!r}",
+    )
     j.check_log("the setup and the first sync", mark)
+    j.check_warnings("the setup and the first sync", mark, every_logger=True)
+
+
+def figures(j: Journey) -> None:
+    """
+    Meridian's own figures fail at the first sync, then come.
+
+    The first sync's billing period, bill day totals and prices requests
+    fail: the entry loads and its update works, the bill shows unknown, and
+    the integration says so and that it asks for the prices again in a day.
+    Each is next due hours later, so a reload asks again instead: with the
+    day totals still failing, the bill shows unknown and says so; with every
+    request answered, every figure has a value.
+    """
+    account = "A-JOURNEY-7"
+    failing = tuple(sorted(standin.FIGURES))
+    j.scenario(Scenario(accounts=(account,), failing_figures=failing))
+    mark = j.log_mark()
+    done, started, ended = j.set_up("journey-7@example.com")
+    entry_id = _created_at_once(j, done, ended - started)
+    coordinator = j.wait_synced(entry_id)
+    imported = datetime.now(UTC)
+    j.check(
+        "the first sync works while Meridian's own figures fail",
+        coordinator.get("last_update_success") is True,
+        f"last failure {coordinator.get('last_failure')}",
+    )
+    j.check_unknown("the first sync", entry_id, BILL)
+    j.check_log(
+        "the first sync", mark, [("INFO", BILLING_LOST), ("INFO", PRICES_UNANSWERED)]
+    )
+    steps = (
+        ("a reload with the day totals failing", ("days",), [("INFO", DAYS_LOST)]),
+        ("a reload with every request answered", (), []),
+    )
+    for when, still_failing, lines in steps:
+        j.scenario(Scenario(accounts=(account,), failing_figures=still_failing))
+        mark = j.log_mark()
+        j.client.rest("POST", f"/api/config/config_entries/entry/{entry_id}/reload")
+        coordinator = j.wait_synced(entry_id, coordinator.get("synced_at"))
+        if still_failing:
+            j.check_unknown(when, entry_id, BILL)
+            j.check_figures(entry_id, ("daily_charge", "anytime_price"))
+        else:
+            j.check_figures(entry_id, FIGURES_WITHOUT_FEED_IN)
+        j.check_log(when, mark, lines)
+    j.check_entry(entry_id, {account: Expected(ended, imported, datetime.now(UTC))})
 
 
 def outage(j: Journey) -> None:
@@ -1404,6 +1556,7 @@ def restart(j: Journey, relaunch: Callable[[], None]) -> None:
 
 JOURNEYS: dict[str, str] = {
     "first_setup": "First-time setup with a feed-in register, the history",
+    "figures": "Meridian's own figures fail at the first sync, then come",
     "outage": "Meridian times out from the start, the notice, then the history",
     "two_accounts": "Two accounts on one login, both followed",
     "reauth": "Meridian ends the sign-in, reconnect",

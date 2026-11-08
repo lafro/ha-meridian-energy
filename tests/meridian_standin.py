@@ -37,11 +37,12 @@ installed in.
 
 The scenario is read from ``scenario.json`` in the folder on each request,
 so the runner can change it between steps without any API (``Scenario``):
-the login's accounts and which have a feed-in register, measurements that
-fail with a status (a JSON error, or an HTML page as a gateway sends, with
-a Retry-After header when asked, as for a rate limit), and a session
-Meridian has ended (every authenticated request refused with 401
-and the session refresh rejected with 400).
+the login's accounts, which have a feed-in register and which are in
+credit, measurements that fail with a status (a JSON error, or an HTML page
+as a gateway sends, with a Retry-After header when asked, as for a rate
+limit), Meridian's own figures that fail, and a session Meridian has ended
+(every authenticated request refused with 401 and the session refresh
+rejected with 400).
 
 The data is a function of the hour alone (``hour_reading``, ``hour_cost``),
 from a fixed ``HISTORY_START`` to the end of today in New Zealand, whatever
@@ -49,7 +50,7 @@ the time of the request or the requests before it, so a restarted Home
 Assistant sees the same history. Neighbouring hours differ, so an hour
 shifted or counted twice shows in the statistics. The billing period is the
 current New Zealand calendar month; the balance and the prices are the
-fake's.
+fake's, but an account in credit has $12.50 in credit.
 """
 
 from __future__ import annotations
@@ -113,6 +114,12 @@ _JOURNALLED = {
     "end_on": "endOn",
     "frequency": "readingFrequencyType",
 }
+# The figures a scenario can fail: the bill's day totals are ``days``.
+FIGURES = frozenset({"billingPeriods", "days", "prices"})
+DAY_FREQUENCY = "DAY_INTERVAL"
+SERVICE_UNAVAILABLE = 503
+# The balance of an account in credit, in cents.
+CREDIT_CENTS = 1250
 _GATEWAY_PAGE = (
     b"<html><head><title>504 Gateway Time-out</title></head>"
     b"<body><h1>504 Gateway Time-out</h1><p>Synthetic gateway page.</p>"
@@ -144,12 +151,15 @@ class Scenario:
     for ``failing_directions`` get: with a JSON error body, or with
     ``measurements_page`` "html", a gateway's HTML page; ``retry_after``,
     when set, adds a Retry-After header of that many seconds, as a 429
-    carries. ``session_ended`` refuses every authenticated request (401) and
+    carries. ``failing_figures`` (any of ``FIGURES``) get a 503 with a JSON
+    error. ``session_ended`` refuses every authenticated request (401) and
     rejects the session refresh (400), as when Meridian ends the sign-in.
     """
 
     accounts: tuple[str, ...] = ("A-TEST-1",)
     feed_in: tuple[str, ...] = ()
+    credit: tuple[str, ...] = ()
+    failing_figures: tuple[str, ...] = ()
     measurements_status: int | None = None
     measurements_page: str = "json"
     failing_directions: tuple[str, ...] = (CONSUMPTION, GENERATION)
@@ -165,11 +175,16 @@ class Scenario:
         page = str(data.get("measurements_page", default.measurements_page))
         if page not in {"json", "html"}:
             raise ValueError("measurements_page is json or html")
+        figures = tuple(str(item) for item in data.get("failing_figures", ()))
+        if not FIGURES.issuperset(figures):
+            raise ValueError(f"failing_figures are among {sorted(FIGURES)}")
         return cls(
             accounts=tuple(
                 str(item) for item in data.get("accounts", default.accounts)
             ),
             feed_in=tuple(str(item) for item in data.get("feed_in", default.feed_in)),
+            credit=tuple(str(item) for item in data.get("credit", default.credit)),
+            failing_figures=figures,
             measurements_status=None if status is None else int(status),
             measurements_page=page,
             failing_directions=tuple(
@@ -361,6 +376,20 @@ def _graphql_answer(
             {"error": "synthetic session ended"}, status=401
         )
         return response
+    days = variables.get("readingFrequencyType") == DAY_FREQUENCY
+    if ("days" if operation == "measurements" and days else operation) in (
+        scenario.failing_figures
+    ):
+        failed: Response = http.json_response(
+            {"errors": [{"message": "synthetic service error"}]},
+            status=SERVICE_UNAVAILABLE,
+        )
+        return failed
+    if operation == "balance" and variables.get("accountNumber") in scenario.credit:
+        account = http.balance_data(datetime.now(_NZ).date())
+        account["balance"] = CREDIT_CENTS
+        credit: Response = http.json_response({"data": {"account": account}})
+        return credit
     if (
         operation == "measurements"
         and scenario.measurements_status is not None
