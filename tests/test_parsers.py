@@ -127,8 +127,12 @@ def _edges(*nodes: dict[str, Any]) -> dict[str, Any]:
     return {"edges": [{"node": node} for node in nodes]}
 
 
-def test_the_balance_picks_the_newest_bill_and_payments_by_date() -> None:
-    """Shuffled answers; nodes without a date are left out."""
+def test_the_balance_keeps_dated_bills_and_payments_in_answer_order() -> None:
+    """
+    The parser keeps Meridian's order, leaving out nodes without a date.
+
+    The coordinator chooses the last bill and payment.
+    """
     balance = parse_balance(
         {
             "balance": -12345,

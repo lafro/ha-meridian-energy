@@ -108,6 +108,36 @@ async def test_a_first_sync_gets_every_figure(
     assert data.requests == 13 + 1
 
 
+async def test_the_last_payment_is_the_newest_made_by_today(
+    hass: HomeAssistant, session: FakeMeridianSession
+) -> None:
+    """Meridian's order of payments is not by date: the newest by today is chosen."""
+
+    def payment(cents: int, days_ago: int, status: str) -> dict[str, Any]:
+        paid_on = (TODAY - days_ago * DAY).isoformat()
+        return {"node": {"amount": cents, "paymentDate": paid_on, "status": status}}
+
+    session.balance = {
+        **session.balance,
+        "payments": {
+            "edges": [
+                payment(4000, 40, "CLEARED"),
+                payment(6000, -5, "REQUESTED"),
+                payment(8000, 0, "CLEARED"),
+                payment(7000, 70, "CLEARED"),
+                payment(5000, 10, "CLEARED"),
+            ]
+        },
+    }
+    coordinator = coordinator_for(hass, session)
+
+    data = await sync(coordinator, NOW, session)
+
+    assert data.account_results[0].last_payment == MeridianPayment(
+        amount_cents=8000, paid_on=TODAY, status="CLEARED"
+    )
+
+
 async def test_a_meter_with_two_registers_sums_both_over_two_pages(
     hass: HomeAssistant, session: FakeMeridianSession
 ) -> None:
