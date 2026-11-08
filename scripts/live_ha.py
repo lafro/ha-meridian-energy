@@ -22,7 +22,9 @@ contained:
   needs (the frontend, history, Energy and the integration) on top of the
   integrations Home Assistant always loads. Nothing that discovers or
   announces devices on the network loads, nor the cloud or mobile-app
-  integrations, and analytics stays off.
+  integrations, and analytics stays off. Home Assistant's Marketplace (2026.11
+  and later), which fetches its catalog over the network, is turned off
+  before the first start, as a user would turn it off.
 - Onboarding creates the owner through the API, with a random password that
   is not kept, and skips the step that adds the weather, radio and shopping
   list integrations. A browser on this computer is signed in without a
@@ -69,7 +71,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Iterable, Mapping
 
 ROOT = Path(__file__).resolve().parents[1]
 HOST = "127.0.0.1"
@@ -86,9 +88,15 @@ KILL_TIMEOUT_S = 10
 # Unprivileged ports only: a port Home Assistant cannot bind sends it into
 # recovery mode, whose defaults listen on every address.
 PORTS = range(1024, 65536)
-# The form of the web-server store this script writes. A release that keeps
-# its settings any other way would ignore it and listen on every address.
-HTTP_STORE_VERSION = (2, 2)
+# The forms of the web-server store this script writes, by store version,
+# each with its release's default TLS profile (no certificate is set, so the
+# profile is never used). 3.1 (Home Assistant 2026.11) renamed the profiles.
+# A release that keeps its settings any other way would ignore the store and
+# listen on every address.
+HTTP_STORES: dict[tuple[int, int], str] = {
+    (2, 2): "modern",
+    (3, 1): "intermediate_v6",
+}
 # Integrations that discover or announce devices, or reach past this
 # computer. None of them may load. (Home Assistant always loads analytics,
 # which sends nothing unless someone opts in, and network, which only lists
@@ -118,6 +126,13 @@ NOT_ALLOWED = frozenset(
 )
 # The config entries Home Assistant creates on its own.
 SYSTEM_ENTRIES = frozenset({"analytics", "backup"})
+# Home Assistant's own integrations whose config entry would reach past this
+# computer: the Marketplace (2026.11 and later) fetches its catalog over the
+# network. Each one a release has gets an entry turned off, as a user would,
+# before the first start, so it is never set up; it must stay off.
+DISABLED_ENTRIES = frozenset({"marketplace"})
+# The form of the config-entries store those are written in.
+CONFIG_ENTRIES_STORE = (1, 5)
 # SSDP and DHCP discovery ports. Not mDNS (5353): Home Assistant's web client
 # listens there to look up ``.local`` names, and announcing Home Assistant is
 # the zeroconf integration's job, which must not load.
@@ -383,8 +398,44 @@ def http_store_version(python: Path) -> tuple[int, int] | None:
     return major, minor
 
 
-def install_home_assistant(state: Path, version: str | None) -> str:
-    """Create the instance's own environment and return the installed version."""
+def integrations_present(python: Path, domains: Iterable[str]) -> frozenset[str]:
+    """
+    Return which of these built-in integrations the release ``python`` runs has.
+
+    A check that fails stops the build: an integration it missed would not be
+    turned off.
+    """
+    names = sorted(domains)
+    result = subprocess.run(  # noqa: S603
+        [
+            python,
+            "-c",
+            (
+                "import importlib.util, sys; print(*(d for d in sys.argv[1:] if "
+                "importlib.util.find_spec(f'homeassistant.components.{d}')))"
+            ),
+            *names,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise SystemExit(
+            f"Could not check whether Home Assistant has {', '.join(names)}, so "
+            "the instance cannot be shown to be contained"
+        )
+    return frozenset(result.stdout.split())
+
+
+def install_home_assistant(
+    state: Path, version: str | None
+) -> tuple[str, tuple[int, int]]:
+    """
+    Create the instance's own environment.
+
+    Return the installed version and the form of its web-server store.
+    """
     venv = state / "venv"
     # --no-config: the repository's own uv settings, such as a test pin of
     # Home Assistant, must not decide what the instance runs.
@@ -397,12 +448,12 @@ def install_home_assistant(state: Path, version: str | None) -> str:
         "-c",
         "from homeassistant.const import __version__; print(__version__)",
     )
-    if (stored := http_store_version(python)) != HTTP_STORE_VERSION:
+    if (stored := http_store_version(python)) not in HTTP_STORES:
         raise SystemExit(
             f"Home Assistant {installed} stores its web-server settings in another "
             f"form ({stored}), so this script cannot keep it to {HOST}"
         )
-    return installed
+    return installed, stored
 
 
 def wait_for(
@@ -472,7 +523,7 @@ def write_onboarding_store(config: Path) -> None:
     )
 
 
-def http_settings(port: int) -> dict[str, Any]:
+def http_settings(port: int, profile: str) -> dict[str, Any]:
     """Return the confirmed web-server settings: this computer only."""
     return {
         "server_host": [HOST],
@@ -480,7 +531,7 @@ def http_settings(port: int) -> dict[str, Any]:
         "cors_allowed_origins": [],
         "login_attempts_threshold": -1,
         "ip_ban_enabled": True,
-        "ssl_profile": "modern",
+        "ssl_profile": profile,
         "use_x_frame_options": True,
         "created_at": "2026-01-01T00:00:00+00:00",
         "error": None,
@@ -488,9 +539,13 @@ def http_settings(port: int) -> dict[str, Any]:
     }
 
 
-def write_http_store(config: Path, port: int) -> None:
-    """Store the web-server settings as confirmed, so nothing can revert them."""
-    major, minor = HTTP_STORE_VERSION
+def write_http_store(config: Path, port: int, form: tuple[int, int]) -> None:
+    """
+    Store the web-server settings as confirmed, so nothing can revert them.
+
+    ``form`` is the store version of the release installed (``HTTP_STORES``).
+    """
+    major, minor = form
     (config / ".storage" / "http").write_text(
         json.dumps(
             {
@@ -498,10 +553,54 @@ def write_http_store(config: Path, port: int) -> None:
                 "minor_version": minor,
                 "key": "http",
                 "data": {
-                    "stable": http_settings(port),
+                    "stable": http_settings(port, HTTP_STORES[form]),
                     "pending": None,
                     "yaml_migration_done": True,
                 },
+            }
+        )
+    )
+
+
+def write_disabled_entries(config: Path, domains: Iterable[str]) -> None:
+    """
+    Store a config entry for each domain, turned off by the user.
+
+    Written before the first start, so Home Assistant never sets them up and
+    starts no flow to create them. Nothing is written for no domain.
+    """
+    created = "2026-01-01T00:00:00+00:00"
+    entries: list[dict[str, Any]] = [
+        {
+            "created_at": created,
+            "data": {},
+            "discovery_keys": {},
+            "disabled_by": "user",
+            "domain": domain,
+            "entry_id": secrets.token_hex(13),
+            "minor_version": 1,
+            "modified_at": created,
+            "options": {},
+            "pref_disable_new_entities": False,
+            "pref_disable_polling": False,
+            "source": "system",
+            "subentries": [],
+            "title": "",
+            "unique_id": None,
+            "version": 1,
+        }
+        for domain in sorted(domains)
+    ]
+    if not entries:
+        return
+    major, minor = CONFIG_ENTRIES_STORE
+    (config / ".storage" / "core.config_entries").write_text(
+        json.dumps(
+            {
+                "version": major,
+                "minor_version": minor,
+                "key": "core.config_entries",
+                "data": {"entries": entries},
             }
         )
     )
@@ -626,7 +725,12 @@ def check_contained(
     if forbidden := sorted(loaded & NOT_ALLOWED):
         raise SystemExit(f"Integrations that must not load are loaded: {forbidden}")
     entries = call(port, "GET", "/api/config/config_entries/entry", token=token)
-    if extra := sorted({entry["domain"] for entry in entries} - allowed_entries):
+    domains = {
+        entry["domain"]
+        for entry in entries
+        if not (entry["domain"] in DISABLED_ENTRIES and entry.get("disabled_by"))
+    }
+    if extra := sorted(domains - allowed_entries):
         raise SystemExit(f"Unexpected config entries: {extra}")
     if not analytics_off(state / "config"):
         raise SystemExit("Analytics is turned on")
@@ -656,10 +760,13 @@ def build(state: Path, domain: str, ref: str | None, version: str | None) -> str
     source = install_integration(state, domain, ref)
     say(f"Integration {domain}: {source}")
     say("Installing Home Assistant (the first run downloads it)...")
-    installed = install_home_assistant(state, version)
-    (state / "config" / "configuration.yaml").write_text(configuration_yaml(domain))
-    write_onboarding_store(state / "config")
-    write_http_store(state / "config", int((state / "port").read_text()))
+    installed, form = install_home_assistant(state, version)
+    config = state / "config"
+    (config / "configuration.yaml").write_text(configuration_yaml(domain))
+    write_onboarding_store(config)
+    write_http_store(config, int((state / "port").read_text()), form)
+    python = state / "venv" / "bin" / "python"
+    write_disabled_entries(config, integrations_present(python, DISABLED_ENTRIES))
     return installed
 
 
