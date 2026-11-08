@@ -14,22 +14,15 @@ failures alone, while the reconciliation keeps its own wait. A unit that
 skips a reconciliation, while it waits or because the time budget did not
 reach it, owes it too. Until a first sync has succeeded, its own retries
 are spaced out instead, and every attempt tries each unit. All of it is
-kept in memory only: a restart starts every unit afresh, as before, except
-that the setup import hands what it remembers to the new entry
-(``SyncMemory``).
+kept in memory only: a restart starts every unit afresh.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from typing import TYPE_CHECKING
 
-from .models import MeridianMeasurement, SyncMode
-
-if TYPE_CHECKING:
-    from .lanes import LaneState
+from .models import SyncMode
 
 STATUS_PENDING = "pending"
 STATUS_OK = "ok"
@@ -324,46 +317,3 @@ class UnitState:
 def _before(at: datetime | None, now: datetime) -> bool:
     """Return whether a wait that ends at ``at`` has not passed by ``now``."""
     return at is not None and now < at - _EARLY_START
-
-
-@dataclass(frozen=True, slots=True)
-class SyncMemory:
-    """
-    What one coordinator remembers of its units, for another to go on from.
-
-    The setup import hands it to the new entry's coordinator: each unit's
-    state, so a unit that failed in setup is not reported as failing again,
-    and one setup found quiet is not searched again at once; the rows it
-    imported in the last 14 days, so the provisional ones are counted and
-    revised as they would be after a restart; the rows an hour holds; and
-    the units whose initial import searched every window it planned
-    (``searched``), so one that found nothing, as for a supply that ended
-    or an export register that never exported, is not searched again at
-    once either; and, for a unit whose replay reached back more than 14
-    days and was not confirmed, the oldest hour it wrote (``unconfirmed``),
-    so the entry's walks reach back to it; and what each unit's walk showed
-    of its history (``lanes``), as where it starts, so the entry's coverage
-    does not ask for it again (``lanes.LaneState``).
-    """
-
-    unit_states: Mapping[tuple[str, str], UnitState]
-    measurements: Mapping[
-        tuple[str, str], Mapping[tuple[datetime, str], MeridianMeasurement]
-    ]
-    row_density: Mapping[tuple[str, str], float]
-    searched: frozenset[tuple[str, str]] = frozenset()
-    unconfirmed: Mapping[tuple[str, str], datetime] = field(default_factory=dict)
-    lanes: Mapping[tuple[str, str], LaneState] = field(default_factory=dict)
-
-    def copy(self) -> SyncMemory:
-        """Return a copy that shares no mutable state with this one."""
-        return SyncMemory(
-            unit_states={
-                key: replace(state) for key, state in self.unit_states.items()
-            },
-            measurements={key: dict(rows) for key, rows in self.measurements.items()},
-            row_density=dict(self.row_density),
-            searched=frozenset(self.searched),
-            unconfirmed=dict(self.unconfirmed),
-            lanes={key: lane.copy() for key, lane in self.lanes.items()},
-        )

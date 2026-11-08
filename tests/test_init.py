@@ -50,7 +50,6 @@ from custom_components.meridian_energy.api import (
 from custom_components.meridian_energy.const import (
     CONF_FIREBASE_USER_ID,
     CONF_REFRESH_TOKEN,
-    CONF_SELECTED_ACCOUNTS,
     DOMAIN,
     UNCONFIRMED_REPLAYS,
     UNSAVED_COVERAGE,
@@ -71,7 +70,7 @@ from custom_components.meridian_energy.statistics import _energy_metadata, accou
 
 def _entry(
     *,
-    version: int = 3,
+    version: int = 4,
     minor_version: int = 1,
     data: dict[str, object] | None = None,
 ) -> MockConfigEntry:
@@ -79,7 +78,6 @@ def _entry(
         "email": "person@example.com",
         CONF_REFRESH_TOKEN: "old-refresh",
         CONF_FIREBASE_USER_ID: "old-user",
-        CONF_SELECTED_ACCOUNTS: ["synthetic-account"],
     }
     return MockConfigEntry(
         domain=DOMAIN,
@@ -232,39 +230,6 @@ async def test_setup_entry_and_rotating_token_persistence(hass) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("selected_accounts", "error"),
-    [(None, KeyError), ([], ValueError)],
-)
-async def test_setup_rejects_invalid_account_selection_before_creating_client(
-    hass, selected_accounts, error
-) -> None:
-    """Reject malformed current entries before client or recorder work begins."""
-    data = {
-        "email": "person@example.com",
-        CONF_REFRESH_TOKEN: "old-refresh",
-        CONF_FIREBASE_USER_ID: "old-user",
-    }
-    if selected_accounts is not None:
-        data[CONF_SELECTED_ACCOUNTS] = selected_accounts
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        data=data,
-        version=3,
-    )
-    entry.add_to_hass(hass)
-
-    with (
-        patch(
-            "custom_components.meridian_energy.MeridianApiClient",
-            side_effect=AssertionError("client construction is a setup side effect"),
-        ),
-        pytest.raises(error),
-    ):
-        await async_setup_entry(hass, entry)
-
-
-@pytest.mark.asyncio
 async def test_setup_defers_first_sync_until_home_assistant_started(
     hass, caplog
 ) -> None:
@@ -388,97 +353,61 @@ async def test_removing_an_entry_forgets_its_unconfirmed_replays(hass) -> None:
     assert list(unsaved) == [other.entry_id]
 
 
-@pytest.mark.asyncio
-async def test_migrate_completed_v024_entry_to_clean_minor_version(hass) -> None:
-    entry = _entry(
-        minor_version=0,
-        data={
-            "email": "person@example.com",
-            CONF_REFRESH_TOKEN: "old-refresh",
-            CONF_FIREBASE_USER_ID: "old-user",
-            CONF_SELECTED_ACCOUNTS: ["synthetic-account"],
-            "statistics_state_version": 1,
-        },
-    )
-    entry.add_to_hass(hass)
-
-    assert await async_migrate_entry(hass, entry) is True
-    assert entry.version == 3
-    assert entry.minor_version == 1
-    assert "statistics_state_version" not in entry.data
+# What an entry before version 4 held: the accounts it was set up to import.
+_VERSION_3_DATA = {
+    "email": "person@example.com",
+    CONF_REFRESH_TOKEN: "old-refresh",
+    CONF_FIREBASE_USER_ID: "old-user",
+    "selected_accounts": ["synthetic-account"],
+    "auto_add_accounts": True,
+}
 
 
 @pytest.mark.asyncio
-async def test_migrate_accepts_clean_v025_entry(hass) -> None:
-    assert await async_migrate_entry(hass, _entry()) is True
-
-
-@pytest.mark.asyncio
-async def test_migrate_keeps_a_newer_minor_version_loadable(hass) -> None:
-    """A rollback to this release still loads an entry from a later 3.x release."""
-    entry = _entry(minor_version=2)
-    original_data = dict(entry.data)
-
-    assert await async_migrate_entry(hass, entry) is True
-
-    assert entry.version == 3
-    assert entry.minor_version == 2
-    assert dict(entry.data) == original_data
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("minor_version", "data"),
-    [
-        (
-            0,
-            {
-                "email": "person@example.com",
-                CONF_REFRESH_TOKEN: "old-refresh",
-                CONF_FIREBASE_USER_ID: "old-user",
-                "statistics_state_version": 1,
-            },
-        ),
-        (
-            0,
-            {
-                "email": "person@example.com",
-                CONF_REFRESH_TOKEN: "old-refresh",
-                CONF_FIREBASE_USER_ID: "old-user",
-                CONF_SELECTED_ACCOUNTS: ["synthetic-account"],
-                "statistics_state_version": True,
-            },
-        ),
-    ],
-)
-async def test_migrate_rejects_incomplete_or_malformed_entry(
-    hass, minor_version, data
+@pytest.mark.parametrize(("version", "minor_version"), [(1, 1), (2, 1), (3, 0), (3, 1)])
+async def test_migrate_refuses_entries_set_up_before_version_4(
+    hass, version: int, minor_version: int
 ) -> None:
-    entry = _entry(minor_version=minor_version, data=data)
-    original_data = dict(entry.data)
+    """
+    An entry an earlier version set up is set up again, not converted.
+
+    It chose its accounts and imported in the setup flow; this version
+    follows every account and imports in the background.
+    """
+    entry = _entry(
+        version=version, minor_version=minor_version, data=dict(_VERSION_3_DATA)
+    )
 
     with pytest.raises(ConfigEntryError) as raised:
         await async_migrate_entry(hass, entry)
 
     assert raised.value.translation_domain == DOMAIN
-    assert raised.value.translation_key == "migration_incomplete_entry"
-    assert entry.minor_version == minor_version
+    assert raised.value.translation_key == "entry_too_old"
+    assert (entry.version, entry.minor_version) == (version, minor_version)
+    assert dict(entry.data) == _VERSION_3_DATA
+
+
+@pytest.mark.asyncio
+async def test_migrate_accepts_a_current_entry(hass) -> None:
+    assert await async_migrate_entry(hass, _entry()) is True
+
+
+@pytest.mark.asyncio
+async def test_migrate_keeps_a_newer_minor_version_loadable(hass) -> None:
+    """A rollback to this release still loads an entry from a later 4.x release."""
+    entry = _entry(minor_version=2)
+    original_data = dict(entry.data)
+
+    assert await async_migrate_entry(hass, entry) is True
+
+    assert entry.version == 4
+    assert entry.minor_version == 2
     assert dict(entry.data) == original_data
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("version", [1, 2])
-async def test_migrate_entry_rejects_unsupported_major_versions(hass, version) -> None:
-    with pytest.raises(ConfigEntryError) as raised:
-        await async_migrate_entry(hass, _entry(version=version))
-
-    assert raised.value.translation_key == "migration_unsupported_version"
-    assert raised.value.translation_placeholders == {"version": f"{version}.1"}
-
-
-@pytest.mark.asyncio
 async def test_manual_device_removal_only_allows_stale_meridian_devices(hass) -> None:
-    entry = _entry(version=3)
+    entry = _entry()
     coordinator = MagicMock()
     coordinator.accounts = (MeridianAccount("active", "ACTIVE", ()),)
     entry.runtime_data = MeridianRuntimeData(MagicMock(), coordinator)
@@ -501,65 +430,22 @@ class TestPublicConfigEntryLifecycle:
         del recorder_db_url
 
     @pytest.mark.asyncio
-    async def test_completed_v024_entry_migrates_and_preserves_statistics(
+    async def test_a_version_3_entry_stops_at_migration_error(
         self, recorder_mock, hass
     ) -> None:
-        """Load a completed v0.2.4 entry without reconstructing its history."""
+        """
+        An entry an earlier version set up stops before setup touches anything.
+
+        Its statistics stay as they were, for the entry set up again to
+        continue.
+        """
         del recorder_mock
-        entry = _entry(
-            minor_version=0,
-            data={
-                "email": "person@example.com",
-                CONF_REFRESH_TOKEN: "old-refresh",
-                CONF_FIREBASE_USER_ID: "old-user",
-                CONF_SELECTED_ACCOUNTS: ["synthetic-account"],
-                "statistics_state_version": 1,
-            },
-        )
+        entry = _entry(version=3, data=dict(_VERSION_3_DATA))
         entry.add_to_hass(hass)
         stat_id = "meridian_energy:consumption_migration_gate"
-        metadata = _energy_metadata(stat_id, "Migration gate")
         ha_async_add_external_statistics(
             hass,
-            metadata,
-            [{"start": datetime(2026, 8, 1, tzinfo=UTC), "state": 2.5, "sum": 7.5}],
-        )
-        instance = get_instance(hass)
-        await async_recorder_block_till_done(hass)
-        before = await instance.async_add_executor_job(
-            ha_get_last_statistics, hass, 1, stat_id, False, {"state", "sum"}
-        )
-
-        with _patched_meridian(lambda: (_account(),), _sync_data):
-            assert await hass.config_entries.async_setup(entry.entry_id)
-            await hass.async_block_till_done(wait_background_tasks=True)
-
-        after = await instance.async_add_executor_job(
-            ha_get_last_statistics, hass, 1, stat_id, False, {"state", "sum"}
-        )
-        assert entry.state is ConfigEntryState.LOADED
-        assert entry.minor_version == 1
-        assert "statistics_state_version" not in entry.data
-        assert after == before
-
-    @pytest.mark.asyncio
-    async def test_incomplete_v024_entry_stops_at_migration_error(
-        self, recorder_mock, hass
-    ) -> None:
-        """Block a pre-floor entry before integration setup can touch history."""
-        del recorder_mock
-        data = {
-            "email": "person@example.com",
-            CONF_REFRESH_TOKEN: "old-refresh",
-            CONF_FIREBASE_USER_ID: "old-user",
-            CONF_SELECTED_ACCOUNTS: ["synthetic-account"],
-        }
-        entry = _entry(minor_version=0, data=data)
-        entry.add_to_hass(hass)
-        stat_id = "meridian_energy:consumption_incomplete_migration_gate"
-        ha_async_add_external_statistics(
-            hass,
-            _energy_metadata(stat_id, "Incomplete migration gate"),
+            _energy_metadata(stat_id, "Migration gate"),
             [{"start": datetime(2026, 8, 1, tzinfo=UTC), "state": 3.0, "sum": 9.0}],
         )
         instance = get_instance(hass)
@@ -576,12 +462,40 @@ class TestPublicConfigEntryLifecycle:
             await hass.async_block_till_done()
 
         assert entry.state is ConfigEntryState.MIGRATION_ERROR
-        assert entry.error_reason_translation_key == "migration_incomplete_entry"
-        assert dict(entry.data) == data
+        assert entry.error_reason_translation_key == "entry_too_old"
+        assert entry.version == 3
+        assert dict(entry.data) == _VERSION_3_DATA
         after = await instance.async_add_executor_job(
             ha_get_last_statistics, hass, 1, stat_id, False, {"state", "sum"}
         )
         assert after == before
+
+    @pytest.mark.asyncio
+    async def test_a_login_with_no_account_retries_setup(
+        self, recorder_mock, hass
+    ) -> None:
+        """
+        No active or dormant account makes Home Assistant try setup again.
+
+        Its reason says so, rather than that Meridian sent data it could not
+        use.
+        """
+        del recorder_mock
+        entry = _entry()
+        entry.add_to_hass(hass)
+        client = MagicMock()
+        client.async_get_accounts = AsyncMock(return_value=())
+
+        with patch(
+            "custom_components.meridian_energy.MeridianApiClient", return_value=client
+        ):
+            assert not await hass.config_entries.async_setup(entry.entry_id)
+            await hass.async_block_till_done()
+
+        assert entry.state is ConfigEntryState.SETUP_RETRY
+        assert entry.error_reason_translation_key == "no_accounts"
+        client.async_get_accounts.assert_awaited_once()
+        assert await hass.config_entries.async_unload(entry.entry_id)
 
     @pytest.mark.asyncio
     async def test_newer_minor_version_entry_sets_up_after_rollback(
@@ -608,7 +522,7 @@ class TestPublicConfigEntryLifecycle:
         """Snapshot every entity's registry entry and state for a feed-in account."""
         del recorder_mock
         freezer.move_to("2026-07-15T01:00:00+00:00")
-        entry = _entry(version=3)
+        entry = _entry()
         entry.add_to_hass(hass)
 
         def _data() -> MeridianSyncData:
@@ -644,7 +558,7 @@ class TestPublicConfigEntryLifecycle:
     async def test_load_reload_and_unload(self, recorder_mock, hass) -> None:
         """Load, reload, and unload through Home Assistant's public APIs."""
         del recorder_mock
-        entry = _entry(version=3)
+        entry = _entry()
         entry.add_to_hass(hass)
         topology = {"feed_in": True}
 
@@ -723,7 +637,7 @@ class TestPublicConfigEntryLifecycle:
     ) -> None:
         """Entities appear unavailable at once and fill in when the sync ends."""
         del recorder_mock
-        entry = _entry(version=3)
+        entry = _entry()
         entry.add_to_hass(hass)
         sync_started = asyncio.Event()
         release_sync = asyncio.Event()
@@ -771,7 +685,7 @@ class TestPublicConfigEntryLifecycle:
         self, recorder_mock, hass
     ) -> None:
         del recorder_mock
-        entry = _entry(version=3)
+        entry = _entry()
         entry.add_to_hass(hass)
 
         with patch.object(
@@ -791,7 +705,7 @@ class TestPublicConfigEntryLifecycle:
         self, recorder_mock, hass
     ) -> None:
         del recorder_mock
-        entry = _entry(version=3)
+        entry = _entry()
         entry.add_to_hass(hass)
 
         with patch.object(

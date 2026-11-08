@@ -23,16 +23,18 @@ from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from custom_components.meridian_energy.api import (
     MeridianGraphQLError,
-    MeridianUpstreamError,
 )
 from custom_components.meridian_energy.const import (
     FIRST_SYNC_RETRY_SCHEDULE,
     POLL_BUDGET_SECONDS,
     REVISION_OVERLAP,
-    SETUP_IMPORT_BUDGET_SECONDS,
 )
 from custom_components.meridian_energy.coordinator import MeridianDataCoordinator
-from custom_components.meridian_energy.models import MeridianAccount, SyncMode
+from custom_components.meridian_energy.models import (
+    MeridianAccount,
+    MeridianBillingPeriod,
+    SyncMode,
+)
 from custom_components.meridian_energy.statistics import (
     StatisticsAnchorError,
     StatisticsWriteError,
@@ -57,6 +59,7 @@ from .test_coordinator_units import (
     _client,
     _Clock,
     _gateway_timeout,
+    _hourly,
     _messages,
     _property,
     _Request,
@@ -1091,9 +1094,7 @@ async def test_a_failed_setup_names_the_request_of_the_failure_it_raises(
     )
 
     with _running(clock), pytest.raises(UpdateFailed) as raised:
-        await coordinator.async_fetch_and_import(
-            setup_import=True, time_budget=SETUP_IMPORT_BUDGET_SECONDS
-        )
+        await coordinator.async_fetch_and_import(time_budget=POLL_BUDGET_SECONDS)
 
     assert raised.value.translation_key == "invalid_data"
     assert isinstance(raised.value.__cause__, MeridianGraphQLError)
@@ -1106,83 +1107,37 @@ async def test_a_failed_setup_names_the_request_of_the_failure_it_raises(
     assert call.finished_at is None
 
 
-@pytest.mark.parametrize("degraded", ["CONSUMPTION", "GENERATION"])
-@pytest.mark.parametrize("cause", ["older_week", "time_budget"])
-@pytest.mark.asyncio
-async def test_a_failed_setup_raises_the_failure_that_kept_it_from_finishing(
-    hass, degraded: str, cause: str
-) -> None:
-    """
-    Setup fails with the failure of the direction that missed its newest week.
-
-    One direction imports its newest week, then stops at an older week with
-    unusable data, or once the time budget runs out at 40 s a request: it is
-    degraded, which does not keep setup from finishing. The other fails at
-    its newest week with Meridian's service error, and that is the failure
-    setup raises and the request it names, in either order of the two, so
-    that the form offers to continue without history.
-    """
-    blocking = "GENERATION" if degraded == "CONSUMPTION" else "CONSUMPTION"
-    clock = _Clock()
-    service = _service(clock)
-    if cause == "time_budget":
-        service.latency = 40.0
-
-    def fail(request: _Request) -> BaseException | None:
-        if request.direction == blocking:
-            return _unavailable()
-        if cause == "older_week" and request.end_on < TODAY:
-            return MeridianGraphQLError("measurements", ("UNKNOWN",))
-        return None
-
-    service.fail = fail
-    coordinator = MeridianDataCoordinator(
-        hass, _client(service, _account(feed_in=True))
-    )
-
-    with _running(clock), pytest.raises(UpdateFailed) as raised:
-        await coordinator.async_fetch_and_import(
-            setup_import=True, time_budget=SETUP_IMPORT_BUDGET_SECONDS
-        )
-
-    assert {unit.cache_key[1]: unit.outcome for unit in coordinator._run_units} == {
-        degraded: "degraded",
-        blocking: "failed",
-    }
-    assert raised.value.translation_key == "upstream_unavailable"
-    assert isinstance(raised.value.__cause__, MeridianUpstreamError)
-    call = coordinator.last_request
-    assert call is not None
-    assert (call.direction, call.window, call.window_count) == (blocking, 1, 13)
-
-
 @pytest.mark.asyncio
 async def test_a_failure_its_unit_recorded_leaves_no_request_in_flight(hass) -> None:
     """
     A failed request whose unit recorded the failure is no longer in flight.
 
-    The ended property, listed second, times out on its newest week and on
-    the probe after the cooldown, the setup's last request; the active
-    property imports, so setup goes on. A cancellation while the history is
-    saved then names no request in flight.
+    In an hourly update, the ended property, listed second, times out on
+    its newest days, the update's last request, and leaves its smaller
+    windows to the next update; the active property imports, so the update
+    goes on. Its billing period is cached, so a cancellation while the
+    history is saved then names no request in flight.
     """
     clock = _Clock()
     service = _service(clock, ACTIVE, ENDED)
     service.fail = lambda request: (
         _gateway_timeout() if request.property_id == ENDED else None
     )
-    coordinator = MeridianDataCoordinator(
-        hass, _client(service, _account(ACTIVE, ENDED))
+    account = _account(ACTIVE, ENDED)
+    client = _client(service, account)
+    coordinator = _hourly(MeridianDataCoordinator(hass, client), account)
+    coordinator._billing_periods[ACCOUNT] = MeridianBillingPeriod(
+        None, None, False, None, None, None, None
     )
+    coordinator._billing_cached_at[ACCOUNT] = NOW
 
-    with _running(clock):
-        data = await coordinator.async_fetch_and_import(
-            setup_import=True, time_budget=SETUP_IMPORT_BUDGET_SECONDS
-        )
+    with _running(clock, latest=NOW - HOUR):
+        data = await coordinator.async_fetch_and_import(time_budget=POLL_BUDGET_SECONDS)
 
     assert data.units_failed == 1
-    assert [request.days for request in service.sent(ENDED)] == [7, 1]
+    assert len(service.sent(ENDED)) == 1
     assert service.requests[-1].property_id == ENDED
+    client.async_get_billing_period.assert_not_awaited()
     call = coordinator.last_request
     assert call is not None
     assert call.property_index == 2

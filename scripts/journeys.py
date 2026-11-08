@@ -50,7 +50,7 @@ import tempfile
 import time
 import urllib.error
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from itertools import pairwise
 from pathlib import Path
@@ -77,20 +77,15 @@ NZ = ZoneInfo("Pacific/Auckland")
 HOUR = timedelta(hours=1)
 DAY = timedelta(days=1)
 INITIAL_BACKFILL = timedelta(days=90)
-# What the setup flow makes a retry wait after a failure, and a margin.
-RETRY_DELAY = timedelta(seconds=120)
-RETRY_MARGIN = timedelta(seconds=3)
-# The first update after an import asks for the newest day or two: the tip.
-TIP_DAYS = 2
 # A restart's update asks again for the last 14 days (README, "Data timing").
 CORRECTION_DAYS = 14
 TWO_DEVICES = 2
-HTTP_OK = 200
 OTP = "123456"
+# The setup asks Meridian for no history: the entry follows the code at once.
+SIGN_IN_LIMIT = timedelta(seconds=30)
 # Readings and costs are compared to the stand-in's within this.
 TOLERANCE = 1e-6
 POLL_S = 2.0
-FLOW_TIMEOUT_S = 600
 SYNC_TIMEOUT_S = 1200
 REQUEST_TIMEOUT_S = 150
 TOKEN_LIFETIME_S = 600
@@ -395,24 +390,6 @@ def render(result: dict[str, Any], translations: dict[str, str]) -> Screen:
     return Screen(kind, step, title, body, error, fields, tuple(missing))
 
 
-def offered(result: dict[str, Any], name: str) -> list[str]:
-    """Return the values a form's select field offers."""
-    for item in result.get("data_schema") or []:
-        if item.get("name") == name:
-            select = (item.get("selector") or {}).get("select") or {}
-            return [str(option["value"]) for option in select.get("options", [])]
-    return []
-
-
-def preselected(result: dict[str, Any], name: str) -> list[str]:
-    """Return the values a form's field starts with."""
-    for item in result.get("data_schema") or []:
-        if item.get("name") == name:
-            default = item.get("default") or []
-            return [str(value) for value in default]
-    return []
-
-
 # --------------------------------------------------------------------- report
 
 
@@ -654,26 +631,10 @@ class Journey:
         return result
 
     def submit(self, flow_id: str, data: dict[str, Any]) -> dict[str, Any]:
-        """Submit a flow's form, follow any progress, and record each screen."""
+        """Submit a flow's form, and record the screen that follows."""
         result: dict[str, Any] = self.client.rest(
             "POST", f"/api/config/config_entries/flow/{flow_id}", data
         )
-        self.screen(result)
-        if result.get("type") == "progress":
-            result = self.follow(flow_id)
-        self._note_entry(result)
-        return result
-
-    def follow(self, flow_id: str) -> dict[str, Any]:
-        """Wait for a flow's progress to end, as the dialog does, and record it."""
-
-        def moved_on() -> dict[str, Any] | None:
-            result: dict[str, Any] = self.client.rest(
-                "GET", f"/api/config/config_entries/flow/{flow_id}"
-            )
-            return None if result.get("type") == "progress" else result
-
-        result: dict[str, Any] = wait("the import to end", moved_on, FLOW_TIMEOUT_S)
         self.screen(result)
         self._note_entry(result)
         return result
@@ -741,6 +702,34 @@ class Journey:
 
         return dict(wait("the entry's sync", synced, SYNC_TIMEOUT_S))
 
+    def wait_failed(self, entry_id: str) -> dict[str, Any]:
+        """Wait for the entry's first sync to fail."""
+
+        def failed() -> dict[str, Any] | None:
+            entry = self.entry(entry_id)
+            if entry is None or entry["state"] != "loaded":
+                return None
+            coordinator = self.diagnostics(entry_id)
+            return coordinator if coordinator.get("last_exception_type") else None
+
+        return dict(wait("the entry's first sync to fail", failed, SYNC_TIMEOUT_S))
+
+    def unavailable(self, entry_id: str) -> list[str]:
+        """Return the entry's entities whose state is unavailable."""
+        return [
+            entity
+            for entity in self.entity_ids(entry_id)
+            if self.client.rest("GET", f"/api/states/{entity}")["state"]
+            == "unavailable"
+        ]
+
+    def update(self, entry_id: str) -> None:
+        """Ask for an update, as the entity's menu does."""
+        entity = self.entity_ids(entry_id)[0]
+        self.client.rest(
+            "POST", "/api/services/homeassistant/update_entity", {"entity_id": entity}
+        )
+
     def entity_ids(self, entry_id: str) -> list[str]:
         """Return the entry's enabled entities."""
         (registry,) = self.client.ws({"type": "config/entity_registry/list"})
@@ -805,12 +794,7 @@ class Journey:
             "" if entry is None else str(entry["state"]),
         )
         entities = self.entity_ids(entry_id)
-        unavailable = [
-            entity
-            for entity in entities
-            if self.client.rest("GET", f"/api/states/{entity}")["state"]
-            == "unavailable"
-        ]
+        unavailable = self.unavailable(entry_id)
         self.check(
             "the sensors exist and have states",
             bool(entities) and not unavailable,
@@ -879,267 +863,83 @@ class Journey:
 # ------------------------------------------------------------------- journeys
 
 
-def first_setup(j: Journey) -> None:
-    """First-time setup with one account, then the entry's first update."""
-    account = "A-JOURNEY-1"
-    j.scenario(Scenario(accounts=(account,)))
-    done, started, ended = j.set_up("journey-1@example.com")
-    j.require("progress, then the entry", done.get("type") == "create_entry")
+def _created_at_once(j: Journey, done: dict[str, Any], took: timedelta) -> str:
+    """Check that the code alone created the entry, at once; return its id."""
+    j.require("the entry follows the code", done.get("type") == "create_entry")
     j.check(
-        "the screens met",
+        "the screens met: no account choice, no import",
         [(s.kind, s.step) for s in j.result.screens]
-        == [
-            ("form", "user"),
-            ("form", "otp"),
-            ("progress", "initial_import"),
-            ("create_entry", "default"),
-        ],
+        == [("form", "user"), ("form", "otp"), ("create_entry", "default")],
         " → ".join(f"{s.kind} {s.step}" for s in j.result.screens),
     )
-    entry_id = j.entries[-1]
-    coordinator = j.wait_synced(entry_id)
-    modes = [r["sync_mode"] for r in coordinator.get("property_results", [])]
-    days = [
-        r["requested_days"]["consumption"]
-        for r in coordinator.get("property_results", [])
-    ]
     j.check(
-        "the first update imported only the tip",
-        coordinator.get("sync_mode") == "tip"
-        and modes == ["tip"]
-        and max(days) <= TIP_DAYS,
-        f"mode {coordinator.get('sync_mode')}, days asked {days}",
+        "the entry is created within seconds of the code",
+        took < SIGN_IN_LIMIT,
+        f"{took.total_seconds():.1f} s",
     )
-    # The import ends before Home Assistant creates the entry, and the entry's
-    # first update starts after it.
-    created = j.created(entry_id)
-    windows = sorted(r["start_on"] for r in j.journal(created) if r.get("start_on"))
-    yesterday = created.astimezone(NZ).date() - timedelta(days=1)
-    j.check(
-        "after the import, no window older than yesterday",
-        bool(windows) and date.fromisoformat(windows[0]) >= yesterday,
-        f"oldest window starts {windows[0]}" if windows else "no windows asked for",
-    )
-    rows = j.check_entry(
-        entry_id, {account: Expected(started, ended, datetime.now(UTC))}
-    )
-    usage = rows[statistic_ids(account)["consumption"]]
-    at_import = sum(row.start < floor_hour(ended) for row in usage)
-    crossed = floor_hour(started) != floor_hour(ended)
-    j.check(
-        "90 days of hourly statistics at the import",
-        at_import in ({2160, 2161} if crossed else {2159, 2160}),
-        f"{at_import} hours before {floor_hour(ended):%H:%M}Z",
-    )
+    return j.entries[-1]
 
 
-def two_accounts(j: Journey) -> None:
-    """Two accounts: choose one, then add the other with Reconfigure."""
-    first, second = "A-JOURNEY-2A", "A-JOURNEY-2B"
-    j.scenario(Scenario(accounts=(first, second)))
-    choice = j.start_flow({})
-    flow_id = str(choice["flow_id"])
-    j.submit(flow_id, {"email": "journey-2@example.com"})
-    accounts = j.submit(flow_id, {"otp": OTP})
-    j.require("the accounts form follows", accounts.get("step_id") == "accounts")
-    j.check(
-        "the accounts form offers both",
-        offered(accounts, "selected_accounts") == [first, second],
-        ", ".join(offered(accounts, "selected_accounts")),
-    )
-    started = datetime.now(UTC)
-    done = j.submit(flow_id, {"selected_accounts": [first]})
-    ended = datetime.now(UTC)
-    j.require("progress, then the entry", done.get("type") == "create_entry")
-    entry_id = j.entries[-1]
-    coordinator = j.wait_synced(entry_id)
-    j.check("one device", j.devices(entry_id) == 1, str(j.devices(entry_id)))
-    before = j.check_entry(
-        entry_id, {first: Expected(started, ended, datetime.now(UTC))}
-    )
-    j.check(
-        "no statistics for the account left out",
-        not any(j.statistics(statistic_ids(second).values()).values()),
-    )
-    reconfigure = j.start_flow({"entry_id": entry_id})
-    j.require(
-        "Reconfigure shows the accounts", reconfigure.get("step_id") == "reconfigure"
-    )
-    j.check(
-        "Reconfigure offers both, the chosen one selected",
-        offered(reconfigure, "selected_accounts") == [first, second]
-        and preselected(reconfigure, "selected_accounts") == [first],
-        f"offers {', '.join(offered(reconfigure, 'selected_accounts'))}; "
-        f"selected {', '.join(preselected(reconfigure, 'selected_accounts'))}",
-    )
-    added = datetime.now(UTC)
-    result = j.submit(
-        str(reconfigure["flow_id"]), {"selected_accounts": [first, second]}
-    )
-    j.check(
-        "Reconfigure saves and reloads",
-        result.get("type") == "abort"
-        and result.get("reason") == "reconfigure_successful",
-        str(result.get("reason")),
-    )
-    j.wait_synced(entry_id, coordinator.get("synced_at"))
-    devices = j.devices(entry_id)
-    j.check("two devices", devices == TWO_DEVICES, str(devices))
-    now = datetime.now(UTC)
-    after = j.check_entry(
-        entry_id,
-        {
-            first: Expected(started, ended, now),
-            second: Expected(added, now, now),
-        },
-    )
-    for kind, sid in statistic_ids(first).items():
-        changed = changed_rows(before[sid], after[sid])
-        j.check(
-            f"{first} {kind} unchanged by the second account",
-            not changed,
-            "; ".join(changed[:3]) or f"{len(before[sid])} hours identical",
-        )
+def first_setup(j: Journey) -> None:
+    """
+    First-time setup while Meridian's history times out, then the history.
 
-
-def _detail(result: dict[str, Any]) -> str:
-    """Return the failure form's ``detail`` placeholder."""
-    return str((result.get("description_placeholders") or {}).get("detail"))
-
-
-def _no_statistics(j: Journey, ids: Iterable[str]) -> bool:
-    """Return once the statistics have no rows (the rollback has run)."""
-    wanted = list(ids)
-    try:
-        wait(
-            "the rollback",
-            lambda: not any(j.statistics(wanted).values()),
-            60,
-        )
-    except JourneyError:
-        return False
-    return True
-
-
-def _wait_out_retry(failed_at: datetime) -> None:
-    """Wait until the setup flow allows a retry after a failure."""
-    remaining = (
-        failed_at + RETRY_DELAY + RETRY_MARGIN - datetime.now(UTC)
-    ).total_seconds()
-    if remaining > 0:
-        say(f"  ...  waiting {remaining:.0f} s, as the flow asks before a retry")
-        time.sleep(remaining)
-
-
-def retry(j: Journey) -> None:
-    """Import fails, then a retry after the real delay works."""
-    account = "A-JOURNEY-3"
-    feed_in = (account,)
-    j.scenario(
-        Scenario(
-            accounts=(account,),
-            feed_in=feed_in,
-            measurements_status=503,
-            failing_directions=(standin.GENERATION,),
-        )
-    )
-    failed, started, _ended = j.set_up("journey-3@example.com")
-    failed_at = datetime.now(UTC)
-    j.require("the failure form", failed.get("step_id") == "import_failed")
-    shown = j.result.screens[-1]
-    j.check(
-        "the failure form's error line",
-        (failed.get("errors") or {}).get("base") == "upstream_unavailable"
-        and "503" in _detail(failed),
-        f"{shown.error} / {_detail(failed)}",
-    )
-    j.check(
-        "the failure form offers Continue without history",
-        "continue_without_history"
-        in [i["name"] for i in failed.get("data_schema") or []],
-        ", ".join(shown.fields),
-    )
-    usage = [
-        r
-        for r in j.journal(started)
-        if r.get("operation") == "measurements"
-        and r.get("direction") == standin.CONSUMPTION
-    ]
-    j.check(
-        "the failed attempt imported usage before it failed",
-        any(r.get("status") == HTTP_OK for r in usage),
-        f"{len(usage)} usage windows answered",
-    )
-    ids = statistic_ids(account, feed_in=True)
-    j.check(
-        "the failed attempt's statistics were removed before the retry",
-        _no_statistics(j, ids.values()),
-    )
-    j.scenario(Scenario(accounts=(account,), feed_in=feed_in))
-    _wait_out_retry(failed_at)
-    retried = datetime.now(UTC)
-    done = j.submit(str(failed["flow_id"]), {})
-    ended = datetime.now(UTC)
-    j.require("progress, then the entry", done.get("type") == "create_entry")
-    j.check(
-        "the entry says nothing is left to import",
-        j.result.screens[-1].step == "default",
-        j.result.screens[-1].step,
-    )
-    entry_id = j.entries[-1]
-    j.wait_synced(entry_id)
-    j.check_entry(
-        entry_id,
-        {account: Expected(retried, ended, datetime.now(UTC))},
-        feed_in=feed_in,
-    )
-
-
-def without_history(j: Journey) -> None:
-    """Meridian down: Continue without history, then the history fills in."""
-    account = "A-JOURNEY-4"
+    The setup asks Meridian for no history, so it creates the entry all the
+    same, at once, and says the history comes in the background. The entry's
+    first sync fails while Meridian times out; once Meridian answers, an
+    update imports the 90 days.
+    """
+    account = "A-JOURNEY-1"
     j.scenario(
         Scenario(accounts=(account,), measurements_status=504, measurements_page="html")
     )
-    failed, _started, _ended = j.set_up("journey-4@example.com")
-    failed_at = datetime.now(UTC)
-    j.require("the failure form", failed.get("step_id") == "import_failed")
-    shown = j.result.screens[-1]
+    done, started, ended = j.set_up("journey-1@example.com")
+    entry_id = _created_at_once(j, done, ended - started)
     j.check(
-        "the failure form's error line",
-        (failed.get("errors") or {}).get("base") == "upstream_timeout",
-        f"{shown.error} / {_detail(failed)}",
-    )
-    j.check(
-        "the failure form offers Continue without history",
-        "continue_without_history"
-        in [i["name"] for i in failed.get("data_schema") or []],
-        ", ".join(shown.fields),
-    )
-    ids = statistic_ids(account)
-    j.check("nothing imported", _no_statistics(j, ids.values()))
-    _wait_out_retry(failed_at)
-    # Meridian is back before the entry exists: its first update starts the
-    # moment it is created, and a failed one waits 10 minutes to try again.
-    j.scenario(Scenario(accounts=(account,)))
-    created = datetime.now(UTC)
-    done = j.submit(str(failed["flow_id"]), {"continue_without_history": True})
-    j.require("the entry is created", done.get("type") == "create_entry")
-    j.check(
-        'the entry says the history finishes in the background ("partial")',
-        done.get("description") == "partial"
-        and "background" in j.result.screens[-1].text,
+        "the entry says the history comes in the background",
+        "background" in j.result.screens[-1].text,
         j.result.screens[-1].text,
     )
-    entry_id = j.entries[-1]
+    failed = j.wait_failed(entry_id)
+    j.check(
+        "the first sync fails while Meridian times out",
+        failed.get("first_sync_pending") is True
+        and failed.get("last_update_success") is False,
+        f"last exception {failed.get('last_exception_type')}",
+    )
+    unavailable = j.unavailable(entry_id)
+    j.check(
+        "the sensors are unavailable until the history arrives",
+        bool(unavailable) and unavailable == j.entity_ids(entry_id),
+        f"{len(unavailable)} of {len(j.entity_ids(entry_id))} unavailable",
+    )
+    j.scenario(Scenario(accounts=(account,)))
+    synced_from = datetime.now(UTC)
+    j.update(entry_id)
     coordinator = j.wait_synced(entry_id)
     j.check(
-        "the entry's first update imported the history",
+        "the first sync that worked imported the history",
         coordinator.get("sync_mode") == "initial",
         f"mode {coordinator.get('sync_mode')}",
     )
     now = datetime.now(UTC)
-    j.check_entry(entry_id, {account: Expected(created, now, now)})
+    j.check_entry(entry_id, {account: Expected(synced_from, now, now)})
+
+
+def two_accounts(j: Journey) -> None:
+    """Two accounts on one login: both are followed, with no choice to make."""
+    first, second = "A-JOURNEY-2A", "A-JOURNEY-2B"
+    j.scenario(Scenario(accounts=(first, second)))
+    done, started, ended = j.set_up("journey-2@example.com")
+    entry_id = _created_at_once(j, done, ended - started)
+    j.wait_synced(entry_id)
+    devices = j.devices(entry_id)
+    j.check("two devices", devices == TWO_DEVICES, str(devices))
+    now = datetime.now(UTC)
+    j.check_entry(
+        entry_id,
+        {first: Expected(ended, now, now), second: Expected(ended, now, now)},
+    )
 
 
 def reauth(j: Journey) -> None:
@@ -1147,16 +947,13 @@ def reauth(j: Journey) -> None:
     account = "A-JOURNEY-5"
     j.scenario(Scenario(accounts=(account,)))
     done, started, ended = j.set_up("journey-5@example.com")
-    j.require("progress, then the entry", done.get("type") == "create_entry")
-    entry_id = j.entries[-1]
+    entry_id = _created_at_once(j, done, ended - started)
     coordinator = j.wait_synced(entry_id)
+    imported = datetime.now(UTC)
     ids = statistic_ids(account)
     before = j.statistics(ids.values())
     j.scenario(Scenario(accounts=(account,), session_ended=True))
-    entity = j.entity_ids(entry_id)[0]
-    j.client.rest(
-        "POST", "/api/services/homeassistant/update_entity", {"entity_id": entity}
-    )
+    j.update(entry_id)
 
     def reauth_flow() -> dict[str, Any] | None:
         (flows,) = j.client.ws({"type": "config_entries/flow/progress"})
@@ -1195,7 +992,7 @@ def reauth(j: Journey) -> None:
     )
     j.wait_synced(entry_id, coordinator.get("synced_at"))
     after = j.check_entry(
-        entry_id, {account: Expected(started, ended, datetime.now(UTC))}
+        entry_id, {account: Expected(ended, imported, datetime.now(UTC))}
     )
     for kind, sid in ids.items():
         changed = changed_rows(before[sid], after[sid])
@@ -1211,11 +1008,11 @@ def restart(j: Journey, relaunch: Callable[[], None]) -> None:
     account = "A-JOURNEY-6"
     j.scenario(Scenario(accounts=(account,)))
     done, started, ended = j.set_up("journey-6@example.com")
-    j.require("progress, then the entry", done.get("type") == "create_entry")
-    entry_id = j.entries[-1]
+    entry_id = _created_at_once(j, done, ended - started)
     coordinator = j.wait_synced(entry_id)
+    imported = datetime.now(UTC)
     ids = statistic_ids(account)
-    expected = {account: Expected(started, ended, datetime.now(UTC))}
+    expected = {account: Expected(ended, imported, datetime.now(UTC))}
     before = j.check_entry(entry_id, expected)
     for when, act in (("the reload", None), ("the restart", relaunch)):
         if act is None:
@@ -1234,7 +1031,7 @@ def restart(j: Journey, relaunch: Callable[[], None]) -> None:
             and min(days) >= CORRECTION_DAYS,
             f"mode {coordinator.get('sync_mode')}, days asked {days}",
         )
-        expected = {account: Expected(started, ended, datetime.now(UTC))}
+        expected = {account: Expected(ended, imported, datetime.now(UTC))}
         after = j.check_entry(entry_id, expected)
         for kind, sid in ids.items():
             changed = changed_rows(before[sid], after[sid])
@@ -1247,10 +1044,8 @@ def restart(j: Journey, relaunch: Callable[[], None]) -> None:
 
 
 JOURNEYS: dict[str, str] = {
-    "first_setup": "First-time setup, one account",
-    "two_accounts": "Two accounts: choose one, add the other later",
-    "retry": "Import fails, then a retry works",
-    "without_history": "Meridian down, Continue without history, history fills in",
+    "first_setup": "First-time setup while Meridian times out, then the history",
+    "two_accounts": "Two accounts on one login, both followed",
     "reauth": "Meridian ends the sign-in, reconnect",
     "restart": "Restart and reload, history unbroken",
 }

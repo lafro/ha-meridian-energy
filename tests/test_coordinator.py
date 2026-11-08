@@ -257,15 +257,41 @@ async def test_prepare_topology_counts_its_request_from_one(hass) -> None:
 
 
 @pytest.mark.asyncio
-async def test_prepare_topology_rejects_missing_selected_accounts(hass) -> None:
+async def test_prepare_topology_retries_a_login_with_no_account(hass) -> None:
+    """No active or dormant account leaves setup to retry, and caches nothing."""
+    client = MagicMock()
+    client.async_get_accounts = AsyncMock(return_value=())
+    coordinator = MeridianDataCoordinator(hass, client)
+
+    with pytest.raises(ConfigEntryNotReady) as raised:
+        await coordinator.async_prepare_topology()
+
+    assert raised.value.translation_key == "no_accounts"
+    assert coordinator.accounts == ()
+    assert coordinator._topology_cached_at is None
+
+
+@pytest.mark.asyncio
+async def test_an_update_fails_while_a_login_has_no_account(hass) -> None:
+    """
+    An update that finds no account fails, and asks again in the next one.
+
+    The accounts it cached before stay, so the statistics it imported are
+    kept, and so is what it remembers of them.
+    """
     client = MagicMock()
     client.async_get_accounts = AsyncMock(return_value=(_account(),))
-    coordinator = MeridianDataCoordinator(
-        hass, client, selected_accounts=frozenset({"A-OTHER"})
-    )
+    coordinator = MeridianDataCoordinator(hass, client)
+    await coordinator.async_prepare_topology()
+    client.async_get_accounts.return_value = ()
 
-    with pytest.raises(ConfigEntryNotReady):
-        await coordinator.async_prepare_topology()
+    coordinator._topology_cached_at = None
+
+    with pytest.raises(UpdateFailed) as raised:
+        await coordinator.async_fetch_and_import()
+
+    assert raised.value.translation_key == "no_accounts"
+    assert coordinator.accounts == (_account(),)
 
 
 @pytest.mark.asyncio

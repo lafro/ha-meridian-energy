@@ -145,7 +145,7 @@ async def async_setup_entry(
     entry: MeridianConfigEntry,
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
-    """Set up and maintain one device per selected Meridian account."""
+    """Set up and maintain one device per Meridian account."""
     coordinator = entry.runtime_data.coordinator
     created_sensors: set[tuple[str, str]] = set()
 
@@ -242,7 +242,7 @@ def _remove_stale_devices(
     entry: MeridianConfigEntry,
     current_account_keys: set[str],
 ) -> None:
-    """Remove entities and detach devices for accounts no longer selected."""
+    """Remove entities and detach devices for accounts Meridian no longer lists."""
     device_registry = dr.async_get(hass)
     entity_registry = er.async_get(hass)
     for device_entry in dr.async_entries_for_config_entry(

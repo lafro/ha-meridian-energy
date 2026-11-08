@@ -482,7 +482,7 @@ def test_a_revision_pass_leaves_what_the_lane_reports_as_it_was(
     # Meridian now has readings for the day before the oldest one.
     state.took(empty[:1], empty=[])
     assert not reached(stored | _days(empty[0], empty[0]))
-    assert state.copy().known_empty == set(empty[1:])
+    assert state.known_empty == set(empty[1:])
     state.forget_before(TODAY)
     assert not state.known_fetched
     assert not state.known_empty
@@ -599,19 +599,6 @@ def test_a_gap_that_started_more_than_14_days_back_is_missing_from_then() -> Non
     assert missing_recent(_hours(hour - timedelta(days=30), hour - 20 * DAY), NOW) is (
         None
     )
-
-
-@pytest.mark.parametrize("days", [1, 50])
-def test_a_copy_shares_nothing(days: int) -> None:
-    state = LaneState()
-    state.took([TODAY - days * DAY], empty=[TODAY - days * DAY])
-    state.fail([TODAY - 2 * days * DAY], NOW)
-    copy = state.copy()
-    copy.took([TODAY - 3 * days * DAY], empty=[], revised=True)
-    copy.bad.clear()
-    assert TODAY - 3 * days * DAY not in state.fetched
-    assert state.bad
-    assert not state.revised
 
 
 def test_hours_after_the_frontier_are_not_missing() -> None:

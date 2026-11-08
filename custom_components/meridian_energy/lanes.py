@@ -239,26 +239,6 @@ class LaneState:
     reaches_target: bool = False
     history_start_found: bool = False
 
-    def copy(self) -> LaneState:
-        """Return a copy that shares no mutable state with this one."""
-        return LaneState(
-            fetched=set(self.fetched),
-            empty=set(self.empty),
-            refused_through=self.refused_through,
-            bad=dict(self.bad),
-            tries=dict(self.tries),
-            unsaved=set(self.unsaved),
-            revision_on=self.revision_on,
-            revising=self.revising,
-            revised=set(self.revised),
-            known_fetched=set(self.known_fetched),
-            known_empty=set(self.known_empty),
-            known_refused_through=self.known_refused_through,
-            missing_recent=self.missing_recent,
-            reaches_target=self.reaches_target,
-            history_start_found=self.history_start_found,
-        )
-
     def history_start(self, oldest: date | None, *, known: bool = False) -> date | None:
         """
         Return the first date of the history, once it is known.

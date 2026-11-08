@@ -13,16 +13,12 @@ from zoneinfo import ZoneInfo
 import pytest
 from homeassistant.core import CoreState
 from homeassistant.helpers.update_coordinator import UpdateFailed
-from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.meridian_energy.api import (
     MeridianGraphQLError,
     MeridianRateLimitError,
 )
 from custom_components.meridian_energy.const import (
-    CONF_AUTO_ADD_ACCOUNTS,
-    CONF_SELECTED_ACCOUNTS,
-    DOMAIN,
     READING_CONSUMPTION,
     READING_GENERATION,
     REVISION_OVERLAP,
@@ -158,59 +154,28 @@ def test_empty_topology_and_refresh_without_data_are_safe(hass) -> None:
 
 
 @pytest.mark.asyncio
-async def test_topology_filters_selected_accounts_and_rejects_stale_selection(
+async def test_topology_follows_every_account_including_one_added_later(
     hass,
 ) -> None:
-    first = _account()
-    second = MeridianAccount(
-        number="other-account", status="ACTIVE", properties=first.properties
-    )
-    client = MagicMock()
-    client.async_get_accounts = AsyncMock(return_value=(first, second))
-    coordinator = MeridianDataCoordinator(
-        hass, client, selected_accounts=frozenset({"other-account"})
-    )
-
-    accounts, _ = await coordinator._async_get_topology(NOW)
-    assert [account.number for account in accounts] == ["other-account"]
-    assert coordinator.accounts == accounts
-
-    missing = MeridianDataCoordinator(
-        hass, client, selected_accounts=frozenset({"missing"})
-    )
-    with pytest.raises(ValueError, match="selected"):
-        await missing._async_get_topology(NOW)
-
-
-@pytest.mark.asyncio
-async def test_topology_auto_adds_new_accounts_when_all_were_selected(hass) -> None:
+    """Every account Meridian lists is followed, one added later included."""
     first = _account()
     second = MeridianAccount(
         number="new-account", status="ACTIVE", properties=first.properties
     )
-    entry = MockConfigEntry(
-        domain=DOMAIN,
-        data={
-            CONF_SELECTED_ACCOUNTS: [first.number],
-            CONF_AUTO_ADD_ACCOUNTS: True,
-        },
-    )
-    entry.add_to_hass(hass)
     client = MagicMock()
-    client.async_get_accounts = AsyncMock(return_value=(first, second))
-    coordinator = MeridianDataCoordinator(
-        hass,
-        client,
-        config_entry=entry,
-        selected_accounts=frozenset({first.number}),
-        auto_add_accounts=True,
-    )
+    client.async_get_accounts = AsyncMock(return_value=(first,))
+    coordinator = MeridianDataCoordinator(hass, client)
 
     accounts, refreshed = await coordinator._async_get_topology(NOW)
+    assert refreshed is True
+    assert accounts == (first,)
+
+    client.async_get_accounts.return_value = (first, second)
+    accounts, refreshed = await coordinator._async_get_topology(NOW, force=True)
 
     assert refreshed is True
-    assert {account.number for account in accounts} == {first.number, second.number}
-    assert entry.data[CONF_SELECTED_ACCOUNTS] == ["new-account", first.number]
+    assert [account.number for account in accounts] == [first.number, "new-account"]
+    assert coordinator.accounts == accounts
 
 
 @pytest.mark.asyncio

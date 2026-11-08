@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 
@@ -16,23 +15,18 @@ from homeassistant.helpers.start import async_at_started
 
 from .api import MeridianApiClient
 from .const import (
-    CONF_AUTO_ADD_ACCOUNTS,
     CONF_FIREBASE_USER_ID,
     CONF_REFRESH_TOKEN,
-    CONF_SELECTED_ACCOUNTS,
-    CONF_STATISTICS_STATE_VERSION,
     DOMAIN,
-    SETUP_HANDOFF,
-    STATISTICS_STATE_VERSION,
     UNCONFIRMED_REPLAYS,
     UNSAVED_COVERAGE,
 )
 from .coordinator import MeridianDataCoordinator
-from .models import MeridianTokenSet, SetupHandoff
+from .models import MeridianTokenSet
 from .statistics import account_key
 
 PLATFORMS = [Platform.SENSOR]
-CONFIG_ENTRY_VERSION = 3
+CONFIG_ENTRY_VERSION = 4
 CONFIG_ENTRY_MINOR_VERSION = 1
 
 
@@ -47,24 +41,6 @@ class MeridianRuntimeData:
 type MeridianConfigEntry = ConfigEntry[MeridianRuntimeData]
 
 
-def _take_setup_handoff(
-    hass: HomeAssistant, entry: MeridianConfigEntry
-) -> SetupHandoff | None:
-    """
-    Take what the setup flow left for this new entry, if anything.
-
-    It is read once: a later setup of the entry, after a restart or a
-    reload, renews the session and fetches the accounts as before. One
-    read late, after a failed first setup of the entry, is still safe: the
-    accounts are refreshed once a day old, the reconciliations fall due
-    counted from when the setup import ran, and the rows its memory holds
-    are those setup stored.
-    """
-    handoffs = hass.data.get(DOMAIN, {}).get(SETUP_HANDOFF, {})
-    handoff = handoffs.pop(entry.unique_id, None) if entry.unique_id else None
-    return handoff if isinstance(handoff, SetupHandoff) else None
-
-
 def _unconfirmed_replays(
     hass: HomeAssistant, entry: MeridianConfigEntry
 ) -> dict[tuple[str, str], datetime]:
@@ -72,8 +48,8 @@ def _unconfirmed_replays(
     Return where the entry's coordinators keep their unconfirmed deep replays.
 
     Each coordinator updates it in place (``MeridianDataCoordinator``), so
-    after a reload of the entry, including those that reauthentication and
-    reconfiguration make, the new one still reaches back to the oldest hour
+    after a reload of the entry, including the one reauthentication makes,
+    the new one still reaches back to the oldest hour
     such a replay wrote: it reads the newest stored hours from the recorder,
     which usage saved without its cost has moved on. A restart of Home
     Assistant forgets it.
@@ -104,32 +80,17 @@ def _unsaved_coverage(
     return unsaved.setdefault(entry.entry_id, {})
 
 
-def _selected_accounts(data: Mapping[str, object]) -> frozenset[str]:
-    """Validate and normalize the required selected-account config field."""
-    configured_accounts = data[CONF_SELECTED_ACCOUNTS]
-    if (
-        not isinstance(configured_accounts, list)
-        or not configured_accounts
-        or any(
-            not isinstance(account, str) or not account
-            for account in configured_accounts
-        )
-    ):
-        raise ValueError("Invalid Meridian account selection")
-    return frozenset(configured_accounts)
-
-
 async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> bool:
     """
     Set up Meridian Energy from a config entry.
 
-    Setup only renews the stored session and caches the account topology, so
-    Home Assistant start-up does not wait for the measurement sync. The first
-    sync, which imports statistics, runs as a background task once Home
-    Assistant has started, or straight away when it is already running. It
-    first waits for the recorder to save what was queued before it, such as
-    the setup import. Right after the setup flow, the accounts it found are
-    used instead, and the first sync continues its import (``SetupHandoff``).
+    Setup only renews the stored session and caches the accounts, every
+    active or dormant one on the login, so Home Assistant start-up does not
+    wait for the measurement sync. The first sync, which imports statistics,
+    runs as a background task once Home Assistant has started, or straight
+    away when it is already running, as right after the setup flow. It first
+    waits for the recorder to save what was queued before it, such as the
+    last import before a reload.
     """
 
     async def async_store_tokens(tokens: MeridianTokenSet) -> None:
@@ -147,7 +108,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> 
             },
         )
 
-    selected_accounts = _selected_accounts(entry.data)
     tokens = MeridianTokenSet(
         id_token="",
         refresh_token=str(entry.data[CONF_REFRESH_TOKEN]),
@@ -159,19 +119,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> 
         tokens=tokens,
         token_update_callback=async_store_tokens,
     )
-    handoff = _take_setup_handoff(hass, entry)
     coordinator = MeridianDataCoordinator(
         hass,
         client,
         config_entry=entry,
-        selected_accounts=selected_accounts,
-        auto_add_accounts=bool(entry.data.get(CONF_AUTO_ADD_ACCOUNTS, False)),
-        topology=handoff.accounts if handoff is not None else None,
-        topology_at=handoff.imported_at if handoff is not None else None,
-        reconciled_at=(
-            handoff.imported_at if handoff is not None and handoff.imported else None
-        ),
-        memory=handoff.memory if handoff is not None else None,
         unconfirmed=_unconfirmed_replays(hass, entry),
         unsaved=_unsaved_coverage(hass, entry),
     )
@@ -207,43 +158,22 @@ async def async_remove_entry(hass: HomeAssistant, entry: MeridianConfigEntry) ->
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """
-    Promote completed v0.2.4 entries to the v0.2.5 compatibility boundary.
+    Refuse entries an earlier version set up; accept a later minor version.
 
-    A higher minor version of the same major version is accepted unchanged:
-    Home Assistant treats minor versions as backward compatible, so rolling
-    back to this release must still load an entry written by a later 3.x
-    release. Unsupported entries raise a translated ``ConfigEntryError``, which
-    leaves the entry in ``migration_error`` with a reason the user can act on.
+    Entries before version 4 chose their accounts and imported in the setup
+    flow; this version follows every account and imports in the background,
+    so such an entry is set up again rather than converted. The translated
+    ``ConfigEntryError`` leaves it in ``migration_error`` with a reason the
+    user can act on. A higher minor version of version 4 is accepted
+    unchanged: Home Assistant treats minor versions as backward compatible,
+    so rolling back to this release must still load an entry a later 4.x
+    release wrote. Home Assistant itself refuses a higher major version.
     """
-    if entry.version != CONFIG_ENTRY_VERSION:
+    del hass
+    if entry.version < CONFIG_ENTRY_VERSION:
         raise ConfigEntryError(
-            translation_domain=DOMAIN,
-            translation_key="migration_unsupported_version",
-            translation_placeholders={
-                "version": f"{entry.version}.{entry.minor_version}"
-            },
+            translation_domain=DOMAIN, translation_key="entry_too_old"
         )
-    if entry.minor_version >= CONFIG_ENTRY_MINOR_VERSION:
-        return True
-    marker = entry.data.get(CONF_STATISTICS_STATE_VERSION)
-    try:
-        _selected_accounts(entry.data)
-    except KeyError, ValueError:
-        complete = False
-    else:
-        complete = type(marker) is int and marker == STATISTICS_STATE_VERSION
-    if not complete:
-        raise ConfigEntryError(
-            translation_domain=DOMAIN,
-            translation_key="migration_incomplete_entry",
-        )
-    data = dict(entry.data)
-    data.pop(CONF_STATISTICS_STATE_VERSION)
-    hass.config_entries.async_update_entry(
-        entry,
-        data=data,
-        minor_version=CONFIG_ENTRY_MINOR_VERSION,
-    )
     return True
 
 

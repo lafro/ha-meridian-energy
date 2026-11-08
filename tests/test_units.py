@@ -3,18 +3,15 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import Any
 
 import pytest
 
-from custom_components.meridian_energy.lanes import LaneState
 from custom_components.meridian_energy.models import SyncMode
 from custom_components.meridian_energy.units import (
     STATUS_DEGRADED,
     STATUS_FAILED,
     STATUS_OK,
     STATUS_PENDING,
-    SyncMemory,
     UnitFailure,
     UnitState,
     backoff,
@@ -226,32 +223,3 @@ def test_a_unit_owes_what_it_skipped_and_only_a_covering_sync_clears_it() -> Non
     # A restart reaches back as far as the weekly reconciliation.
     assert state.covers(SyncMode.RESTART)
     assert state.covers(SyncMode.INITIAL)
-
-
-def test_a_memory_copy_shares_no_state() -> None:
-    state = UnitState()
-    rows: dict[tuple[datetime, str], Any] = {}
-    unconfirmed = {("synthetic-key", "CONSUMPTION"): NOW - timedelta(days=90)}
-    lane = LaneState()
-    memory = SyncMemory(
-        unit_states={("synthetic-key", "CONSUMPTION"): state},
-        measurements={("synthetic-key", "CONSUMPTION"): rows},
-        row_density={("synthetic-key", "CONSUMPTION"): 1.0},
-        unconfirmed=unconfirmed,
-        lanes={("synthetic-key", "CONSUMPTION"): lane},
-    )
-
-    copy = memory.copy()
-    state.fail(NOW, _failure(), SyncMode.TIP)
-    rows[(NOW, "synthetic-channel")] = None
-    unconfirmed.clear()
-    lane.took([NOW.date()], empty=[NOW.date()])
-
-    copied = copy.unit_states[("synthetic-key", "CONSUMPTION")]
-    assert copied.status == STATUS_PENDING
-    assert copy.measurements[("synthetic-key", "CONSUMPTION")] == {}
-    assert copy.row_density == {("synthetic-key", "CONSUMPTION"): 1.0}
-    assert copy.unconfirmed == {
-        ("synthetic-key", "CONSUMPTION"): NOW - timedelta(days=90)
-    }
-    assert copy.lanes[("synthetic-key", "CONSUMPTION")].fetched == set()

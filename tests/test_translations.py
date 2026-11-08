@@ -11,17 +11,11 @@ from typing import Any
 
 import pytest
 
-from custom_components.meridian_energy.const import (
-    SETUP_IMPORT_BUDGET_SECONDS,
-    SETUP_IMPORT_MAX_ATTEMPTS,
-    SETUP_IMPORT_TIMEOUT_SECONDS,
-)
-
 _INTEGRATION_DIR = Path(__file__).parents[1] / "custom_components" / "meridian_energy"
 _ENTITY_PLATFORMS = frozenset({"sensor"})
 # Abort reasons Home Assistant's own helpers raise for this flow, so the code
-# never names them: _abort_if_unique_id_configured and _abort_if_unique_id_mismatch.
-_IMPLICIT_ABORT_REASONS = frozenset({"already_configured", "unique_id_mismatch"})
+# never names them: _abort_if_unique_id_configured.
+_IMPLICIT_ABORT_REASONS = frozenset({"already_configured"})
 # The text Home Assistant shows for a created entry with no description.
 _IMPLICIT_CREATE_ENTRY = frozenset({"default"})
 
@@ -47,7 +41,6 @@ class _ModuleKeys:
         self.module = path.stem
         self.tree = ast.parse(path.read_text())
         self.keys: dict[str, set[str]] = defaultdict(set)
-        self.next_step_ids: set[str] = set()
         self.step_methods: set[str] = set()
         self._assignments: dict[str, list[ast.expr]] = defaultdict(list)
         self._functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
@@ -144,14 +137,10 @@ class _ModuleKeys:
                 self.keys[section] |= self._resolve(keyword.value)
             elif keyword.arg == "step_id" and name == "async_show_form":
                 self.keys["config.step"] |= self._resolve(keyword.value)
-            elif keyword.arg == "progress_action":
-                self.keys["config.progress"] |= self._resolve(keyword.value)
             elif keyword.arg == "reason" and name == "async_abort":
                 self.keys["config.abort"] |= self._resolve(keyword.value)
             elif keyword.arg == "description" and name == "async_create_entry":
                 self.keys["config.create_entry"] |= self._resolve(keyword.value)
-            elif keyword.arg == "next_step_id":
-                self.next_step_ids |= self._resolve(keyword.value)
 
 
 def _call_name(call: ast.Call) -> str:
@@ -175,20 +164,17 @@ def _is_base_subscript(target: ast.expr) -> bool:
 
 
 @cache
-def _used_keys() -> tuple[dict[str, frozenset[str]], frozenset[str], frozenset[str]]:
+def _used_keys() -> tuple[dict[str, frozenset[str]], frozenset[str]]:
     keys: dict[str, set[str]] = defaultdict(set)
-    next_step_ids: set[str] = set()
     step_methods: set[str] = set()
     for path in sorted(_INTEGRATION_DIR.glob("*.py")):
         module = _ModuleKeys(path)
         for section, values in module.keys.items():
             keys[section] |= values
         if module.module == "config_flow":
-            next_step_ids |= module.next_step_ids
             step_methods |= module.step_methods
     return (
         {section: frozenset(values) for section, values in keys.items()},
-        frozenset(next_step_ids),
         frozenset(step_methods),
     )
 
@@ -205,9 +191,7 @@ def _section(strings: dict[str, Any], dotted: str) -> dict[str, Any]:
     "section",
     [
         "config.abort",
-        "config.create_entry",
         "config.error",
-        "config.progress",
         "config.step",
         "exceptions",
         "entity.sensor",
@@ -215,7 +199,7 @@ def _section(strings: dict[str, Any], dotted: str) -> dict[str, Any]:
 )
 def test_every_translation_key_the_code_uses_exists(section: str) -> None:
     """A key used in code but missing from strings.json shows as a raw key."""
-    used, _, _ = _used_keys()
+    used, _ = _used_keys()
     assert used.get(section), f"no {section} keys found; the collector is broken"
     missing = sorted(used[section] - _section(_source_strings(), section).keys())
     assert not missing, f"{section} keys missing from strings.json: {missing}"
@@ -227,7 +211,6 @@ def test_every_translation_key_the_code_uses_exists(section: str) -> None:
         "config.abort",
         "config.create_entry",
         "config.error",
-        "config.progress",
         "config.step",
         "exceptions",
         "entity.sensor",
@@ -235,7 +218,7 @@ def test_every_translation_key_the_code_uses_exists(section: str) -> None:
 )
 def test_every_source_string_is_still_used(section: str) -> None:
     """A string the code no longer uses is stale text that misleads reviewers."""
-    used, _, _ = _used_keys()
+    used, _ = _used_keys()
     allowed = used.get(section, frozenset())
     if section == "config.abort":
         allowed |= _IMPLICIT_ABORT_REASONS
@@ -245,16 +228,9 @@ def test_every_source_string_is_still_used(section: str) -> None:
     assert not unused, f"{section} keys no code uses: {unused}"
 
 
-def test_progress_done_targets_are_flow_steps() -> None:
-    """Every async_show_progress_done target is a step the flow defines."""
-    _, next_step_ids, step_methods = _used_keys()
-    assert next_step_ids
-    assert next_step_ids <= step_methods
-
-
 def test_flow_form_steps_have_strings_and_methods() -> None:
     """Every step in strings.json is a step the flow can show."""
-    _, _, step_methods = _used_keys()
+    _, step_methods = _used_keys()
     steps = _section(_source_strings(), "config.step")
     assert steps.keys() <= step_methods
 
@@ -265,44 +241,8 @@ def _texts(value: Any) -> list[str]:
     return [value] if isinstance(value, str) else []
 
 
-def test_the_setup_time_limits_are_stated_in_the_readme_not_the_dialog() -> None:
-    """
-    The setup cap is 300 s and the import's own budget 240 s: the README says so.
-
-    The setup dialog says what is happening and what to do, in a sentence or
-    two; the detail is in the README, which the dialog's help link opens. So
-    no dialog text names either limit, and a change to a constant leaves none
-    stating the old one. The README also says that the time Home Assistant
-    takes to save an import is not counted, since setup's limit moves on by it
-    (the coordinator's ``_async_uncounted``): the 5 minutes are not the
-    longest setup can take. It names the import's own 4 minutes too
-    (``SETUP_IMPORT_BUDGET_SECONDS``), which end it with what it imported, as
-    the 5 minutes, a backstop, do not.
-    """
-    assert SETUP_IMPORT_TIMEOUT_SECONDS == 300
-    assert SETUP_IMPORT_BUDGET_SECONDS == 240
-    limit = f"{SETUP_IMPORT_TIMEOUT_SECONDS // 60} minutes"
-    budget = f"{SETUP_IMPORT_BUDGET_SECONDS // 60} minutes"
-    for text in _texts(_source_strings()["config"]):
-        assert limit not in text
-        assert budget not in text
-    uncounted = f"after {limit}, not counting the time Home Assistant takes to save it"
-    readme = (_INTEGRATION_DIR.parents[1] / "README.md").read_text()
-    assert f"still running {uncounted}" in readme
-    assert f"The import has {budget}" in readme
-
-
 def test_the_setup_dialog_is_brief() -> None:
     """Each setup text is a sentence or two: the README has the detail."""
     config = _source_strings()["config"]
     for text in _texts(config):
         assert len(text) <= 250, text
-
-
-def test_the_last_failure_texts_give_the_attempt_limit() -> None:
-    """The texts after the last attempt allowed say how many attempts failed."""
-    assert SETUP_IMPORT_MAX_ATTEMPTS == 5
-    config = _source_strings()["config"]
-    stated = f"failed {SETUP_IMPORT_MAX_ATTEMPTS} times"
-    assert stated in config["step"]["import_failed_last"]["description"]
-    assert stated in config["abort"]["too_many_attempts"]

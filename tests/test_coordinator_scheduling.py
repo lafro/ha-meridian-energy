@@ -16,19 +16,18 @@ import logging
 from collections import Counter
 from datetime import datetime, timedelta
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from custom_components.meridian_energy import coordinator as coordinator_module
 from custom_components.meridian_energy.api import MeridianConnectionError
 from custom_components.meridian_energy.const import (
     POLL_BUDGET_SECONDS,
-    SETUP_IMPORT_BUDGET_SECONDS,
 )
 from custom_components.meridian_energy.coordinator import MeridianDataCoordinator
 from custom_components.meridian_energy.models import (
     MeasurementPage,
-    MeridianAccount,
     SyncMode,
 )
 from custom_components.meridian_energy.statistics import consumption_ids, property_key
@@ -387,92 +386,6 @@ async def test_an_ended_property_with_two_directions_does_not_block_the_active_o
     assert importer.await_count >= 2 * 6
 
 
-@pytest.mark.parametrize(("latency", "active"), [(1.0, 26), (5.0, 21), (34.0, 3)])
-@pytest.mark.asyncio
-async def test_setup_imports_the_active_property_when_an_ended_one_with_export_fails(
-    hass, latency: float, active: int
-) -> None:
-    """
-    The ended property's probes wait behind the active property's weeks.
-
-    Its grid import's probe and its grid export's newest week and probe
-    each wait out a cooldown of 75 s; the active property's 26 weeks go
-    first, so setup imports them all within its 4 minutes at 1 s a request,
-    and its newest weeks of both directions when slower.
-    """
-    clock = _Clock()
-    service = _service(clock, ACTIVE, ENDED)
-    service.latency = latency
-    service.fail = lambda request: (
-        _gateway_timeout() if request.property_id == ENDED else None
-    )
-    coordinator = MeridianDataCoordinator(
-        hass, _client(service, _account(ENDED, ACTIVE, feed_in=True))
-    )
-
-    with _running(clock) as importer:
-        data = await coordinator.async_fetch_and_import(
-            setup_import=True, time_budget=SETUP_IMPORT_BUDGET_SECONDS
-        )
-
-    assert len(service.sent(ACTIVE)) == active
-    assert importer.await_count == 2
-    assert data.units_failed + data.units_deferred == 2
-
-
-@pytest.mark.asyncio
-async def test_a_walk_waiting_for_its_cooldown_lets_another_property_go_on(
-    hass,
-) -> None:
-    """
-    In setup, a week that timed out waits 75 s; another property uses them.
-
-    The first property's third week times out once. Its probe waits out the
-    cooldown, while the second property's walk goes on rather than wait
-    with it; the probe then follows, and the first walk ends in weeks.
-    """
-    clock = _Clock()
-    service = _service(clock, ACTIVE, ENDED)
-    third_week = TODAY - 20 * DAY
-    failed: list[bool] = []
-
-    def once(request: Any) -> BaseException | None:
-        if (
-            request.property_id == ACTIVE
-            and request.start_on == third_week
-            and not failed
-        ):
-            failed.append(True)
-            return _gateway_timeout()
-        return None
-
-    service.fail = once
-    coordinator = MeridianDataCoordinator(
-        hass, _client(service, _account(ACTIVE, ENDED))
-    )
-
-    with _running(clock) as importer:
-        data = await coordinator.async_fetch_and_import(
-            setup_import=True, time_budget=SETUP_IMPORT_BUDGET_SECONDS
-        )
-
-    order = [request.property_id for request in service.requests]
-    timed_out = next(
-        index
-        for index, request in enumerate(service.requests)
-        if request.start_on == third_week
-    )
-    assert order[: timed_out + 1] == [ACTIVE, ENDED, ACTIVE, ACTIVE]
-    # Every one of the second property's older weeks, then the probe.
-    assert order[timed_out + 1 : timed_out + 13] == [ENDED] * 12
-    assert service.requests[timed_out + 13].days == 1
-    assert order[timed_out + 13 :] == [ACTIVE] * (len(order) - timed_out - 13)
-    assert data.units_failed == 0
-    assert importer.await_count == 2
-    # The cooldown's wait, less the time the second property's weeks took.
-    assert max(clock.waits) < 75.0
-
-
 # ------------------------------------------------ walks that must be whole
 
 
@@ -514,26 +427,28 @@ async def test_an_update_with_a_first_import_has_the_deep_walk_budget(
 
 
 @pytest.mark.asyncio
-async def test_setup_keeps_the_weeks_each_property_fetched_in_its_time(
+async def test_a_first_import_keeps_the_weeks_each_property_fetched_in_its_time(
     hass,
 ) -> None:
     """
-    Setup finishes with one property whole and the newer weeks of the other.
+    A first import cut short keeps one property whole and the other's newer weeks.
 
-    At 10 s a request, the two properties' 26 weeks do not fit setup's 4
-    minutes: the first is imported whole, and the second, cut short, keeps
-    the weeks it fetched, newest first. The entry's updates fill in the
-    rest. Imported all or nothing, the second would have imported nothing.
+    At 10 s a request, the two properties' 26 weeks do not fit 4 minutes,
+    with the deep walk's own budget left out: the first is imported whole,
+    and the second, cut short, keeps the weeks it fetched, newest first.
+    The updates after it fill in the rest. Imported all or nothing, the
+    second would have imported nothing.
     """
     clock = _Clock()
     service = _service(clock, ACTIVE, ENDED)
     service.latency = 10.0
     account = _account(ACTIVE, ENDED)
-    setup = MeridianDataCoordinator(hass, _client(service, account))
-    with _running(clock) as importer:
-        data = await setup.async_fetch_and_import(
-            setup_import=True, time_budget=SETUP_IMPORT_BUDGET_SECONDS
-        )
+    coordinator = MeridianDataCoordinator(hass, _client(service, account))
+    with (
+        _running(clock) as importer,
+        patch.object(coordinator_module, "DEEP_WALK_BUDGET_SECONDS", 0),
+    ):
+        data = await coordinator.async_fetch_and_import(time_budget=POLL_BUDGET_SECONDS)
 
     assert (data.units_failed, data.units_degraded) == (0, 1)
     assert importer.await_count == 2
@@ -702,7 +617,7 @@ async def test_a_direction_whose_readings_stopped_still_gets_its_estimates_revis
     ]
 
 
-# --------------------------------------------- what setup hands its entry
+# ------------------------------------- what the first sync leaves the next
 
 
 class _Provisional(FakeKraken):
@@ -715,94 +630,22 @@ class _Provisional(FakeKraken):
         return node
 
 
-def _entry(
-    hass, service: _Service, account: MeridianAccount, setup: MeridianDataCoordinator
-) -> MeridianDataCoordinator:
-    """Return the entry's coordinator, with what a finished setup hands it."""
-    return MeridianDataCoordinator(
-        hass,
-        _client(service, account),
-        topology=(account,),
-        topology_at=NOW,
-        reconciled_at=NOW,
-        memory=setup.memory,
-    )
-
-
-@pytest.mark.asyncio
-async def test_a_unit_setup_left_failing_is_not_reported_failing_again(
-    hass, caplog: pytest.LogCaptureFixture
-) -> None:
-    """
-    Setup's warning says the first update tries it again; that one warns no more.
-
-    The entry's first update, minutes later, tries the ended property again:
-    it still fails, which setup has said already. Once it works, one INFO
-    line says so.
-    """
-    caplog.set_level(logging.INFO, logger=_LOGGER_NAME)
-    clock = _Clock()
-    now = {"value": NOW}
-    service = _service(clock, ACTIVE, ENDED)
-    failing = {"on": True}
-    service.fail = lambda request: (
-        _gateway_timeout() if failing["on"] and request.property_id == ENDED else None
-    )
-    account = _account(ENDED, ACTIVE)
-    setup = MeridianDataCoordinator(hass, _client(service, account))
-    with _running(clock):
-        await setup.async_fetch_and_import(
-            setup_import=True, time_budget=SETUP_IMPORT_BUDGET_SECONDS
-        )
-    (warning,) = _messages(caplog, logging.WARNING)
-    assert warning.endswith(
-        "and this one is tried again by the first update after setup"
-    )
-
-    entry = _entry(hass, service, account, setup)
-    imported, _ = consumption_ids(property_key(ACCOUNT, ACTIVE))
-    with _running(
-        clock,
-        lambda: now["value"],
-        latest=lambda statistic_id: NOW - HOUR if statistic_id == imported else None,
-    ):
-        before = len(service.sent(ENDED))
-        now["value"] = NOW + 5 * timedelta(minutes=1)
-        data = await entry.async_fetch_and_import(time_budget=POLL_BUDGET_SECONDS)
-        assert len(service.sent(ENDED)) - before == 1
-        assert data.units_failed == 1
-        failing["on"] = False
-        now["value"] = NOW + 3 * HOUR
-        await entry.async_fetch_and_import(time_budget=POLL_BUDGET_SECONDS)
-
-    assert len(_messages(caplog, logging.WARNING)) == 1
-    assert any(
-        message.startswith(
-            "Meridian usage history updates for one direction are working again"
-        )
-        for message in _messages(caplog, logging.INFO)
-    )
-
-
 @pytest.mark.asyncio
 async def test_the_entry_sizes_its_first_page_for_the_meters_registers(hass) -> None:
     """
-    Setup hands over the rows an hour holds: one request for three registers.
+    The first sync learns the rows an hour holds: one request for three registers.
 
-    The entry's first update, the hourly one, asks for its two days in one
-    page holding every register's readings. Starting from one register's,
-    it would need two more pages.
+    The update after it, the hourly one, asks for its two days in one page
+    holding every register's readings. Starting from one register's, it
+    would need two more pages.
     """
     clock = _Clock()
     service = _Service(clock, {ACTIVE: FakeKraken(NOW, channels=3)})
     account = _account()
-    setup = MeridianDataCoordinator(hass, _client(service, account))
+    entry = MeridianDataCoordinator(hass, _client(service, account))
     with _running(clock):
-        await setup.async_fetch_and_import(
-            setup_import=True, time_budget=SETUP_IMPORT_BUDGET_SECONDS
-        )
+        await entry.async_fetch_and_import(time_budget=POLL_BUDGET_SECONDS)
 
-    entry = _entry(hass, service, account, setup)
     service.requests.clear()
     with _running(clock, NOW + 5 * timedelta(minutes=1), latest=NOW - HOUR):
         data = await entry.async_fetch_and_import(time_budget=POLL_BUDGET_SECONDS)
@@ -815,27 +658,24 @@ async def test_the_entry_sizes_its_first_page_for_the_meters_registers(hass) -> 
 
 
 @pytest.mark.asyncio
-async def test_setups_provisional_rows_are_counted_and_revised_after_it(
+async def test_a_first_imports_provisional_rows_are_counted_and_revised_after_it(
     hass,
 ) -> None:
     """
-    The entry knows the estimates setup imported, as after a 14-day restart.
+    The entry knows the estimates its first sync imported, as after a restart.
 
-    Its first update counts them in the provisional intervals, and its first
-    daily reconciliation reaches back to the oldest of them, 5 days, rather
-    than waiting a week for the weekly one.
+    The update after it counts them in the provisional intervals, and its
+    first daily reconciliation reaches back to the oldest of them, 5 days,
+    rather than waiting a week for the weekly one.
     """
     clock = _Clock()
     now = {"value": NOW}
     service = _Service(clock, {ACTIVE: _Provisional(NOW)})
     account = _account()
-    setup = MeridianDataCoordinator(hass, _client(service, account))
+    entry = MeridianDataCoordinator(hass, _client(service, account))
     with _running(clock):
-        await setup.async_fetch_and_import(
-            setup_import=True, time_budget=SETUP_IMPORT_BUDGET_SECONDS
-        )
+        await entry.async_fetch_and_import(time_budget=POLL_BUDGET_SECONDS)
 
-    entry = _entry(hass, service, account, setup)
     seen = []
     with _running(clock, lambda: now["value"], latest=lambda _id: NOW - HOUR):
         for when in (NOW + 5 * timedelta(minutes=1), NOW + DAY + HOUR):
@@ -862,31 +702,29 @@ async def test_setups_provisional_rows_are_counted_and_revised_after_it(
 
 
 @pytest.mark.asyncio
-async def test_the_first_update_after_setup_does_not_import_a_stale_direction_again(
+async def test_the_update_after_a_first_import_does_not_import_a_stale_direction_again(
     hass,
 ) -> None:
     """
-    Readings that ended 20 days ago: setup imported 70 days, and that stands.
+    Readings that ended 20 days ago: the first sync imported 70 days.
 
-    Until now the entry's first update saw statistics older than 14 days and
-    imported the 90 days again, 13 requests. The frontier rule reaches back
-    to the newest stored hour in any mode, and setup found nothing newer:
-    the hourly update asks for the newest week alone.
+    The update after it sees statistics older than 14 days, but the frontier
+    rule reaches back to the newest stored hour in any mode, and the first
+    sync found nothing newer: the hourly update asks for the newest week
+    alone, not the 90 days again, 13 requests.
     """
     clock = _Clock()
     service = _Service(
         clock, {ACTIVE: FakeKraken(NOW, gaps=[(NOW - 20 * DAY, NOW + 3 * DAY)])}
     )
     account = _account()
-    setup = MeridianDataCoordinator(hass, _client(service, account))
+    entry = MeridianDataCoordinator(hass, _client(service, account))
     with _running(clock):
-        await setup.async_fetch_and_import(
-            setup_import=True, time_budget=SETUP_IMPORT_BUDGET_SECONDS
-        )
-    (newest,) = setup.imported_newest.values()
+        await entry.async_fetch_and_import(time_budget=POLL_BUDGET_SECONDS)
+    energy_id, _ = consumption_ids(property_key(ACCOUNT, ACTIVE))
+    newest = entry._frontier[energy_id]
     assert newest < NOW - 20 * DAY
 
-    entry = _entry(hass, service, account, setup)
     service.requests.clear()
     with _running(clock, NOW + 5 * timedelta(minutes=1), latest=newest) as importer:
         data = await entry.async_fetch_and_import(time_budget=POLL_BUDGET_SECONDS)

@@ -33,8 +33,8 @@ from custom_components.meridian_energy.api import (
 from custom_components.meridian_energy.const import (
     FIREBASE_REFRESH_URL,
     INITIAL_BACKFILL,
+    POLL_BUDGET_SECONDS,
     REVISION_OVERLAP,
-    SETUP_IMPORT_BUDGET_SECONDS,
     TARGETED_RECONCILIATION_MINIMUM,
     TIP_WINDOW,
 )
@@ -209,7 +209,7 @@ async def test_every_request_has_both_bounds_and_continuations_repeat_them(
     coordinator = MeridianDataCoordinator(hass, client)
 
     with _sync():
-        await coordinator.async_fetch_and_import(setup_import=True)
+        await coordinator.async_fetch_and_import()
 
     assert kraken.violations == []
     assert all(
@@ -424,7 +424,7 @@ async def test_dates_read_differently_stop_the_walk_where_they_show(
     coordinator = MeridianDataCoordinator(hass, _client(kraken))
 
     with _sync() as importer:
-        data = await coordinator.async_fetch_and_import(setup_import=True)
+        data = await coordinator.async_fetch_and_import()
 
     assert data.units_degraded == 1
     (unit,) = coordinator._run_units
@@ -475,7 +475,7 @@ async def test_last_dates_missing_in_weeks_apart_are_gaps(hass) -> None:
     coordinator = MeridianDataCoordinator(hass, _client(kraken))
 
     with _sync() as importer:
-        data = await coordinator.async_fetch_and_import(setup_import=True)
+        data = await coordinator.async_fetch_and_import()
 
     assert len(kraken.requests) == 13
     assert data.windows_ok == 13
@@ -496,7 +496,7 @@ async def test_last_dates_missing_in_two_weeks_in_a_row_fail(hass) -> None:
     coordinator = MeridianDataCoordinator(hass, _client(kraken))
 
     with _sync() as importer:
-        data = await coordinator.async_fetch_and_import(setup_import=True)
+        data = await coordinator.async_fetch_and_import()
 
     assert data.units_degraded == 1
     assert "two windows in a row" in str(coordinator._run_units[0].error)
@@ -560,7 +560,7 @@ async def test_edge_hours_missing_at_boundaries_apart_or_on_both_sides_are_gaps(
     coordinator = MeridianDataCoordinator(hass, _client(kraken))
 
     with _sync() as importer:
-        data = await coordinator.async_fetch_and_import(setup_import=True)
+        data = await coordinator.async_fetch_and_import()
 
     assert len(kraken.requests) == 13
     assert data.windows_ok == 13
@@ -815,7 +815,7 @@ async def test_two_empty_windows_mark_the_start_of_the_history(
     coordinator = MeridianDataCoordinator(hass, _client(kraken))
 
     with _sync():
-        data = await coordinator.async_fetch_and_import(setup_import=True)
+        data = await coordinator.async_fetch_and_import()
 
     assert len(kraken.requests) == 5
     assert data.history_start is True
@@ -930,7 +930,6 @@ async def test_a_window_rejected_before_the_supply_began_is_the_history_start(
     coordinator = MeridianDataCoordinator(
         hass, _client(kraken, measurements=refuse_before_the_supply)
     )
-    fractions: list[float] = []
     energy_id = consumption_ids(property_key(ACCOUNT, PROPERTY))[0]
 
     with _sync(
@@ -941,9 +940,7 @@ async def test_a_window_rejected_before_the_supply_began_is_the_history_start(
             else None
         ),
     ) as importer:
-        data = await coordinator.async_fetch_and_import(
-            setup_import=True, progress=fractions.append
-        )
+        data = await coordinator.async_fetch_and_import()
 
     # Three weeks, the refused one, then its newest date alone, refused too.
     assert coordinator.client.async_get_measurements.await_count == 5
@@ -958,7 +955,6 @@ async def test_a_window_rejected_before_the_supply_began_is_the_history_start(
     ]
     assert coordinator.last_request is not None
     assert coordinator.last_request.finished_at is not None
-    assert fractions == pytest.approx([1 / 13, 2 / 13, 3 / 13, 4 / 13, 1.0])
     (record,) = _records(caplog, "Meridian rejected a window older than every")
     assert record.levelno == logging.INFO
     assert ("KT-CT-4321" if answer == "graphql" else "HTTP 404") in record.getMessage()
@@ -1062,11 +1058,11 @@ async def test_other_rejected_windows_fail_the_sync(hass, case: str) -> None:
     ):
         if case == "no-reading-yet":
             with pytest.raises(UpdateFailed) as raised:
-                await coordinator.async_fetch_and_import(setup_import=True)
+                await coordinator.async_fetch_and_import()
             assert raised.value.translation_key == "invalid_data"
             importer.assert_not_awaited()
             return
-        data = await coordinator.async_fetch_and_import(setup_import=True)
+        data = await coordinator.async_fetch_and_import()
 
     assert data.units_degraded == 1
     (unit,) = coordinator._run_units
@@ -1107,7 +1103,7 @@ async def test_an_initial_import_with_no_readings_says_so(
     coordinator = MeridianDataCoordinator(hass, _client(kraken, feed_in=feed_in))
 
     with _sync() as importer:
-        data = await coordinator.async_fetch_and_import(setup_import=True)
+        data = await coordinator.async_fetch_and_import()
 
     importer.assert_not_awaited()
     assert len(kraken.requests) == 13 * (1 + feed_in)
@@ -1122,18 +1118,17 @@ async def test_an_initial_import_with_no_readings_says_so(
 
 
 @pytest.mark.asyncio
-async def test_an_initial_import_after_setup_searches_the_90_days_too(
+async def test_an_initial_import_searches_the_90_days_in_every_coordinator(
     hass, caplog: pytest.LogCaptureFixture
 ) -> None:
     """
     A direction with no statistics is searched to the cutoff in every coordinator.
 
-    Nothing records which directions setup searched: one with no statistics
-    may be one setup found nothing for, or an account added later through
-    Reconfigure, an account added on its own or a property that appeared
-    since, which no setup searched. So the first sync after setup, a restart
-    or a reload walks its 90 days, as setup does, and says once at INFO that
-    it found nothing.
+    Nothing records which directions an earlier coordinator searched: one
+    with no statistics may be one it found nothing for, or an account added
+    on its own or a property that appeared since. So the first sync after
+    setup, a restart or a reload walks its 90 days, and says once at INFO
+    that it found nothing.
     """
     caplog.set_level(logging.DEBUG, logger=_LOGGER_NAME)
     kraken = FakeKraken(NOW, history_start=NOW + timedelta(days=2))
@@ -1158,20 +1153,18 @@ async def test_an_initial_import_after_setup_searches_the_90_days_too(
     )
 
 
-@pytest.mark.parametrize("setup_import", [True, False], ids=["setup", "after-setup"])
 @pytest.mark.parametrize("ended", [15, 20, 60])
 @pytest.mark.asyncio
 async def test_a_supply_that_ended_weeks_ago_imports_its_history(
-    hass, caplog: pytest.LogCaptureFixture, ended: int, setup_import: bool
+    hass, caplog: pytest.LogCaptureFixture, ended: int
 ) -> None:
     """
     Weeks with no readings before any reading are not the start of a history.
 
     A property whose supply ended, or a meter that sent nothing for a while,
     has empty newest weeks and readings before them. The walk goes on past
-    them, and imports what one request for the 90 days would have: at setup,
-    and in the first sync of an account added after setup, such as a closed
-    account added through Reconfigure to see its history.
+    them, and imports what one request for the 90 days would have, in the
+    first sync after setup or of an account Meridian lists later.
     """
     caplog.set_level(logging.INFO, logger=_LOGGER_NAME)
     since = NOW - INITIAL_BACKFILL
@@ -1181,7 +1174,7 @@ async def test_a_supply_that_ended_weeks_ago_imports_its_history(
     coordinator = MeridianDataCoordinator(hass, _client(kraken))
 
     with _sync() as importer:
-        data = await coordinator.async_fetch_and_import(setup_import=setup_import)
+        data = await coordinator.async_fetch_and_import()
 
     assert data.sync_mode is SyncMode.INITIAL
     assert len(kraken.requests) == 13
@@ -1284,7 +1277,7 @@ async def test_a_week_refused_after_a_complete_week_fails_the_sync(
     coordinator = MeridianDataCoordinator(hass, _client(kraken))
 
     with _sync() as importer:
-        data = await coordinator.async_fetch_and_import(setup_import=True)
+        data = await coordinator.async_fetch_and_import()
 
     assert data.units_degraded == 1
     assert data.history_start is False
@@ -1343,7 +1336,7 @@ async def test_a_week_refused_after_a_week_short_of_its_first_hour_is_asked_by_d
 
     if refused == "week-only":
         with _sync() as importer:
-            data = await coordinator.async_fetch_and_import(setup_import=True)
+            data = await coordinator.async_fetch_and_import()
 
         assert data.history_start is False
         assert (data.windows_ok, data.windows_failed) == (13, 0)
@@ -1358,7 +1351,7 @@ async def test_a_week_refused_after_a_week_short_of_its_first_hour_is_asked_by_d
         return
 
     with _sync() as importer:
-        data = await coordinator.async_fetch_and_import(setup_import=True)
+        data = await coordinator.async_fetch_and_import()
 
     assert data.units_degraded == 1
     imported = importer.await_args.kwargs["measurements"]
@@ -1394,12 +1387,9 @@ async def test_a_week_refused_across_the_supply_start_imports_from_it(
         pre_supply_start_on=True,
     )
     coordinator = MeridianDataCoordinator(hass, _client(kraken))
-    fractions: list[float] = []
 
     with _sync() as importer:
-        data = await coordinator.async_fetch_and_import(
-            setup_import=True, progress=fractions.append
-        )
+        data = await coordinator.async_fetch_and_import()
 
     assert data.history_start is True
     assert data.windows_failed == 1
@@ -1408,7 +1398,6 @@ async def test_a_week_refused_across_the_supply_start_imports_from_it(
         start for start, _channel in _expected(kraken, since)
     ]
     assert min(item.start for item in imported) == local_midnight(supply_start)
-    assert fractions[-1] == pytest.approx(1.0)
     assert coordinator.last_request is not None
     assert coordinator.last_request.finished_at is not None
     (record,) = _records(caplog, "Meridian rejected a window older than every")
@@ -1508,7 +1497,7 @@ async def test_a_week_refused_once_is_fetched_by_its_days(
     )
 
     with _sync() as importer:
-        data = await coordinator.async_fetch_and_import(setup_import=True)
+        data = await coordinator.async_fetch_and_import()
 
     assert coordinator.client.async_get_measurements.await_count == 13 + 7
     assert data.history_start is False
@@ -1657,7 +1646,7 @@ async def test_a_refused_week_whose_days_fail_too_fails_the_sync(
     )
 
     with _sync() as importer, pytest.raises(UpdateFailed) as raised:
-        await coordinator.async_fetch_and_import(setup_import=True)
+        await coordinator.async_fetch_and_import()
 
     importer.assert_not_awaited()
     calls = coordinator.client.async_get_measurements.await_args_list
@@ -1694,7 +1683,7 @@ async def test_a_failure_of_the_newest_day_of_a_refused_week_fails_the_sync(
     )
 
     with _sync() as importer:
-        data = await coordinator.async_fetch_and_import(setup_import=True)
+        data = await coordinator.async_fetch_and_import()
 
     assert data.units_degraded == 1
     (unit,) = coordinator._run_units
@@ -1756,17 +1745,13 @@ async def test_a_supply_that_began_on_a_windows_first_date_is_found(
         codes={} if answer == "refused-again" else {_start_on(3): "KT-CT-4321"},
     )
     coordinator = MeridianDataCoordinator(hass, _client(kraken))
-    fractions: list[float] = []
 
     with _sync() as importer:
-        data = await coordinator.async_fetch_and_import(
-            setup_import=True, progress=fractions.append
-        )
+        data = await coordinator.async_fetch_and_import()
 
     assert len(kraken.requests) == 4
     assert data.history_start is True
     assert data.windows_failed == 1
-    assert fractions == pytest.approx([1 / 13, 2 / 13, 3 / 13, 1.0])
     imported = importer.await_args.kwargs["measurements"]
     assert [item.start.astimezone(UTC) for item in imported] == [
         start for start, _channel in _expected(kraken, since)
@@ -1806,13 +1791,12 @@ def _two_properties() -> MeridianAccount:
     )
 
 
-@pytest.mark.parametrize("setup_import", [True, False], ids=["setup", "after-setup"])
 @pytest.mark.parametrize(
     "starts_before", [False, True], ids=["ends-before-supply", "starts-before-supply"]
 )
 @pytest.mark.asyncio
 async def test_a_property_whose_supply_has_not_started_fails_nothing(
-    hass, caplog: pytest.LogCaptureFixture, setup_import: bool, starts_before: bool
+    hass, caplog: pytest.LogCaptureFixture, starts_before: bool
 ) -> None:
     """
     A property listed before its supply starts, next to one supplied, syncs.
@@ -1822,9 +1806,9 @@ async def test_a_property_whose_supply_has_not_started_fails_nothing(
     ends before the supply, perhaps any that starts before it. Before any
     reading, the newest week and then today alone are refused with a
     GraphQL error: there is no history yet, with one INFO line. The other
-    property's history is imported, and the sync succeeds, at setup and in
-    every update after it, rather than fail for every property until the
-    supply starts.
+    property's history is imported, and the sync succeeds, in the first
+    sync and every update after it, rather than fail for every property
+    until the supply starts.
     """
     caplog.set_level(logging.INFO, logger=_LOGGER_NAME)
     active = FakeKraken(NOW, days=400)
@@ -1844,7 +1828,7 @@ async def test_a_property_whose_supply_has_not_started_fails_nothing(
     coordinator = MeridianDataCoordinator(hass, client)
 
     with _sync() as importer:
-        data = await coordinator.async_fetch_and_import(setup_import=setup_import)
+        data = await coordinator.async_fetch_and_import()
         later = await coordinator.async_fetch_and_import()
 
     assert data.sync_mode is SyncMode.INITIAL
@@ -1880,10 +1864,9 @@ async def test_a_property_whose_supply_has_not_started_fails_nothing(
     ]
 
 
-@pytest.mark.parametrize("setup_import", [True, False], ids=["setup", "after-setup"])
 @pytest.mark.asyncio
 async def test_rows_still_to_come_are_no_reading(
-    hass, caplog: pytest.LogCaptureFixture, setup_import: bool
+    hass, caplog: pytest.LogCaptureFixture
 ) -> None:
     """
     A meter silent for 30 days, with Meridian's estimates for the rest of today.
@@ -1902,7 +1885,7 @@ async def test_rows_still_to_come_are_no_reading(
     coordinator = MeridianDataCoordinator(hass, _client(kraken))
 
     with _sync() as importer:
-        data = await coordinator.async_fetch_and_import(setup_import=setup_import)
+        data = await coordinator.async_fetch_and_import()
 
     assert len(kraken.requests) == 13
     assert data.history_start is False
@@ -1926,7 +1909,7 @@ async def test_a_history_of_estimates_still_to_come_says_none_was_found(
     coordinator = MeridianDataCoordinator(hass, _client(kraken))
 
     with _sync() as importer:
-        data = await coordinator.async_fetch_and_import(setup_import=True)
+        data = await coordinator.async_fetch_and_import()
 
     importer.assert_not_awaited()
     assert len(kraken.requests) == 13
@@ -1950,7 +1933,7 @@ async def test_empty_weeks_apart_inside_the_history_are_crossed(hass) -> None:
     coordinator = MeridianDataCoordinator(hass, _client(kraken))
 
     with _sync() as importer:
-        data = await coordinator.async_fetch_and_import(setup_import=True)
+        data = await coordinator.async_fetch_and_import()
 
     assert len(kraken.requests) == 13
     assert data.history_start is False
@@ -2016,7 +1999,7 @@ async def test_a_meter_with_many_channels_fits_its_newest_week(
     coordinator = MeridianDataCoordinator(hass, _client(kraken))
 
     with _sync() as importer:
-        await coordinator.async_fetch_and_import(setup_import=True)
+        await coordinator.async_fetch_and_import()
 
     newest_week = [
         request
@@ -2033,31 +2016,29 @@ async def test_a_meter_with_many_channels_fits_its_newest_week(
 
 
 @pytest.mark.asyncio
-async def test_setup_in_the_hour_after_nz_midnight_sends_13_weeks(hass) -> None:
+async def test_a_first_import_in_the_hour_after_nz_midnight_sends_13_weeks(
+    hass,
+) -> None:
     """
     No 14th request asks for a date no row kept is on.
 
     At 00:30 on 23 October 2026, 90 days back is 23:30 on 24 July, in
-    standard time: the first hour kept is midnight after it. Setup asks for
-    13 weeks, 91 dates from 25 July, as it does an hour later, and imports
-    what one request for the 90 days would have.
+    standard time: the first hour kept is midnight after it. The first
+    import asks for 13 weeks, 91 dates from 25 July, as it does an hour
+    later, and imports what one request for the 90 days would have.
     """
     for minutes in (0, 60):
         now = datetime(2026, 10, 22, 11, 30, tzinfo=UTC) + timedelta(minutes=minutes)
         kraken = FakeKraken(now, days=400)
         coordinator = MeridianDataCoordinator(hass, _client(kraken))
-        fractions: list[float] = []
 
         with _sync(now) as importer:
-            data = await coordinator.async_fetch_and_import(
-                setup_import=True, progress=fractions.append
-            )
+            data = await coordinator.async_fetch_and_import()
 
         walk = data.results[0].consumption_walk
         assert (len(kraken.requests), walk.windows_requested) == (13, 13)
         assert walk.requested_days == 91
         assert _windows(kraken)[-1][0] == date(2026, 7, 25)
-        assert fractions == pytest.approx([index / 13 for index in range(1, 14)])
         imported = importer.await_args.kwargs["measurements"]
         assert [item.start.astimezone(UTC) for item in imported] == [
             start for start, _channel in _expected(kraken, now - INITIAL_BACKFILL, now)
@@ -2076,7 +2057,7 @@ async def test_kraken_rate_limit_stops_the_sync_for_an_hour_without_a_resend(
     coordinator = MeridianDataCoordinator(hass, _client(kraken))
 
     with _sync(), pytest.raises(UpdateFailed) as raised:
-        await coordinator.async_fetch_and_import(setup_import=True)
+        await coordinator.async_fetch_and_import()
 
     assert raised.value.translation_key == "rate_limited"
     assert raised.value.retry_after == 3600
@@ -2093,14 +2074,15 @@ async def test_a_query_over_krakens_limits_is_asked_for_by_day_once(
 
     The rest of the walk then asks for days too, and imports the 90 days.
     A second refusal, of one of those days, stops the walk with unusable
-    data, as one did at once until now; the same request is never resent.
+    data, as one did at once until now, after the newer days it imported;
+    the same request is never resent.
     """
     caplog.set_level(logging.INFO, logger=_LOGGER_NAME)
     kraken = FakeKraken(NOW, week_codes={TODAY - timedelta(days=6): code})
     coordinator = MeridianDataCoordinator(hass, _client(kraken))
 
     with _sync() as importer:
-        data = await coordinator.async_fetch_and_import(setup_import=True)
+        data = await coordinator.async_fetch_and_import()
 
     # The week, then the 91 dates of the 90 days one at a time.
     assert len(kraken.requests) == 92
@@ -2119,11 +2101,13 @@ async def test_a_query_over_krakens_limits_is_asked_for_by_day_once(
 
     refused = FakeKraken(NOW, codes={TODAY - timedelta(days=6): code})
     coordinator = MeridianDataCoordinator(hass, _client(refused))
-    with _sync(), pytest.raises(UpdateFailed) as raised:
-        await coordinator.async_fetch_and_import(setup_import=True)
+    with _sync():
+        data = await coordinator.async_fetch_and_import()
 
-    assert raised.value.translation_key == "invalid_data"
-    assert code in str(raised.value.__cause__)
+    assert data.units_degraded == 1
+    (unit,) = coordinator.unit_diagnostics()
+    assert unit["last_failure"]["reason"] == "invalid_data"
+    assert unit["last_failure"]["cause"] == "MeridianGraphQLError"
     # The week, then its days from today back to its first, refused again.
     assert [request["startOn"] for request in refused.requests] == [
         (TODAY - timedelta(days=offset)).isoformat() for offset in (6, *range(7))
@@ -2151,7 +2135,7 @@ async def test_a_date_refused_in_a_walk_by_day_with_readings_before_it_is_no_sta
     coordinator = MeridianDataCoordinator(hass, _client(kraken))
 
     with _sync() as importer:
-        data = await coordinator.async_fetch_and_import(setup_import=True)
+        data = await coordinator.async_fetch_and_import()
 
     asked = [request["startOn"] for request in kraken.requests]
     assert asked[-2:] == [
@@ -2240,13 +2224,11 @@ def _status(status: int) -> Response:
 
 
 async def _run(
-    hass, session: FakeMeridianSession, *, setup: bool, budget: float | None = None
+    hass, session: FakeMeridianSession, *, budget: float | None = None
 ) -> Any:
     coordinator = MeridianDataCoordinator(hass, _http_client(session))
     with _sync():
-        return coordinator, await coordinator.async_fetch_and_import(
-            setup_import=setup, time_budget=budget
-        )
+        return coordinator, await coordinator.async_fetch_and_import(time_budget=budget)
 
 
 def _failed_pages(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -2257,11 +2239,10 @@ def _failed_pages(caplog: pytest.LogCaptureFixture) -> list[str]:
     ]
 
 
-@pytest.mark.parametrize("setup", [True, False], ids=["setup", "polling"])
 @pytest.mark.parametrize("status", [408, 502, 503, 520, 521, 522, 523])
 @pytest.mark.asyncio
 async def test_a_passing_failure_is_sent_once_more_after_a_short_pause(
-    hass, caplog: pytest.LogCaptureFixture, setup: bool, status: int
+    hass, caplog: pytest.LogCaptureFixture, status: int
 ) -> None:
     caplog.set_level(logging.DEBUG, logger=_LOGGER_NAME)
     clock = _Clock()
@@ -2269,7 +2250,7 @@ async def test_a_passing_failure_is_sent_once_more_after_a_short_pause(
     sent = _answers(session, _status(status))
 
     with _timed(clock):
-        _coordinator, data = await _run(hass, session, setup=setup)
+        _coordinator, data = await _run(hass, session)
 
     # Window 1 twice, then the two empty windows before the history start.
     assert sent() == 4
@@ -2289,7 +2270,7 @@ async def test_the_pause_before_a_resend_is_between_2_and_5_seconds(hass) -> Non
         patch.object(coordinator_module, "monotonic", side_effect=clock),
         patch.object(coordinator_module, "_async_wait", side_effect=clock.wait),
     ):
-        _coordinator, data = await _run(hass, session, setup=False)
+        _coordinator, data = await _run(hass, session)
 
     assert data.retries == 1
     assert 2.0 <= clock.waits[0] <= 5.0
@@ -2302,58 +2283,10 @@ async def test_a_second_passing_failure_fails_the_sync(hass) -> None:
     sent = _answers(session, _status(503), _status(503))
 
     with _timed(clock), pytest.raises(UpdateFailed) as raised:
-        await _run(hass, session, setup=True)
+        await _run(hass, session)
 
     assert raised.value.translation_key == "upstream_unavailable"
     assert sent() == 2
-
-
-@pytest.mark.parametrize("seconds", [5.0, 90.0])
-@pytest.mark.asyncio
-async def test_a_gateway_timeout_in_setup_probes_the_newest_day_after_the_cooldown(
-    hass, caplog: pytest.LogCaptureFixture, seconds: float
-) -> None:
-    """
-    No request goes to the property for 75 s, or as long as the failure took.
-
-    The service behind the gateway may still be working on the first
-    request, so the probe waits rather than stack a second one on it, and
-    asks for the week's newest day alone; its other days follow one at a
-    time, then the walk goes back to weeks. The failed request has ended by
-    then: during the cooldown, a failure or a cancellation does not name it
-    as still waiting for an answer.
-    """
-    caplog.set_level(logging.DEBUG, logger=_LOGGER_NAME)
-    clock = _Clock()
-    session = _session(clock, days=3)
-    sent = _answers(session, _status(504), seconds=seconds)
-    coordinator = MeridianDataCoordinator(hass, _http_client(session))
-    during_waits: list[Any] = []
-
-    async def wait(wait_seconds: float) -> None:
-        during_waits.append(coordinator.last_request)
-        await clock.wait(wait_seconds)
-
-    with (
-        _timed(clock),
-        patch.object(coordinator_module, "_async_wait", side_effect=wait),
-        _sync(),
-    ):
-        # Without a time budget: 10 requests of 90 s each would outlast it.
-        data = await coordinator.async_fetch_and_import(setup_import=True)
-
-    # The week, its 7 days, then the two empty weeks before the history.
-    assert sent() == 10
-    assert data.retries == 0
-    assert data.splits == 1
-    assert clock.waits[0] == max(75.0, seconds)
-    failed = during_waits[0]
-    assert (failed.operation, failed.window, failed.page) == ("measurements", 1, 1)
-    assert failed.finished_at is not None
-    assert failed.finished_at - failed.started_at == seconds
-    (line,) = _failed_pages(caplog)
-    assert " status=504 action=probe_1d " in line
-    assert data.results[0].consumption_walk.windows_requested == 10
 
 
 @pytest.mark.parametrize("status", [504, 524])
@@ -2367,7 +2300,7 @@ async def test_a_gateway_timeout_in_polling_is_left_to_the_next_poll(
     sent = _answers(session, _status(status))
 
     with _timed(clock), pytest.raises(UpdateFailed) as raised:
-        await _run(hass, session, setup=False)
+        await _run(hass, session)
 
     assert raised.value.translation_key == "upstream_timeout"
     assert sent() == 1
@@ -2415,7 +2348,7 @@ async def test_rate_limits_graphql_errors_and_client_errors_are_never_resent(
     fails = pytest.raises(UpdateFailed) if answer != "graphql_error" else nullcontext()
 
     with _timed(clock), fails:
-        await _run(hass, session, setup=True, budget=SETUP_IMPORT_BUDGET_SECONDS)
+        await _run(hass, session, budget=POLL_BUDGET_SECONDS)
 
     assert sent() == (2 if answer in {"graphql_error", "rejected"} else 1)
     assert len(set(asked)) == len(asked)
@@ -2436,20 +2369,20 @@ async def test_a_gateway_timeout_needs_no_session_refresh(hass) -> None:
 
     session.post = post  # type: ignore[method-assign]
 
-    with _timed(clock):
-        await _run(hass, session, setup=True, budget=SETUP_IMPORT_BUDGET_SECONDS)
+    with _timed(clock), pytest.raises(UpdateFailed):
+        await _run(hass, session, budget=POLL_BUDGET_SECONDS)
 
     assert not any(url.startswith(FIREBASE_REFRESH_URL) for url in posts)
 
 
 @pytest.mark.asyncio
-async def test_a_rejected_resend_gets_its_own_session_refresh(hass) -> None:
+async def test_a_rejected_probe_gets_its_own_session_refresh(hass) -> None:
     """
     504, then 401, then 200: one forced refresh and no reauthentication.
 
-    The probe after the 504 is a new call to the client, whose own loop
-    renews a rejected session once; reusing that loop for it would have
-    forced a refresh on the 504 and taken the 401 as a final rejection.
+    The probe the next update sends after the 504 is a new call to the
+    client, whose own loop renews a rejected session once: the 504 forced
+    no refresh, and the 401 is not taken as a final rejection.
     """
     clock = _Clock()
     session = _session(clock, days=3)
@@ -2462,45 +2395,36 @@ async def test_a_rejected_resend_gets_its_own_session_refresh(hass) -> None:
         return real_post(url, **kwargs)
 
     session.post = post  # type: ignore[method-assign]
+    coordinator = MeridianDataCoordinator(hass, _http_client(session))
 
-    with _timed(clock):
-        _coordinator, data = await _run(
-            hass, session, setup=True, budget=SETUP_IMPORT_BUDGET_SECONDS
-        )
+    with _timed(clock), _sync():
+        with pytest.raises(UpdateFailed):
+            await coordinator.async_fetch_and_import(time_budget=POLL_BUDGET_SECONDS)
+        assert not any(url.startswith(FIREBASE_REFRESH_URL) for url in posts)
+        data = await coordinator.async_fetch_and_import(time_budget=POLL_BUDGET_SECONDS)
 
     assert sum(url.startswith(FIREBASE_REFRESH_URL) for url in posts) == 1
-    # The week, the probe rejected and sent again with a new session, the
-    # week's other 6 days, then the two empty weeks.
+    # The week, then the next update's probe, rejected and sent again with a
+    # new session, the week's other 6 days, then the two empty weeks.
     assert sent() == 11
     assert data.splits == 1
 
 
 @pytest.mark.parametrize(
     ("status", "budget", "resent", "error"),
-    [
-        (504, 154.0, False, UpdateFailed),
-        (504, 155.0, True, UpdateFailed),
-        (503, 83.0, False, UpdateFailed),
-        (503, 84.0, True, None),
-    ],
+    [(503, 83.0, False, UpdateFailed), (503, 84.0, True, None)],
 )
 @pytest.mark.asyncio
 async def test_a_resend_needs_time_left_for_another_request(
     hass, status: int, budget: float, resent: bool, error: type[Exception] | None
 ) -> None:
     """
-    A second request must still leave 80 s after its wait: 75 s, or 3.5 s here.
+    A request sent again must still leave 80 s after its 3.5 s wait.
 
-    After a gateway timeout that request is the probe of the week's newest
-    day; after another passing failure, the request sent again. With just
-    enough left, it goes, and then the next request cannot start: less than
-    80 s remain. The probe's day alone is not the newest week, so setup
-    fails; the week sent again is, so setup keeps it. Without, the gateway
-    timeout's probe cannot start either, while the other failure stands.
-    Setup fails with the gateway timeout, not the time budget: the timeout
-    and its cooldown cost the time, and the failure form then offers to
-    continue without history. Either failure is raised as it came, from
-    the answer it was raised for.
+    With just enough left, it goes, and the week it fetches is kept; the
+    next request cannot start, as less than 80 s remain. Without, the
+    failure stands, raised as it came, from the answer it was raised for.
+    The deep walk's own budget is left out, so the one given holds.
     """
     clock = _Clock()
     session = _session(clock, days=3)
@@ -2508,9 +2432,10 @@ async def test_a_resend_needs_time_left_for_another_request(
 
     with (
         _timed(clock),
+        patch.object(coordinator_module, "DEEP_WALK_BUDGET_SECONDS", 0),
         pytest.raises(error) if error else nullcontext() as raised,
     ):
-        await _run(hass, session, setup=True, budget=budget)
+        await _run(hass, session, budget=budget)
 
     assert sent() == (2 if resent else 1)
     if raised is not None:
@@ -2531,17 +2456,20 @@ async def test_no_request_starts_with_less_than_80_seconds_left(hass) -> None:
     """
     The first request always starts; later ones need 80 s of the budget.
 
-    What came back before is imported: setup keeps the weeks fetched.
+    What came back before is imported, and later updates fetch the rest.
+    The deep walk's own budget is left out, so the one given holds.
     """
     clock = _Clock()
     session = _session(clock)
     sent = _answers(session, seconds=30.0)
     coordinator = MeridianDataCoordinator(hass, _http_client(session))
 
-    with _timed(clock), _sync():
-        data = await coordinator.async_fetch_and_import(
-            setup_import=True, time_budget=171.0
-        )
+    with (
+        _timed(clock),
+        _sync(),
+        patch.object(coordinator_module, "DEEP_WALK_BUDGET_SECONDS", 0),
+    ):
+        data = await coordinator.async_fetch_and_import(time_budget=171.0)
 
     # Starts at 0, 30, 60 and 90 s; at 120 s only 51 s would remain.
     assert sent() == 4
@@ -2551,10 +2479,12 @@ async def test_no_request_starts_with_less_than_80_seconds_left(hass) -> None:
     first = _session(clock)
     first_sent = _answers(first, seconds=30.0)
     coordinator = MeridianDataCoordinator(hass, _http_client(first))
-    with _timed(clock), _sync():
-        data = await coordinator.async_fetch_and_import(
-            setup_import=True, time_budget=10.0
-        )
+    with (
+        _timed(clock),
+        _sync(),
+        patch.object(coordinator_module, "DEEP_WALK_BUDGET_SECONDS", 0),
+    ):
+        data = await coordinator.async_fetch_and_import(time_budget=10.0)
     assert first_sent() == 1
     assert data.units_degraded == 1
 
@@ -2566,7 +2496,7 @@ async def test_measurements_requests_start_at_least_a_second_apart(hass) -> None
     sent = _answers(session, seconds=0.25)
 
     with _timed(clock):
-        await _run(hass, session, setup=False)
+        await _run(hass, session)
 
     assert sent() == 13
     assert clock.waits == [0.75] * 12
@@ -2646,39 +2576,7 @@ async def test_overlapping_windows_that_disagree_fail(hass) -> None:
         await _fetch(coordinator, NOW - REVISION_OVERLAP)
 
 
-# --------------------------------------------------------------- progress
-
-
-@pytest.mark.parametrize(
-    ("days", "feed_in", "pre_supply_error", "reported"),
-    [
-        (400, False, None, [index / 13 for index in range(1, 14)]),
-        # Three weeks with readings, two empty ones, then the rest skipped.
-        (20, False, None, [1 / 13, 2 / 13, 3 / 13, 4 / 13, 5 / 13, 1.0]),
-        # Three weeks with readings, one rejected, then the rest skipped.
-        (20, False, "KT-CT-4321", [1 / 13, 2 / 13, 3 / 13, 4 / 13, 1.0]),
-        (400, True, None, [index / 26 for index in range(1, 27)]),
-    ],
-    ids=["full-history", "short-history", "rejected-before-supply", "feed-in"],
-)
-@pytest.mark.asyncio
-async def test_progress_counts_the_windows_done_of_those_planned(
-    hass,
-    days: int,
-    feed_in: bool,
-    pre_supply_error: str | None,
-    reported: list[float],
-) -> None:
-    kraken = FakeKraken(NOW, days=days, pre_supply_error=pre_supply_error)
-    coordinator = MeridianDataCoordinator(hass, _client(kraken, feed_in=feed_in))
-    fractions: list[float] = []
-
-    with _sync():
-        await coordinator.async_fetch_and_import(
-            setup_import=True, progress=fractions.append
-        )
-
-    assert fractions == pytest.approx(reported)
+# ------------------------------------------------------------ the clock
 
 
 @pytest.mark.asyncio
@@ -2688,16 +2586,15 @@ async def test_a_sync_across_new_zealand_midnight_sends_the_windows_it_planned(
     """
     A sync reads the clock once: the windows it sends are those it counted.
 
-    Setup starts at 23:50 in New Zealand, and its walk starts after midnight.
-    It still sends 13 weeks for its 90 days, ending on the date it started,
-    and its progress reaches 1.0 with the last of them, not before.
+    The first sync starts at 23:50 in New Zealand, and its walk starts after
+    midnight. It still sends 13 weeks for its 90 days, ending on the date it
+    started.
     """
     started = datetime(2026, 10, 16, 10, 50, tzinfo=UTC)
     later = started + timedelta(minutes=12)
     assert later.astimezone(NZ).date() > started.astimezone(NZ).date()
     kraken = FakeKraken(started)
     coordinator = MeridianDataCoordinator(hass, _client(kraken))
-    fractions: list[float] = []
     readings = iter([started])
 
     with (
@@ -2706,14 +2603,11 @@ async def test_a_sync_across_new_zealand_midnight_sends_the_windows_it_planned(
             coordinator_module, "_utcnow", side_effect=lambda: next(readings, later)
         ),
     ):
-        await coordinator.async_fetch_and_import(
-            setup_import=True, progress=fractions.append
-        )
+        await coordinator.async_fetch_and_import()
 
     sent = _windows(kraken)
     assert len(sent) == len(kraken.requests) == 13
     assert sent[0][1] == started.astimezone(NZ).date()
-    assert fractions == pytest.approx([index / 13 for index in range(1, 14)])
 
 
 @pytest.mark.asyncio
@@ -2731,7 +2625,6 @@ async def test_statistics_that_turn_14_days_old_during_a_sync_keep_its_mode(
     later = started + timedelta(minutes=12)
     kraken = FakeKraken(started)
     coordinator = MeridianDataCoordinator(hass, _client(kraken))
-    fractions: list[float] = []
     readings = iter([started])
 
     with (
@@ -2740,12 +2633,11 @@ async def test_statistics_that_turn_14_days_old_during_a_sync_keep_its_mode(
             coordinator_module, "_utcnow", side_effect=lambda: next(readings, later)
         ),
     ):
-        data = await coordinator.async_fetch_and_import(progress=fractions.append)
+        data = await coordinator.async_fetch_and_import()
 
     assert data.sync_mode is SyncMode.RESTART
     assert data.results[0].consumption_walk.requested_days == 15
     assert len(kraken.requests) == 3
-    assert fractions == pytest.approx([1 / 3, 2 / 3, 1.0])
 
 
 # ------------------------------------------------------- load on Meridian
@@ -2762,7 +2654,7 @@ async def test_statistics_that_turn_14_days_old_during_a_sync_keep_its_mode(
         ("setup-nine-channels", 44),
         ("setup-21-channels", 77),
         ("setup-24-channels", 91),
-        ("setup-gateway-timeouts", 2),
+        ("setup-gateway-timeouts", 1),
         ("restart", 3),
         ("restart-no-history", 13),
         ("full-reconciliation", 3),
@@ -2782,9 +2674,9 @@ async def test_requests_per_sync_mode(hass, case: str, requests: int) -> None:
     thirteen. The newest week, read before the channels are known, takes
     pages of 214 rows: eight for nine channels, 17 for 21 and 19 for 24. A
     direction with no readings in 90 days, such as a property whose supply
-    ended or an export register that never exported, walks all 13 weeks at
-    setup, and again after each restart, which cannot tell it from one
-    that no setup searched.
+    ended or an export register that never exported, walks all 13 weeks in
+    the first sync after setup, and again after each restart, which cannot
+    tell it from one that no coordinator searched.
     """
     channels = {
         "setup-two-channels": 2,
@@ -2827,10 +2719,10 @@ async def test_requests_per_sync_mode(hass, case: str, requests: int) -> None:
         elif case == "setup-gateway-timeouts":
             with pytest.raises(UpdateFailed):
                 await coordinator.async_fetch_and_import(
-                    setup_import=True, time_budget=SETUP_IMPORT_BUDGET_SECONDS
+                    time_budget=POLL_BUDGET_SECONDS
                 )
         else:
-            await coordinator.async_fetch_and_import(setup_import=True)
+            await coordinator.async_fetch_and_import()
 
     assert client.async_get_measurements.await_count == requests
     assert all(rows <= 169 * channels for rows in kraken.materialized)

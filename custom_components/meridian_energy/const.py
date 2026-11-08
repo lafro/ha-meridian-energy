@@ -7,10 +7,6 @@ NAME = "Meridian Energy"
 
 CONF_REFRESH_TOKEN = "refresh_token"  # noqa: S105 - config-entry field name
 CONF_FIREBASE_USER_ID = "firebase_user_id"
-CONF_SELECTED_ACCOUNTS = "selected_accounts"
-CONF_AUTO_ADD_ACCOUNTS = "auto_add_accounts"
-CONF_STATISTICS_STATE_VERSION = "statistics_state_version"
-STATISTICS_STATE_VERSION = 1
 
 AUTH_EMAIL_URL = "https://auth.meridianenergy.nz/cf/email-connector"
 AUTH_OTP_URL = "https://auth.meridianenergy.nz/cf/email-otp-authenticator"
@@ -85,29 +81,16 @@ FIRST_SYNC_RETRY_SCHEDULE = (FIRST_SYNC_RETRY_SECONDS, 1800, 3600)
 # starts once less than REQUEST_START_RESERVE_SECONDS of it remain.
 POLL_BUDGET_SECONDS = 240
 # How many 30 s waits an entry's first sync makes for the recorder to save
-# the work queued before it, such as the setup import, before it reads any
-# statistics. When the recorder is still behind, the sync tries again after
-# FIRST_SYNC_RETRY_SECONDS.
+# the work queued before it, such as the last import before a reload, before
+# it reads any statistics. When the recorder is still behind, the sync tries
+# again after FIRST_SYNC_RETRY_SECONDS.
 FIRST_SYNC_RECORDER_WAITS = 10
-SETUP_IMPORT_RETRY_DELAY_SECONDS = 120
-# A backstop for one setup import attempt, including the wait for the
-# recorder to save it; real failures end long before.
-SETUP_IMPORT_TIMEOUT_SECONDS = 300
-# The setup import's own budget, as an hourly update's: no request after its
-# first starts once less than REQUEST_START_RESERVE_SECONDS of it remain, so
-# the last one can end before the backstop, and what came back is imported.
-# Setup then creates the entry, whose updates import the rest.
-SETUP_IMPORT_BUDGET_SECONDS = POLL_BUDGET_SECONDS
 # An hourly update that walks back further than 14 days for a direction, as
 # a first import or a catch-up after a long outage, has this budget instead:
 # it imports what it fetched all the same, but a search for the newest
 # reading of a supply that ended must finish to show it ended, or it would
 # start again at every update. Its newest windows still go first.
 DEEP_WALK_BUDGET_SECONDS = 900
-SETUP_IMPORT_MAX_ATTEMPTS = 5
-# Where a finished setup leaves its new entry the accounts it found and when
-# its import ran, in hass.data[DOMAIN], keyed by the entry's unique ID.
-SETUP_HANDOFF = "setup_handoff"
 # Where each entry keeps, across its reloads, the oldest hour of each unit's
 # deep replay that was not confirmed, in hass.data[DOMAIN], keyed by the
 # entry's ID. A restart of Home Assistant forgets it.
