@@ -33,7 +33,8 @@ def is_service_failure(codes: Iterable[str]) -> bool:
 
     Such an error, as for a failure inside Meridian's service, says nothing
     about the request: it counts as Meridian not answering, not as a
-    refusal. A GraphQL error always carries at least one code.
+    refusal. An error without a code is recorded as UNKNOWN_ERROR_CODE, so
+    codes is never empty.
     """
     return set(codes) <= {UNKNOWN_ERROR_CODE}
 
