@@ -54,6 +54,8 @@ Each selected account is represented by one service device.
 
 The **Current bill** sensors are running totals for the current period, with the period dates as attributes. They have no state class, so Home Assistant keeps no long-term statistics for them and does not offer them in the Energy dashboard; the statistics below are the long-term record.
 
+The period follows Meridian's billing cycle, as Meridian's apps do, so its dates can differ by a day or two from the period printed on your bill. The totals also include Meridian's estimates for past hours it has not read yet, which the app's "so far" total leaves out, so they can be higher than it until those hours are read.
+
 ## Energy dashboard statistics
 
 For each property, the integration creates:
