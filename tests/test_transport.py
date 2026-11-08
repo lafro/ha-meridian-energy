@@ -160,17 +160,13 @@ async def test_measurements_requests_carry_both_bounds_on_every_page() -> None:
     assert first["headers"] == {"Authorization": "synthetic-id-token"}
 
 
-def test_operation_name_parity_reverts_name_and_url_together() -> None:
-    """One switch changes the measurements query's name and URL, never one alone."""
+def test_measurements_go_out_under_the_web_apps_name() -> None:
+    """The query's name and the URL's ``opName`` are the web app's."""
     assert measurements_operation(GRAPHQL_URL) == (
         "GetMeasurements",
         f"{GRAPHQL_URL}?opName=GetMeasurements",
     )
-    assert measurements_operation(GRAPHQL_URL, web_app_name=False) == (
-        "measurements",
-        GRAPHQL_URL,
-    )
-    assert "query measurements(" in measurements_query("measurements")
+    assert "query GetMeasurements(" in measurements_query("GetMeasurements")
 
 
 @pytest.mark.parametrize(
@@ -246,7 +242,7 @@ async def _measurements(client: MeridianApiClient) -> object:
 async def test_html_gateway_error_is_logged_by_class_before_parsing(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """An HTML 504 logs its status, kind, size and hop, and none of its text."""
+    """An HTML 504 logs its status, kind and size, and none of its text."""
     caplog.set_level(logging.DEBUG, logger="custom_components.meridian_energy")
     session = _CapturingSession(
         _Response(
@@ -257,7 +253,7 @@ async def test_html_gateway_error_is_logged_by_class_before_parsing(
     )
     client = MeridianApiClient(session, tokens=_tokens())  # type: ignore[arg-type]
 
-    # Readings at the start, once the headers arrive and once the body has.
+    # Readings at the start and once the body has arrived.
     with (
         patch.object(transport_module, "monotonic", side_effect=_Clock(30.62)),
         pytest.raises(MeridianUpstreamError) as raised,
@@ -269,43 +265,11 @@ async def test_html_gateway_error_is_logged_by_class_before_parsing(
     (record,) = _transport_records(caplog)
     assert record.levelno == logging.DEBUG
     assert record.getMessage() == (
-        f"Meridian response: operation=measurements status=504 content=html "
-        f"bytes={len(_HTML_504)} edge=cloudflare cf_ray=yes elapsed=61.2s"
+        f"Meridian request: operation=measurements status=504 content=html "
+        f"bytes={len(_HTML_504)} elapsed=30.6s"
     )
     for text in _PRIVATE_TEXT:
         assert text not in caplog.text
-
-
-@pytest.mark.parametrize(
-    ("body", "headers", "edge", "cf_ray"),
-    [
-        (b"<html>cloudflare</html>", {"Content-Type": "text/html"}, "cloudflare", "no"),
-        (b"<html>Ray ID: 1</html>", {"cf-ray": "1"}, "cloudflare", "yes"),
-        (b"<html><center>awselb/2.0</center></html>", {}, "awselb", "no"),
-        (b"<html><center>nginx</center></html>", {}, "nginx", "no"),
-        (b"Service Unavailable", {"Content-Type": "text/plain"}, "other", "no"),
-    ],
-)
-@pytest.mark.asyncio
-async def test_edge_class_comes_from_fixed_body_markers_only(
-    caplog: pytest.LogCaptureFixture,
-    body: bytes,
-    headers: dict[str, str],
-    edge: str,
-    cf_ray: str,
-) -> None:
-    caplog.set_level(logging.DEBUG, logger="custom_components.meridian_energy")
-    client = MeridianApiClient(
-        _CapturingSession(_Response(body, status=503, headers=headers)),  # type: ignore[arg-type]
-        tokens=_tokens(),
-    )
-
-    with pytest.raises(MeridianUpstreamError) as raised:
-        await _measurements(client)
-
-    assert raised.value.gateway is False
-    (record,) = _transport_records(caplog)
-    assert f" edge={edge} cf_ray={cf_ray} " in record.getMessage()
 
 
 @pytest.mark.parametrize(
@@ -334,10 +298,6 @@ async def test_content_class_comes_from_the_content_type(
 
     (record,) = _transport_records(caplog)
     assert f" status=200 content={content} bytes={len(body)} " in record.getMessage()
-    # A JSON answer comes from Meridian's API itself, so no hop is guessed;
-    # any other body is checked for an error page's markers.
-    edge = "-" if content == "json" else "other"
-    assert f" edge={edge} cf_ray=no " in record.getMessage()
 
 
 @pytest.mark.asyncio
@@ -358,8 +318,8 @@ async def test_non_json_success_is_logged_and_still_unreadable(
     assert not isinstance(raised.value, MeridianUpstreamError)
     (record,) = _transport_records(caplog)
     assert record.getMessage().startswith(
-        f"Meridian response: operation=measurements status=200 content=html "
-        f"bytes={len(page)} edge=other cf_ray=no elapsed="
+        f"Meridian request: operation=measurements status=200 content=html "
+        f"bytes={len(page)} elapsed="
     )
     assert "maintenance" not in caplog.text
 
@@ -381,39 +341,30 @@ async def test_timeout_before_an_answer_logs_its_class_and_elapsed_time(
 
     assert raised.value.status is None
     assert raised.value.gateway is True
-    assert raised.value.detail == "no answer within the time limit"
+    assert raised.value.detail == "no answer in time"
     (record,) = _transport_records(caplog)
     assert record.getMessage() == (
-        "Meridian request timed out: operation=measurements error=TimeoutError "
-        "limit=75s status=- content=- cf_ray=- headers_after=- elapsed=75.0s"
+        "Meridian request: operation=measurements status=- content=- "
+        "error=TimeoutError elapsed=75.0s"
     )
 
 
 @pytest.mark.parametrize(
-    ("error", "line"),
+    "error",
     [
-        (
-            ServerTimeoutError("Timeout on reading data from socket"),
-            (
-                "Meridian request timed out: operation=measurements "
-                "error=ServerTimeoutError limit=75s"
-            ),
-        ),
-        (
-            ClientPayloadError("Response payload is not completed"),
-            "Meridian request failed: operation=measurements error=ClientPayloadError",
-        ),
+        ServerTimeoutError("Timeout on reading data from socket"),
+        ClientPayloadError("Response payload is not completed"),
     ],
 )
 @pytest.mark.asyncio
 async def test_a_body_that_fails_after_the_headers_logs_what_had_arrived(
-    caplog: pytest.LogCaptureFixture, error: Exception, line: str
+    caplog: pytest.LogCaptureFixture, error: Exception
 ) -> None:
     """
     An answer that started and then stalled is told apart from no answer.
 
     The status and headers were in; only the body did not finish. The line
-    says what had arrived, and when.
+    says what had arrived, and the class of the error that ended it.
     """
     caplog.set_level(logging.DEBUG, logger="custom_components.meridian_energy")
     response = _Response(
@@ -426,17 +377,19 @@ async def test_a_body_that_fails_after_the_headers_logs_what_had_arrived(
         tokens=_tokens(),
     )
 
-    # Readings at the start, once the headers arrive and when the body fails.
+    # Readings at the start and when the body fails.
     with (
-        patch.object(transport_module, "monotonic", side_effect=[100.0, 112.3, 175.0]),
+        patch.object(transport_module, "monotonic", side_effect=[100.0, 175.0]),
         pytest.raises(MeridianConnectionError) as raised,
     ):
         await _measurements(client)
 
     (record,) = _transport_records(caplog)
     assert record.getMessage() == (
-        f"{line} status=200 content=json cf_ray=yes headers_after=12.3s elapsed=75.0s"
+        "Meridian request: operation=measurements status=200 content=json "
+        f"error={type(error).__name__} elapsed=75.0s"
     )
+    assert str(error) not in caplog.text
     assert isinstance(raised.value, MeridianUpstreamError) is isinstance(
         error, TimeoutError
     )
@@ -491,8 +444,10 @@ async def test_an_error_page_that_fails_to_arrive_keeps_its_status(
     logged = "".join(traceback.format_exception(raised.value))
     assert str(error) not in logged
     (record,) = _transport_records(caplog)
-    assert f"error={type(error).__name__} " in record.getMessage()
-    assert f" status={status} content=html cf_ray=yes " in record.getMessage()
+    assert (
+        f" status={status} content=html error={type(error).__name__} elapsed="
+        in record.getMessage()
+    )
 
 
 @pytest.mark.parametrize(
@@ -573,9 +528,8 @@ async def test_no_connection_in_time_is_a_network_failure(
     assert raised.value.__cause__.error_class == "ConnectionTimeoutError"
     (record,) = _transport_records(caplog)
     assert re.fullmatch(
-        r"Meridian request failed: operation=measurements "
-        r"error=ConnectionTimeoutError status=- content=- cf_ray=- "
-        r"headers_after=- elapsed=0\.\ds",
+        r"Meridian request: operation=measurements status=- content=- "
+        r"error=ConnectionTimeoutError elapsed=0\.\ds",
         record.getMessage(),
     )
 
@@ -625,8 +579,8 @@ async def test_an_answer_that_never_comes_is_meridian_not_answering(
     (record,) = _transport_records(caplog)
     # The connection was made at once; only the answer never came.
     assert record.getMessage().startswith(
-        "Meridian request timed out: operation=measurements error=TimeoutError "
-        "limit=1s status=- content=- cf_ray=- headers_after=- elapsed="
+        "Meridian request: operation=measurements status=- content=- "
+        "error=TimeoutError elapsed="
     )
 
 
@@ -678,9 +632,8 @@ async def test_connection_failure_logs_its_class_and_elapsed_time(
     assert not isinstance(raised.value, MeridianUpstreamError)
     (record,) = _transport_records(caplog)
     assert record.getMessage() == (
-        "Meridian request failed: operation=measurements "
-        "error=ClientConnectionError status=- content=- cf_ray=- headers_after=- "
-        "elapsed=0.5s"
+        "Meridian request: operation=measurements status=- content=- "
+        "error=ClientConnectionError elapsed=0.5s"
     )
     assert "synthetic reset" not in caplog.text
 
@@ -858,50 +811,3 @@ async def test_session_service_failures_are_not_meridians(
         await attempt
 
     assert not isinstance(raised.value, MeridianUpstreamError)
-
-
-@pytest.mark.asyncio
-async def test_requests_are_counted_where_they_are_sent() -> None:
-    """
-    A tally counts every HTTP request sent while it counts, as it was sent.
-
-    One client call can send several requests: a session refresh before the
-    query, a retry after a rejected token, one request per account. Each
-    counts, a failed one too, with its time; nothing counts outside a tally.
-    """
-    refreshed = {
-        "id_token": "synthetic-id-token",
-        "refresh_token": "synthetic-refresh",
-        "expires_in": "3600",
-        "user_id": "synthetic-user",
-    }
-    session = _CapturingSession(refreshed, _EMPTY_PAGE, _EMPTY_PAGE)
-    expired = MeridianTokenSet(
-        id_token="synthetic-id-token",
-        refresh_token="synthetic-refresh",
-        expires_at=datetime.now(UTC) - timedelta(seconds=1),
-        user_id="synthetic-user",
-    )
-    client = MeridianApiClient(session, tokens=expired)  # type: ignore[arg-type]
-    # Readings at the start, the headers and the end of each request: the
-    # refresh takes 1 s, the page 40 s, and the request that times out 75 s.
-    readings = [0.0, 1.0, 1.0, 10.0, 40.0, 50.0, 100.0, 175.0]
-
-    with (
-        patch.object(transport_module, "monotonic", side_effect=readings),
-        transport_module.count_requests() as tally,
-    ):
-        await _measurements(client)
-        session.post = MagicMock(side_effect=TimeoutError())  # type: ignore[method-assign]
-        with pytest.raises(MeridianUpstreamError):
-            await _measurements(client)
-
-    assert tally.sent == 3
-    assert tally.median_seconds() == pytest.approx(40.0)
-    assert tally.median_seconds("measurements") == pytest.approx(57.5)
-    assert tally.median_seconds("billingPeriods") is None
-
-    session.post = MagicMock(side_effect=TimeoutError())  # type: ignore[method-assign]
-    with pytest.raises(MeridianUpstreamError):
-        await _measurements(client)
-    assert tally.sent == 3

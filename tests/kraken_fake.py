@@ -50,7 +50,11 @@ from custom_components.meridian_energy.api import (
 )
 from custom_components.meridian_energy.const import DEFAULT_RETRY_AFTER_SECONDS
 from custom_components.meridian_energy.graphql import RATE_LIMIT_CODE
-from custom_components.meridian_energy.models import MeasurementPage, MeridianTokenSet
+from custom_components.meridian_energy.models import (
+    MeasurementPage,
+    MeridianMeasurement,
+    MeridianTokenSet,
+)
 
 NZ = ZoneInfo("Pacific/Auckland")
 HOUR = timedelta(hours=1)
@@ -299,6 +303,7 @@ class FakeKraken:
                 for name in ("startOn", "endOn", "last", "before")
                 if variables.get(name) is not None
             }
+            | {"direction": variables.get("readingDirectionType")}
         )
         code = self.codes.get(start_on)
         if code is None and end_on > start_on:
@@ -354,8 +359,8 @@ class FakeKraken:
             }
         }
 
-    async def async_get_measurements(self, **kwargs: Any) -> MeasurementPage:
-        """Stand in for the client's call, parsing the answer as the client does."""
+    def client(self) -> MeridianApiClient:
+        """Return the integration's client, its GraphQL answered by this fake."""
         client = MeridianApiClient(
             MagicMock(),
             tokens=MeridianTokenSet(
@@ -381,7 +386,15 @@ class FakeKraken:
             return data
 
         client._async_graphql = answer  # type: ignore[method-assign,assignment]
-        return await client.async_get_measurements(**kwargs)
+        return client
+
+    async def async_get_measurements(self, **kwargs: Any) -> MeasurementPage:
+        """Stand in for the client's call, parsing the answer as the client does."""
+        return await self.client().async_get_measurements(**kwargs)
+
+    async def async_get_window(self, **kwargs: Any) -> tuple[MeridianMeasurement, ...]:
+        """Stand in for the client's window call, following pages as it does."""
+        return await self.client().async_get_window(**kwargs)
 
     def payload_dates(self) -> set[str]:
         """Return every date the history or the requests held, in either zone."""

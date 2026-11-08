@@ -69,25 +69,19 @@ query account($accountNumber: String!, $activeFrom: DateTime) {
 }
 """
 
-# Meridian's web app names its usage query GetMeasurements, and sends it to the
-# GraphQL URL with ``?opName=GetMeasurements`` added. The integration does the
-# same. The name and the URL change together, never one without the other:
-# set this to False to send the integration's earlier name, measurements, to
-# the bare URL again, should a live check find the web app's form refused.
-MEASUREMENTS_WEB_APP_NAME = True
-
 # Kraken's in-band limits, which arrive in an HTTP 200 body: a rate limit, and
 # a query whose complexity or node count is over the limit.
 RATE_LIMIT_CODE = "KT-CT-1199"
 QUERY_LIMIT_CODES = frozenset({"KT-CT-1188", "KT-CT-1189"})
 
 
-def measurements_operation(
-    graphql_url: str, *, web_app_name: bool = MEASUREMENTS_WEB_APP_NAME
-) -> tuple[str, str]:
-    """Return the measurements query's operation name and the URL it is sent to."""
-    if not web_app_name:
-        return "measurements", graphql_url
+def measurements_operation(graphql_url: str) -> tuple[str, str]:
+    """
+    Return the measurements query's operation name and the URL it is sent to.
+
+    Meridian's web app names its usage query GetMeasurements and adds
+    ``?opName=GetMeasurements`` to the GraphQL URL; so does the integration.
+    """
     name = "GetMeasurements"
     return name, f"{graphql_url}?opName={name}"
 

@@ -23,6 +23,7 @@ from custom_components.meridian_energy.api import (
     MeridianGraphQLError,
     MeridianOtpError,
     MeridianRateLimitError,
+    MeridianRejectedError,
     _graphql_error_code,
     _is_active_feed_in_register,
     _MeridianHttpError,
@@ -35,6 +36,8 @@ from custom_components.meridian_energy.api import (
     exception_chain,
 )
 from custom_components.meridian_energy.models import (
+    MeasurementPage,
+    MeridianMeasurement,
     MeridianTokenSet,
     require_list,
     require_mapping,
@@ -1214,13 +1217,23 @@ async def test_graphql_retries_once_after_unauthorized() -> None:
 
 
 @pytest.mark.asyncio
-async def test_graphql_second_unauthorized_requires_reauth() -> None:
+@pytest.mark.parametrize(
+    ("json_body", "error"),
+    [(True, MeridianAuthenticationError), (False, MeridianRejectedError)],
+)
+async def test_graphql_second_unauthorized_requires_reauth(
+    json_body: bool, error: type[Exception]
+) -> None:
+    """Only Meridian's own JSON refusal of a fresh session ends the sign-in."""
     client = MeridianApiClient(MagicMock(), tokens=_tokens())
     client.async_refresh_tokens = AsyncMock(return_value=_tokens())
     client._async_json_request = AsyncMock(
-        side_effect=[_MeridianHttpError(401, {}), _MeridianHttpError(403, {})]
+        side_effect=[
+            _MeridianHttpError(401, {}, json_body=True),
+            _MeridianHttpError(403, {}, json_body=json_body),
+        ]
     )
-    with pytest.raises(MeridianAuthenticationError):
+    with pytest.raises(error):
         await client._async_graphql("operation", "query", {})
 
 
@@ -1613,3 +1626,96 @@ def test_exception_chain_follows_what_a_traceback_shows() -> None:
         MeridianConnectionError,
         ValueError,
     ]
+
+
+def _page(rows: int, *, more: bool, cursor: str | None) -> MeasurementPage:
+    start = datetime(2026, 7, 10, tzinfo=UTC)
+    return MeasurementPage(
+        measurements=tuple(
+            MeridianMeasurement(
+                start=start + timedelta(hours=offset),
+                end=start + timedelta(hours=offset + 1),
+                value_kwh=Decimal("0.5"),
+                quality="ACTUAL",
+                direction="CONSUMPTION",
+                channel_id="synthetic-meter:synthetic-register",
+                cost_cents=Decimal(15),
+            )
+            for offset in range(rows)
+        ),
+        has_previous_page=more,
+        start_cursor=cursor,
+    )
+
+
+@pytest.mark.parametrize(
+    ("pages", "message"),
+    [
+        ([_page(0, more=True, cursor="c1")], "an empty page with more to come"),
+        ([_page(1, more=True, cursor=None)], "a page that does not move on"),
+        (
+            [_page(1, more=True, cursor=f"c{index}") for index in range(8)],
+            "more pages than a window can hold",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_window_whose_pages_cannot_end_is_refused(
+    pages: list[MeasurementPage], message: str
+) -> None:
+    """A window's pages must move on, end with an empty one, and number 8 at most."""
+    client = MeridianApiClient(MagicMock(), tokens=_tokens())
+    client.async_get_measurements = AsyncMock(side_effect=pages)  # type: ignore[method-assign]
+    pace = AsyncMock()
+
+    with pytest.raises(ValueError, match=message):
+        await client.async_get_window(
+            account_number="A-TEST-1",
+            property_id="synthetic-property",
+            direction="CONSUMPTION",
+            start_on=date(2026, 7, 10),
+            end_on=date(2026, 7, 16),
+            last=214,
+            pace=pace,
+            context="grid_import window=-6..0d",
+        )
+
+    assert pace.await_count == len(pages)
+    contexts = [
+        call.kwargs["context"] for call in client.async_get_measurements.await_args_list
+    ]
+    assert contexts == [
+        f"grid_import window=-6..0d page={number}"
+        for number in range(1, len(pages) + 1)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_window_without_pacing_or_context_reads_its_pages() -> None:
+    client = MeridianApiClient(MagicMock(), tokens=_tokens())
+    client.async_get_measurements = AsyncMock(  # type: ignore[method-assign]
+        side_effect=[
+            _page(2, more=True, cursor="c1"),
+            _page(1, more=False, cursor=None),
+        ]
+    )
+
+    rows = await client.async_get_window(
+        account_number="A-TEST-1",
+        property_id="synthetic-property",
+        direction="CONSUMPTION",
+        start_on=date(2026, 7, 10),
+        end_on=date(2026, 7, 16),
+        last=214,
+    )
+
+    assert len(rows) == 3
+    assert [
+        call.kwargs["before"] for call in client.async_get_measurements.await_args_list
+    ] == [
+        None,
+        "c1",
+    ]
+    assert (
+        client.async_get_measurements.await_args_list[0].kwargs["context"] == "page=1"
+    )

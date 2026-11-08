@@ -4,13 +4,9 @@ from __future__ import annotations
 
 import json as json_module
 import logging
-from collections.abc import Iterator, Mapping
-from contextlib import contextmanager
-from contextvars import ContextVar
-from dataclasses import dataclass, field
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
-from statistics import median
 from time import monotonic
 from typing import Any, NamedTuple
 
@@ -27,59 +23,6 @@ from .models import require_mapping
 
 _LOGGER = logging.getLogger(__name__)
 _HTTP_BAD_REQUEST = 400
-# Fixed markers of the hop that wrote an error page, checked in this order on
-# the lower-cased body. Only the class is logged, never the page: gateway
-# error pages show the client's IP address.
-_EDGE_MARKERS = (
-    ("cloudflare", (b"cloudflare", b"ray id")),
-    ("awselb", (b"awselb",)),
-    ("nginx", (b"nginx",)),
-)
-
-
-@dataclass(slots=True)
-class RequestTally:
-    """
-    The HTTP requests sent while a tally counts, and how long each took.
-
-    ``sent`` counts every request as it is sent; ``times`` holds the
-    operation and time of each one that ended, answered or failed.
-    """
-
-    sent: int = 0
-    times: list[tuple[str, float]] = field(default_factory=list)
-
-    def median_seconds(self, operation: str | None = None) -> float | None:
-        """Return the median time of the requests that ended, or of one kind."""
-        seconds = [
-            elapsed
-            for name, elapsed in self.times
-            if operation is None or name == operation
-        ]
-        return median(seconds) if seconds else None
-
-
-_TALLY: ContextVar[RequestTally | None] = ContextVar(
-    "meridian_energy_request_tally", default=None
-)
-
-
-@contextmanager
-def count_requests() -> Iterator[RequestTally]:
-    """
-    Count the requests the transport sends in this context, while the block runs.
-
-    A client call can send several requests (a session refresh before the
-    query, a retry with a new token, one request per account), so only the
-    transport knows how many were sent. The tally follows the running task,
-    so requests sent elsewhere at the same time are not counted.
-    """
-    tally = RequestTally()
-    token = _TALLY.set(tally)
-    try:
-        yield tally
-    finally:
-        _TALLY.reset(token)
 
 
 class MeridianTransportError(Exception):
@@ -112,8 +55,9 @@ class MeridianHttpError(MeridianTransportError):
     """
     Meridian returned an unsuccessful HTTP status.
 
-    ``error_class`` names the network library's error when the body failed
-    or timed out after the status had arrived; the payload is then empty.
+    ``json_body`` says the body was JSON, as Meridian's own errors are; a
+    gateway's error page is not. ``error_class`` names the network library's
+    error when the body failed after the status had arrived.
     """
 
     def __init__(
@@ -123,31 +67,21 @@ class MeridianHttpError(MeridianTransportError):
         retry_after: float = DEFAULT_RETRY_AFTER_SECONDS,
         *,
         error_class: str | None = None,
+        json_body: bool = False,
     ) -> None:
         super().__init__(f"Meridian returned HTTP {status}", error_class=error_class)
         self.status = status
         self.payload = payload
         self.retry_after = retry_after
+        self.json_body = json_body
 
 
 class _Head(NamedTuple):
-    """What an answer had sent before its body, and how long that took."""
+    """What an answer had sent before its body."""
 
     status: int
     content: str
-    cf_ray: bool
-    seconds: float
     retry_after: float
-
-
-def _head_fields(head: _Head | None) -> str:
-    """Return an answer's status and headers as log fields, or ``-`` for none."""
-    if head is None:
-        return "status=- content=- cf_ray=- headers_after=-"
-    return (
-        f"status={head.status} content={head.content} "
-        f"cf_ray={'yes' if head.cf_ray else 'no'} headers_after={head.seconds:.1f}s"
-    )
 
 
 class MeridianTransport:
@@ -165,29 +99,20 @@ class MeridianTransport:
         json: dict[str, Any] | None = None,
         data: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
+        context: str = "",
     ) -> dict[str, Any]:
         """
         Post a request and return a validated JSON object.
 
-        Every answer is logged at debug level once its body has been read and
-        before it is parsed: the operation, the status, the kind and size of
-        the body, which hop wrote an error page, and how long it took. A
-        request that times out or fails logs its error class and how long it
-        waited, and, when the status and headers had arrived before the body
-        failed, those too. URLs, headers and bodies are never logged.
-
-        A network error is raised as a transport error that names its class
-        but not its text, which can hold the URL, so a traceback never shows
-        it. Making the connection has its own limit, 20 s at most, so a
+        Each request logs one DEBUG line: the operation, ``context`` (such as
+        a window as day offsets), the status, the kind and size of the body,
+        or the error class, and how long it took. URLs, headers and bodies
+        are never logged. A network error names its class but not its text,
+        which can hold the URL. Making the connection has its own limit, so a
         connection never made is a network error, never a timeout of
-        Meridian's answer. When an unsuccessful status had arrived before
-        the body failed or timed out, the status is the answer: it is raised
-        as that HTTP error with an empty payload, as for a complete error
-        page, naming the network error's class.
+        Meridian's answer. An unsuccessful status that arrived before its
+        body failed is the answer: it is raised as that HTTP error.
         """
-        tally = _TALLY.get()
-        if tally is not None:
-            tally.sent += 1
         started = monotonic()
         head: _Head | None = None
         try:
@@ -206,52 +131,32 @@ class MeridianTransport:
                 head = _Head(
                     status=status,
                     content=_content_class(_header(response_headers, "content-type")),
-                    cf_ray=bool(_header(response_headers, "cf-ray")),
-                    seconds=monotonic() - started,
                     retry_after=parse_retry_after(
                         _header(response_headers, "retry-after")
                     ),
                 )
                 body = await response.read()
-                elapsed = _ended(tally, operation, started)
-                _LOGGER.debug(
-                    "Meridian response: operation=%s status=%d content=%s bytes=%d "
-                    "edge=%s cf_ray=%s elapsed=%.1fs",
-                    operation,
-                    status,
-                    head.content,
-                    len(body),
-                    "-"
-                    if head.content == "json" and status < _HTTP_BAD_REQUEST
-                    else _edge_class(body),
-                    "yes" if head.cf_ray else "no",
-                    elapsed,
-                )
-        except ConnectionTimeoutError as err:
-            # No connection within the connect limit: nothing reached
-            # Meridian, which is a network failure, not a gateway timeout.
-            # aiohttp raises this only for that limit; the request's total
-            # limit running out raises a plain TimeoutError, even while
-            # connecting.
-            elapsed = _ended(tally, operation, started)
-            raise _network_failure(operation, err, head, elapsed) from None
-        except TimeoutError as err:
-            _LOGGER.debug(
-                "Meridian request timed out: operation=%s error=%s limit=%ds %s "
-                "elapsed=%.1fs",
-                operation,
-                type(err).__name__,
-                time_limit,
-                _head_fields(head),
-                _ended(tally, operation, started),
+        except (ClientError, TimeoutError) as err:
+            # ConnectionTimeoutError is the connect limit: nothing reached
+            # Meridian, a network failure. The total limit running out
+            # raises a plain TimeoutError, even while connecting.
+            timed_out = isinstance(err, TimeoutError) and not isinstance(
+                err, ConnectionTimeoutError
             )
-            raise _status_failure(head, err) or MeridianTimeoutError(
-                f"Meridian did not answer in time ({type(err).__name__})",
+            _log(operation, context, started, head, error=type(err).__name__)
+            failure = _status_failure(head, err)
+            if failure is not None:
+                raise failure from None
+            if timed_out:
+                raise MeridianTimeoutError(
+                    f"Meridian did not answer in time ({type(err).__name__})",
+                    error_class=type(err).__name__,
+                ) from None
+            raise MeridianTransportError(
+                f"Unable to reach Meridian ({type(err).__name__})",
                 error_class=type(err).__name__,
             ) from None
-        except ClientError as err:
-            elapsed = _ended(tally, operation, started)
-            raise _network_failure(operation, err, head, elapsed) from None
+        _log(operation, context, started, head, size=len(body))
         try:
             payload = json_module.loads(body) if body.strip() else None
         except ValueError as err:
@@ -264,32 +169,29 @@ class MeridianTransport:
                 status,
                 payload if isinstance(payload, dict) else {},
                 head.retry_after,
+                json_body=payload is not None,
             )
         return require_mapping(payload, "HTTP response")
 
 
-def _ended(tally: RequestTally | None, operation: str, started: float) -> float:
-    """Return how long a request took, and count its time in the tally."""
-    elapsed = monotonic() - started
-    if tally is not None:
-        tally.times.append((operation, elapsed))
-    return elapsed
-
-
-def _network_failure(
-    operation: str, err: Exception, head: _Head | None, elapsed: float
-) -> MeridianTransportError:
-    """Log a request that failed on the network, and return the error to raise."""
+def _log(
+    operation: str,
+    context: str,
+    started: float,
+    head: _Head | None,
+    *,
+    size: int | None = None,
+    error: str | None = None,
+) -> None:
+    """Log one request's outcome at DEBUG, without its URL, headers or body."""
     _LOGGER.debug(
-        "Meridian request failed: operation=%s error=%s %s elapsed=%.1fs",
+        "Meridian request: operation=%s%s status=%s content=%s %s elapsed=%.1fs",
         operation,
-        type(err).__name__,
-        _head_fields(head),
-        elapsed,
-    )
-    return _status_failure(head, err) or MeridianTransportError(
-        f"Unable to reach Meridian ({type(err).__name__})",
-        error_class=type(err).__name__,
+        f" {context}" if context else "",
+        "-" if head is None else head.status,
+        "-" if head is None else head.content,
+        f"bytes={size}" if error is None else f"error={error}",
+        monotonic() - started,
     )
 
 
@@ -328,15 +230,6 @@ def _content_class(content_type: str) -> str:
         return "html"
     if mime.startswith("text/"):
         return "text"
-    return "other"
-
-
-def _edge_class(body: bytes) -> str:
-    """Return which hop wrote an error page, from fixed markers in its body."""
-    lowered = body.lower()
-    for edge, markers in _EDGE_MARKERS:
-        if any(marker in lowered for marker in markers):
-            return edge
     return "other"
 
 

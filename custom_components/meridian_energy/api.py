@@ -20,6 +20,7 @@ from .const import (
     FIREBASE_CUSTOM_TOKEN_URL,
     FIREBASE_REFRESH_URL,
     GRAPHQL_URL,
+    MAX_WINDOW_PAGES,
     MEASUREMENTS_TIMEOUT_SECONDS,
     READING_FREQUENCY_HOUR,
     READING_QUALITY_COMBINED,
@@ -40,6 +41,7 @@ from .graphql import (
 )
 from .graphql import (
     RATE_LIMIT_CODE,
+    UNKNOWN_ERROR_CODE,
     measurements_operation,
     measurements_query,
 )
@@ -128,9 +130,8 @@ _OTP_CODES = frozenset(
 )
 _LOGGER = logging.getLogger(__name__)
 _NZ = ZoneInfo("Pacific/Auckland")
-# The measurements query goes out under the web app's name and URL (see
-# MEASUREMENTS_WEB_APP_NAME); logs, timings and errors keep calling it
-# "measurements", the integration's own label for it.
+# The measurements query goes out under the web app's name and URL; logs and
+# errors call it "measurements", the integration's own label for it.
 _MEASUREMENTS = "measurements"
 _MEASUREMENTS_NAME, _MEASUREMENTS_URL = measurements_operation(GRAPHQL_URL)
 _MEASUREMENTS_QUERY = measurements_query(_MEASUREMENTS_NAME)
@@ -187,23 +188,27 @@ class MeridianUpstreamError(MeridianConnectionError):
     @property
     def detail(self) -> str:
         """Describe the failure without identifiers, as in ``HTTP 503``."""
-        if self.status is None:
-            return "no answer within the time limit"
-        return f"HTTP {self.status}"
+        return "no answer in time" if self.status is None else f"HTTP {self.status}"
 
 
 class MeridianRejectedError(MeridianConnectionError):
     """
     Meridian's service refused a request with a client error (HTTP 4xx).
 
-    Not a timeout (408), a rate limit (429) or a rejected session (401 or
-    403), each handled on its own, and never a failure of Google's session
-    service: so the request itself, and what it asked for, was refused.
+    Not a timeout (408) or a rate limit (429), each handled on its own, and
+    never a failure of Google's session service. ``codes`` are the validated
+    Kraken error codes its body named, if any; never its messages.
     """
 
-    def __init__(self, status: int) -> None:
+    def __init__(self, status: int, codes: tuple[str, ...] = ()) -> None:
         super().__init__(f"Meridian service returned HTTP {status}")
         self.status = status
+        self.codes = codes
+
+    @property
+    def detail(self) -> str:
+        """Describe the refusal without identifiers, as in ``HTTP 400, KT-CT-1``."""
+        return ", ".join((f"HTTP {self.status}", *self.codes))
 
 
 class MeridianAuthenticationError(MeridianError):
@@ -481,6 +486,7 @@ class MeridianApiClient:
         end_on: date,
         last: int,
         before: str | None = None,
+        context: str = "",
     ) -> MeasurementPage:
         """
         Return one backwards page of hourly measurements inside a window.
@@ -488,7 +494,8 @@ class MeridianApiClient:
         The window is ``start_on`` to ``end_on``, New Zealand dates, both
         included. Every page of a window sends both bounds and ``last``; a
         continuation page adds ``before``, the previous page's start cursor,
-        and differs from the first page in nothing else.
+        and differs from the first page in nothing else. ``context`` goes
+        into the request's DEBUG line.
         """
         if start_on > end_on or last < 1:
             raise ValueError("Invalid Meridian measurements window")
@@ -512,6 +519,7 @@ class MeridianApiClient:
             time_limit=MEASUREMENTS_TIMEOUT_SECONDS,
             operation_name=_MEASUREMENTS_NAME,
             url=_MEASUREMENTS_URL,
+            context=context,
         )
         account = require_mapping(data.get("account"), "measurement account")
         property_data = require_mapping(account.get("property"), "measurement property")
@@ -529,6 +537,51 @@ class MeridianApiClient:
             has_previous_page=bool(page_info.get("hasPreviousPage")),
             start_cursor=_optional_string(page_info.get("startCursor")),
         )
+
+    async def async_get_window(
+        self,
+        *,
+        account_number: str,
+        property_id: str,
+        direction: str,
+        start_on: date,
+        end_on: date,
+        last: int,
+        pace: Callable[[], Awaitable[None]] | None = None,
+        context: str = "",
+    ) -> tuple[MeridianMeasurement, ...]:
+        """
+        Return every row of one window, following its pages backwards.
+
+        ``pace`` is awaited before each page's request. A window takes at
+        most 8 pages; each continuation must carry a new cursor, and an empty
+        page must be the last. Otherwise the answer is one this can't read
+        (``ValueError``).
+        """
+        rows: list[MeridianMeasurement] = []
+        before: str | None = None
+        for page_number in range(1, MAX_WINDOW_PAGES + 1):
+            if pace is not None:
+                await pace()
+            page = await self.async_get_measurements(
+                account_number=account_number,
+                property_id=property_id,
+                direction=direction,
+                start_on=start_on,
+                end_on=end_on,
+                last=last,
+                before=before,
+                context=f"{context} page={page_number}".strip(),
+            )
+            rows.extend(page.measurements)
+            if not page.has_previous_page:
+                return tuple(rows)
+            if not page.measurements:
+                raise ValueError("Meridian returned an empty page with more to come")
+            if page.start_cursor is None or page.start_cursor == before:
+                raise ValueError("Meridian returned a page that does not move on")
+            before = page.start_cursor
+        raise ValueError("Meridian returned more pages than a window can hold")
 
     async def async_get_billing_period(
         self, account_number: str
@@ -571,7 +624,7 @@ class MeridianApiClient:
             period_start_day=start_day,
         )
 
-    async def _async_graphql(
+    async def _async_graphql(  # noqa: C901 - one branch per kind of answer
         self,
         operation: str,
         query: str,
@@ -580,6 +633,7 @@ class MeridianApiClient:
         time_limit: float = REQUEST_TIMEOUT_SECONDS,
         operation_name: str | None = None,
         url: str = GRAPHQL_URL,
+        context: str = "",
     ) -> dict[str, Any]:
         """
         Send one GraphQL query, renewing the session once if it is rejected.
@@ -587,8 +641,9 @@ class MeridianApiClient:
         ``operation`` labels the query in logs and errors; ``operation_name``,
         when given, is the name the document and the request carry instead.
         Kraken's rate limit (KT-CT-1199) arrives as a GraphQL error and is
-        raised as a rate limit with an hour's delay: Kraken's limits grow
-        stricter while they are being hit, so the sync stops.
+        raised as a rate limit with an hour's delay. A 401 or 403 after a
+        fresh session ends the sign-in only when its body is JSON, as
+        Meridian's own answers are; a gateway's page refuses the request.
         """
         for attempt in range(2):
             tokens = await self.async_refresh_tokens(force=attempt == 1)
@@ -604,11 +659,14 @@ class MeridianApiClient:
                     },
                     headers={"Authorization": tokens.id_token},
                     authenticated=True,
+                    context=context,
                 )
             except _MeridianHttpError as err:
                 if err.status == _HTTP_TOO_MANY_REQUESTS:
                     raise MeridianRateLimitError(err.retry_after) from err
                 if err.status in {401, 403} and attempt == 1:
+                    if not err.json_body:
+                        raise _connection_error(err) from err
                     raise MeridianAuthenticationError(
                         "Meridian rejected the authenticated session"
                     ) from err
@@ -657,6 +715,7 @@ class MeridianApiClient:
         headers: dict[str, str] | None = None,
         authenticated: bool,
         meridian_service: bool = True,
+        context: str = "",
     ) -> dict[str, Any]:
         """
         Send one request through the transport and translate its failures.
@@ -674,6 +733,7 @@ class MeridianApiClient:
                 json=json,
                 data=data,
                 headers=headers,
+                context=context,
             )
         except _MeridianHttpError:
             raise
@@ -727,6 +787,15 @@ def _connection_error(
             err.status, gateway=err.status in _GATEWAY_TIMEOUT_STATUSES
         )
     if meridian_service and err.status >= _HTTP_CLIENT_ERROR:
-        return MeridianRejectedError(err.status)
+        return MeridianRejectedError(err.status, _error_codes(err.payload))
     service = "Meridian" if meridian_service else "Meridian's session"
     return MeridianConnectionError(f"{service} service returned HTTP {err.status}")
+
+
+def _error_codes(payload: dict[str, Any]) -> tuple[str, ...]:
+    """Return the validated Kraken error codes an error body names, in order."""
+    errors = payload.get("errors")
+    if not isinstance(errors, list):
+        return ()
+    codes = (_graphql_error_code(item) for item in errors if isinstance(item, dict))
+    return tuple(dict.fromkeys(code for code in codes if code != UNKNOWN_ERROR_CODE))
