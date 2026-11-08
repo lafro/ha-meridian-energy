@@ -5,7 +5,9 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 import traceback
+from collections import Counter
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
@@ -1766,6 +1768,54 @@ async def test_balance_and_prices_are_asked_as_the_web_app_asks() -> None:
     for query in (BALANCE_QUERY, PRICES_QUERY):
         assert "temporaryUrl" not in query
         assert "address" not in query.lower()
+
+
+def _names(query: str) -> Counter[str]:
+    return Counter(re.findall(r"[A-Za-z_]+", query))
+
+
+def test_the_balance_and_prices_documents_ask_only_for_the_fields_used() -> None:
+    """Counted, not a set: an added field may share a name already there."""
+    asked = {"query": 1, "accountNumber": 3, "String": 1, "account": 1}
+    assert _names(BALANCE_QUERY) == Counter(
+        {
+            **asked,
+            "GetAccountBalance": 1,
+            "payments": 1,
+            "first": 2,
+            "edges": 2,
+            "node": 2,
+            "amount": 1,
+            "paymentDate": 1,
+            "status": 1,
+            "bills": 1,
+            "fromDate": 1,
+            "toDate": 1,
+            "issuedDate": 1,
+            "balance": 1,
+            "includeAllLedgers": 1,
+            "true": 1,
+        }
+    )
+    assert _names(PRICES_QUERY) == Counter(
+        {
+            **asked,
+            "GetAccountPropertyAgreements": 1,
+            "propertyId": 2,
+            "ID": 1,
+            "property": 1,
+            "id": 1,
+            "meterPoints": 1,
+            "activeAgreement": 1,
+            "displayName": 1,
+            "rates": 1,
+            "hasDiscount": 1,
+            "formattedRateIncludingTax": 1,
+            "formattedRateIncludingTaxIncludingDiscount": 1,
+            "bandCategory": 1,
+            "touBucketName": 1,
+        }
+    )
 
 
 def test_codes_not_in_krakens_form_are_never_shown() -> None:

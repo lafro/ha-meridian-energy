@@ -532,9 +532,12 @@ async def test_prices_never_answered_leave_the_price_sensors_as_they_are(
 
 
 async def test_a_rate_limit_on_a_figure_fails_nothing_and_waits(
-    hass: HomeAssistant, session: FakeMeridianSession
+    hass: HomeAssistant,
+    session: FakeMeridianSession,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """No more requests in that update; the next waits, and asks again."""
+    caplog.set_level(logging.INFO)
     session.hook = _failing(
         "balance", Response(b"", status=429, headers={"Retry-After": "10800"})
     )
@@ -545,11 +548,55 @@ async def test_a_rate_limit_on_a_figure_fails_nothing_and_waits(
     assert data.account_results[0].total_due is None
     assert "prices" not in session.operations
     assert coordinator.update_interval == timedelta(hours=3)
+    assert not _own(caplog, logging.INFO)
+    assert coordinator.extras_diagnostics()["balance"]["failing"] == 0
 
     session.hook = lambda _operation, _variables: None
     data = await sync(coordinator, NOW + 3 * HOUR, session)
     assert data.account_results[0].total_due == Decimal(40)
     assert coordinator.update_interval == UPDATE_INTERVAL
+    assert not _own(caplog, logging.INFO)
+
+
+async def test_a_kind_is_back_only_when_no_account_fails_it(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Another account still failing, though it shows its kept value, is not back."""
+    caplog.set_level(logging.INFO)
+    session = FakeMeridianSession(NOW, accounts=(ACCOUNT_NUMBER, "A-TEST-2"))
+    failing = {ACCOUNT_NUMBER}
+    session.hook = lambda operation, variables: (
+        _FAILED
+        if operation == "balance" and variables["accountNumber"] in failing
+        else None
+    )
+    coordinator = coordinator_for(hass, session)
+    lost = (
+        "Meridian Energy couldn't get the balance; Total due, Last bill and Last "
+        "payment show unknown until it can"
+    )
+
+    data = await sync(coordinator, NOW, session)
+    assert [result.total_due for result in data.account_results] == [
+        None,
+        Decimal(40),
+    ]
+    assert _own(caplog, logging.INFO) == [lost]
+
+    failing = {"A-TEST-2"}
+    data = await sync(coordinator, NOW + 6 * HOUR, session)
+    assert [result.total_due for result in data.account_results] == [
+        Decimal(40),
+        Decimal(40),
+    ]
+    assert _own(caplog, logging.INFO) == [lost]
+
+    failing = set()
+    await sync(coordinator, NOW + 12 * HOUR, session)
+    assert _own(caplog, logging.INFO) == [
+        lost,
+        "Meridian Energy is getting the balance again",
+    ]
 
 
 async def test_no_figure_is_asked_for_after_a_measurements_rate_limit(

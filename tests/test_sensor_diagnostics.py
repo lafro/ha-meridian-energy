@@ -699,6 +699,37 @@ async def test_entities_before_first_sync_come_from_topology(hass) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("has_feed_in", [False, True])
+async def test_registered_sensors_before_first_sync(
+    hass, entity_registry, has_feed_in: bool
+) -> None:
+    """Price entries stay in the registry until Meridian has answered."""
+    account = _account()
+    meter = replace(account.properties[0].meter_points[0], has_feed_in=has_feed_in)
+    account = replace(
+        account, properties=(replace(account.properties[0], meter_points=(meter,)),)
+    )
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    coordinator._topology = (account,)
+    assert coordinator.data is None
+    entry = _entry(coordinator)
+    entities = []
+
+    with patch(
+        "custom_components.meridian_energy.sensor.er.async_get",
+        return_value=entity_registry,
+    ):
+        await async_setup_entry(hass, entry, entities.extend)
+
+    feed_in = _FEED_IN if has_feed_in else ()
+    assert set(_by_key(entities)) == {*_ALWAYS, *feed_in, *_PRICES}
+    assert _removed(entity_registry) == (
+        set() if has_feed_in else {"sensor.bill_export", "sensor.bill_credit"}
+    )
+    await entry._async_process_on_unload(hass)
+
+
+@pytest.mark.asyncio
 async def test_diagnostics_before_first_sync(hass, freezer) -> None:
     """Before a first sync, each unit shows its target and nothing stored."""
     freezer.move_to("2026-07-15T01:00:00+00:00")
