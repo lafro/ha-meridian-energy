@@ -85,17 +85,35 @@
       "estimated_readings": {
         "name": "Provisional data intervals"
       },
-      "current_bill_usage": {
-        "name": "Current bill usage"
+      "bill_usage": {
+        "name": "Bill usage so far"
       },
-      "current_bill_cost": {
-        "name": "Current bill cost"
+      "bill_cost": {
+        "name": "Bill cost so far"
       },
-      "current_bill_export": {
-        "name": "Current bill export"
+      "bill_export": {
+        "name": "Bill export so far"
       },
-      "current_bill_credit": {
-        "name": "Current bill export credit"
+      "bill_credit": {
+        "name": "Bill credit so far"
+      },
+      "bill_estimate": {
+        "name": "Bill estimate"
+      },
+      "total_due": {
+        "name": "Total due"
+      },
+      "last_bill": {
+        "name": "Last bill"
+      },
+      "last_payment": {
+        "name": "Last payment"
+      },
+      "daily_charge": {
+        "name": "Daily charge"
+      },
+      "anytime_price": {
+        "name": "Anytime price"
       },
       "billing_period_start": {
         "name": "Billing period start"

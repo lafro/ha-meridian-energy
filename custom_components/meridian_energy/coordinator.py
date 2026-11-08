@@ -5,8 +5,10 @@ A unit is one direction of one property: grid import always, and grid
 export when the property has an active feed-in register. Each sync takes
 the units one after another. For each it asks for its recent dates, then
 fills in the dates still missing back to its target, 90 days back, and
-writes what it fetched (``statistics.async_write_hours``). What it learns
-about a unit is kept in memory only, and built again after a start.
+writes what it fetched (``statistics.async_write_hours``). Then each
+account's other figures are asked for, each kind at its own interval: the
+billing period, the bill's day totals, the balance and the prices. What it
+learns is kept in memory only, and built again after a start.
 """
 
 from __future__ import annotations
@@ -15,15 +17,17 @@ import asyncio
 import logging
 import random
 from collections import Counter
-from collections.abc import Collection, Iterable
-from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable, Collection, Iterable
+from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
+from functools import partial
+from operator import attrgetter
 from time import monotonic
 from typing import Any, NamedTuple
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import CoreState, HomeAssistant
+from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
@@ -42,6 +46,8 @@ from .api import (
     http_status,
 )
 from .const import (
+    BALANCE_INTERVAL,
+    BILL_DAYS_INTERVAL,
     BILLING_CACHE_INTERVAL,
     DAILY_DATES,
     DAILY_INTERVAL,
@@ -55,7 +61,9 @@ from .const import (
     MAX_RETRY_AFTER_SECONDS,
     MEASUREMENTS_PACING_SECONDS,
     NAME,
+    PRICES_INTERVAL,
     READING_CONSUMPTION,
+    READING_FREQUENCY_DAY,
     READING_GENERATION,
     RECENT_DATES,
     TOPOLOGY_CACHE_INTERVAL,
@@ -63,19 +71,21 @@ from .const import (
     TRANSIENT_STATUSES,
     UPDATE_INTERVAL,
 )
-from .graphql import QUERY_LIMIT_CODES, UNKNOWN_ERROR_CODE, is_service_failure
+from .graphql import QUERY_LIMIT_CODES, is_service_failure, shown_codes
 from .models import (
     AccountSyncResult,
+    BillFigures,
     MeridianAccount,
+    MeridianBalance,
     MeridianBillingPeriod,
     MeridianMeasurement,
+    MeridianPrices,
     MeridianProperty,
     MeridianSyncData,
     PropertySyncResult,
 )
 from .statistics import (
     account_key,
-    async_account_period_totals,
     async_stored_hours,
     async_write_hours,
     consumption_ids,
@@ -90,6 +100,7 @@ from .windows import (
     MeasurementWindow,
     Reading,
     date_hours,
+    day_readings,
     hourly_readings,
     local_midnight,
     nz_date,
@@ -103,16 +114,39 @@ _CENTS_PER_DOLLAR = Decimal(100)
 # A request that failed in a way that may pass is sent once more.
 _SENDS = 2
 _LABELS = {READING_CONSUMPTION: "grid import", READING_GENERATION: "grid export"}
-# What the INFO lines say when an extra request is lost, and when it is back.
+# How often each kind of an account's other figures is asked for. A failed
+# one is asked again after as long, and its value is kept for two of these.
+_INTERVALS = {
+    "billing": BILLING_CACHE_INTERVAL,
+    "days": BILL_DAYS_INTERVAL,
+    "balance": BALANCE_INTERVAL,
+    "prices": PRICES_INTERVAL,
+}
+_NAMES = {
+    "billing": "billing period",
+    "days": "bill's day totals",
+    "balance": "balance",
+    "prices": "prices",
+}
+# The INFO lines when a kind of figure is lost, and when it is back.
 _EXTRA_LOST = {
     "accounts": "Meridian Energy couldn't refresh the list of accounts; it keeps "
     "using the one it has",
     "billing": "Meridian Energy couldn't get the billing period; the billing "
-    "sensors keep what they have",
+    "period sensors show unknown until it can",
+    "days": "Meridian Energy couldn't get the bill's day totals; the 'so far' "
+    "sensors show unknown until it can",
+    "balance": "Meridian Energy couldn't get the balance; Total due, Last bill "
+    "and Last payment show unknown until it can",
+    "prices": "Meridian Energy couldn't get the prices; Daily charge and Anytime "
+    "price show unknown until it can",
 }
 _EXTRA_BACK = {
     "accounts": "Meridian Energy has refreshed the list of accounts again",
     "billing": "Meridian Energy is getting the billing period again",
+    "days": "Meridian Energy is getting the bill's day totals again",
+    "balance": "Meridian Energy is getting the balance again",
+    "prices": "Meridian Energy is getting the prices again",
 }
 
 type UnitKey = tuple[str, str]
@@ -203,6 +237,35 @@ class _Fetched:
     windows: int = 0
 
 
+@dataclass(slots=True)
+class _Extra:
+    """
+    One kind of an account's other figures: the last value got, and when.
+
+    ``due`` is when it is next asked for, None for the next update;
+    ``failing`` says whether the last time it was asked for failed.
+    """
+
+    value: Any = None
+    at: datetime | None = None
+    due: datetime | None = None
+    failing: bool = False
+
+    def kept(self, kind: str, now: datetime) -> Any:
+        """Return the value while it is kept, two intervals after it was got."""
+        if self.at is None or now - self.at >= 2 * _INTERVALS[kind]:
+            return None
+        return self.value
+
+
+class _Bill(NamedTuple):
+    """A bill's figures from the day totals, and the period they are for."""
+
+    start: date
+    end: date
+    figures: BillFigures
+
+
 class _Outcome(NamedTuple):
     """How a sync went: the units that imported, and those that failed."""
 
@@ -231,9 +294,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         self.client = client
         self._topology: tuple[MeridianAccount, ...] | None = None
         self._topology_cached_at: datetime | None = None
-        self._billing_periods: dict[str, MeridianBillingPeriod] = {}
-        self._billing_cached_at: dict[str, datetime] = {}
-        self._billing_unavailable: set[str] = set()
+        self._extras: dict[tuple[str, str], _Extra] = {}
         self._memory: dict[UnitKey, _Memory] = {}
         self._extras_lost: set[str] = set()
         self._synced = False
@@ -247,18 +308,24 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         """Return the cached accounts, none before they were first fetched."""
         return self._topology or ()
 
-    @property
-    def billing_metadata_unavailable_count(self) -> int:
-        """Return how many accounts have a failed billing refresh."""
-        return len(self._billing_unavailable)
-
-    @property
-    def billing_metadata_cache_age_seconds(self) -> float | None:
-        """Return the age of the oldest billing metadata cache entry."""
-        if not self._billing_cached_at:
-            return None
-        oldest_cached_at = min(self._billing_cached_at.values())
-        return max(0.0, (_utcnow() - oldest_cached_at).total_seconds())
+    def extras_diagnostics(self) -> dict[str, dict[str, Any]]:
+        """Return, for each kind of other figure, how many fail and the oldest age."""
+        now = _utcnow()
+        kinds: dict[str, dict[str, Any]] = {}
+        for kind in _INTERVALS:
+            extras = [
+                extra for (name, _number), extra in self._extras.items() if name == kind
+            ]
+            ages = [
+                max(0.0, (now - extra.at).total_seconds())
+                for extra in extras
+                if extra.at is not None
+            ]
+            kinds[kind] = {
+                "failing": sum(extra.failing for extra in extras),
+                "oldest_age_seconds": round(max(ages), 3) if ages else None,
+            }
+        return kinds
 
     def unit_diagnostics(self) -> list[dict[str, Any]]:
         """Return each unit's state, by position, never by identifier."""
@@ -390,7 +457,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         return float(min(MAX_RETRY_AFTER_SECONDS, doubled))
 
     async def _async_sync(self, now: datetime) -> MeridianSyncData:
-        """Sync every unit, then the billing figures, and summarise the sync."""
+        """Sync every unit, then the accounts' other figures, and summarise."""
         started = monotonic()
         self._requests = 0
         self._last_request = None
@@ -416,7 +483,11 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 # A unit without readings, quiet or not, counts as neither.
                 unit.memory.failure = None
         self._settle(outcome)
-        account_results = await self._async_account_results(accounts, now)
+        failed = {
+            property_key(unit.account_number, unit.property_id)
+            for unit, _err in outcome.failed
+        }
+        account_results = await self._async_account_results(accounts, failed, now)
         if self._rate_limit is None:
             self._rate_limits = 0
         else:
@@ -442,7 +513,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
 
         It succeeds when a unit with readings imported its recent dates, or
         none failed, as when every unit is quiet: a unit without readings
-        counts as neither. Then a unit that failed logs one WARNING, until
+        never counts as imported, and counts as failed only when its recent
+        dates fail. Then a unit that failed logs one WARNING, until
         it works again, which logs one INFO. Otherwise it raises the rate
         limit that stopped it, or its first failure: Home Assistant logs
         that one.
@@ -804,7 +876,9 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             except MeridianConnectionError as err:
                 if attempt == _SENDS - 1 or not _is_transient(err):
                     raise
-                _LOGGER.debug("Resending a request after %s", _error_detail(err))
+                _LOGGER.debug(
+                    "Resending a request that failed (%s)", _error_detail(err)
+                )
                 await _async_wait(random.uniform(*TRANSIENT_RESEND_DELAY_SECONDS))  # noqa: S311
         raise AssertionError  # pragma: no cover - the loop returns or raises
 
@@ -892,10 +966,9 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         }
         for memory in self._memory.values():
             memory.quiet = False
-        for kept in (self._billing_periods, self._billing_cached_at):
-            for number in kept.keys() - numbers:
-                del kept[number]
-        self._billing_unavailable &= numbers
+        self._extras = {
+            key: extra for key, extra in self._extras.items() if key[1] in numbers
+        }
 
     def _note_extra(self, kind: str, *, ok: bool) -> None:
         """Log at INFO once when an extra request is lost, and once when it is back."""
@@ -925,92 +998,239 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             quality_counts=tuple(sorted(Counter(memory.quality.values()).items())),
         )
 
-    async def _async_account_results(
-        self, accounts: tuple[MeridianAccount, ...], now: datetime
-    ) -> tuple[AccountSyncResult, ...]:
-        """Build each account's billing period and totals from the statistics."""
-        results: list[AccountSyncResult] = []
-        for account in accounts:
-            billing_period = await self._async_billing_period(account.number, now)
-            feed_in_keys = tuple(
-                property_key(account.number, item.id)
-                for item in account.properties
-                if any(meter.has_feed_in for meter in item.meter_points)
-            )
-            totals = None
-            if (
-                self.hass.state is CoreState.running
-                and billing_period is not None
-                and billing_period.start is not None
-                and billing_period.end is not None
-            ):
-                start = local_midnight(billing_period.start)
-                end = min(local_midnight(billing_period.end + _DAY), now)
-                if start < end:
-                    totals = await async_account_period_totals(
-                        self.hass,
-                        property_keys=tuple(
-                            property_key(account.number, item.id)
-                            for item in account.properties
-                        ),
-                        feed_in_keys=feed_in_keys,
-                        start=start,
-                        end=end,
-                    )
-            results.append(
-                AccountSyncResult(
-                    account_key=account_key(account.number),
-                    billing_period=billing_period,
-                    current_bill_usage=totals.usage if totals else None,
-                    current_bill_cost=totals.cost if totals else None,
-                    current_bill_export=totals.export if totals else None,
-                    current_bill_credit=totals.credit if totals else None,
-                    has_feed_in=bool(feed_in_keys),
-                    usage_complete=bool(totals and totals.usage_complete),
-                    cost_complete=bool(totals and totals.cost_complete),
-                    export_complete=bool(totals and totals.export_complete),
-                    credit_complete=bool(totals and totals.credit_complete),
-                )
-            )
-        return tuple(results)
-
-    async def _async_billing_period(
-        self, account_number: str, now: datetime
-    ) -> MeridianBillingPeriod | None:
+    async def _async_extra(
+        self,
+        kind: str,
+        account_number: str,
+        now: datetime,
+        fetch: Callable[[], Awaitable[Any]],
+        *,
+        due: bool = False,
+    ) -> _Extra:
         """
-        Return an account's billing period, asking Meridian once it is a day old.
+        Ask for one kind of an account's figures when it is due; return it.
 
-        A period that has ended is asked for again too. When asking fails,
-        the cached period is kept, or withheld once it has ended. A rate
-        limit fails nothing: it keeps the cache and makes the next update
-        wait, and no more requests go out in this one.
+        A failure keeps what was got and asks again after the kind's
+        interval. A rate limit fails nothing: it makes the next update wait,
+        and no more requests go out in this one. An ended sign-in stops the
+        sync.
         """
-        cached_at = self._billing_cached_at.get(account_number)
-        cached = self._billing_periods.get(account_number)
-        expired = cached_at is None or now - cached_at >= BILLING_CACHE_INTERVAL
-        ended = (
-            cached is not None and cached.end is not None and nz_date(now) > cached.end
-        )
-        if cached is not None and not expired and not ended:
-            return cached
-        kept = None if ended else cached
-        if self._rate_limit is not None:
-            return kept
+        extra = self._extras.setdefault((kind, account_number), _Extra())
+        if self._rate_limit is not None or not (
+            due or extra.due is None or now >= extra.due
+        ):
+            return extra
         try:
-            billing = await self.client.async_get_billing_period(account_number)
+            extra.value = await fetch()
+        except MeridianAuthenticationError:
+            raise
         except MeridianRateLimitError as err:
             self._rate_limit = err
-            return kept
-        except MeridianConnectionError, MeridianGraphQLError, ValueError:
-            self._billing_unavailable.add(account_number)
-            self._note_extra("billing", ok=False)
-            return kept
-        self._billing_unavailable.discard(account_number)
-        if not self._billing_unavailable:
-            self._note_extra("billing", ok=True)
-        self._billing_periods[account_number] = billing
-        self._billing_cached_at[account_number] = now
-        return billing
+            return extra
+        except (MeridianError, ValueError) as err:
+            extra.failing = True
+            _LOGGER.debug("Couldn't get the %s (%s)", _NAMES[kind], _error_detail(err))
+        else:
+            extra.at = now
+            extra.failing = False
+        extra.due = now + _INTERVALS[kind]
+        return extra
+
+    async def _async_account_results(
+        self, accounts: tuple[MeridianAccount, ...], failed: set[str], now: datetime
+    ) -> tuple[AccountSyncResult, ...]:
+        """Return every account's figures, then log each kind lost or back."""
+        lost: set[str] = set()
+        results = [
+            await self._async_account_result(account, failed, now, lost)
+            for account in accounts
+        ]
+        for kind in _INTERVALS:
+            if kind in lost:
+                self._note_extra(kind, ok=False)
+            elif not any(
+                extra.failing
+                for (name, _number), extra in self._extras.items()
+                if name == kind
+            ):
+                self._note_extra(kind, ok=True)
+        return tuple(results)
+
+    async def _async_account_result(
+        self, account: MeridianAccount, failed: set[str], now: datetime, lost: set[str]
+    ) -> AccountSyncResult:
+        """
+        Return an account's figures, asking for those that are due.
+
+        A billing period is withheld once it has ended, and asked for again
+        at the first update after its end. ``lost`` gathers the kinds that
+        failed and show unknown.
+        """
+        number = account.number
+        today = nz_date(now)
+        billing = await self._async_extra(
+            "billing",
+            number,
+            now,
+            partial(self.client.async_get_billing_period, number),
+        )
+        period: MeridianBillingPeriod | None = billing.kept("billing", now)
+        end = period.end if period is not None else None
+        if end is not None and today > end:
+            period = None
+        elif end is not None and billing.at == now and billing.due is not None:
+            billing.due = min(billing.due, local_midnight(end + _DAY))
+        if billing.failing and period is None:
+            lost.add("billing")
+        bill = await self._async_bill(account, period, failed, now, lost)
+        extra = await self._async_extra(
+            "balance", number, now, partial(self.client.async_get_balance, number)
+        )
+        balance: MeridianBalance | None = extra.kept("balance", now)
+        if extra.failing and balance is None:
+            lost.add("balance")
+        price_sensors, prices = await self._async_prices(account, now, lost)
+        result = AccountSyncResult(
+            account_key=account_key(number),
+            billing_period=period,
+            has_feed_in=_has_feed_in(account),
+            bill=bill,
+            price_sensors=price_sensors,
+            prices=prices,
+        )
+        if balance is None:
+            return result
+        cents = balance.balance_cents
+        return replace(
+            result,
+            total_due=Decimal(max(0, -cents)) / _CENTS_PER_DOLLAR,
+            credit=Decimal(cents) / _CENTS_PER_DOLLAR if cents > 0 else None,
+            last_bill=max(balance.bills, key=attrgetter("issued"), default=None),
+            last_payment=max(
+                (payment for payment in balance.payments if payment.paid_on <= today),
+                key=attrgetter("paid_on"),
+                default=None,
+            ),
+        )
+
+    async def _async_bill(
+        self,
+        account: MeridianAccount,
+        period: MeridianBillingPeriod | None,
+        failed: set[str],
+        now: datetime,
+        lost: set[str],
+    ) -> BillFigures:
+        """
+        Return the bill's figures, asking for its day totals when due.
+
+        They need every property's, so they are not asked for while one of
+        the account's properties failed its recent dates in this sync, and
+        are asked for at once when the period changes. Once their period has
+        ended they are withheld; until then the 'so far' figures are kept
+        for two intervals, and the estimate throughout.
+        """
+        number = account.number
+        extra = self._extras.get(("days", number))
+        if (
+            period is not None
+            and period.start is not None
+            and period.end is not None
+            and not any(
+                property_key(number, item.id) in failed for item in account.properties
+            )
+        ):
+            known: _Bill | None = extra.value if extra is not None else None
+            extra = await self._async_extra(
+                "days",
+                number,
+                now,
+                partial(self._async_bill_days, account, period.start, period.end),
+                due=known is not None
+                and (known.start, known.end) != (period.start, period.end)
+                and not (extra is not None and extra.failing),
+            )
+        if extra is None:
+            return BillFigures()
+        bill: _Bill | None = extra.value
+        kept = extra.kept("days", now) is not None
+        if extra.failing and not kept:
+            lost.add("days")
+        if bill is None or nz_date(now) > bill.end:
+            return BillFigures()
+        return bill.figures if kept else BillFigures(estimate=bill.figures.estimate)
+
+    async def _async_bill_days(
+        self, account: MeridianAccount, start_on: date, end_on: date
+    ) -> _Bill:
+        """
+        Return a bill's figures from every property's day totals.
+
+        'So far' counts the actual days only; the estimate adds every day's
+        cost, future estimates included.
+        """
+        days: dict[str, list[Reading]] = {
+            READING_CONSUMPTION: [],
+            READING_GENERATION: [],
+        }
+        for property_data in account.properties:
+            key = property_key(account.number, property_data.id)
+            for direction, _ids in _directions(key, property_data):
+                rows = await self.client.async_get_window(
+                    account_number=account.number,
+                    property_id=property_data.id,
+                    direction=direction,
+                    start_on=start_on,
+                    end_on=end_on,
+                    last=(end_on - start_on).days + 1,
+                    frequency=READING_FREQUENCY_DAY,
+                    pace=self._async_pace,
+                    context=f"{_LABELS[direction].replace(' ', '_')} bill_days",
+                )
+                days[direction].extend(day_readings(rows, start_on, end_on).values())
+        used = [day for day in days[READING_CONSUMPTION] if day.quality == _ACTUAL]
+        figures = BillFigures(
+            usage=sum((day.energy for day in used), Decimal(0)),
+            cost=_dollars(used),
+            estimate=_dollars(days[READING_CONSUMPTION]),
+        )
+        if _has_feed_in(account):
+            sent = [day for day in days[READING_GENERATION] if day.quality == _ACTUAL]
+            figures = replace(
+                figures,
+                export=sum((day.energy for day in sent), Decimal(0)),
+                credit=_dollars(sent),
+            )
+        return _Bill(start_on, end_on, figures)
+
+    async def _async_prices(
+        self, account: MeridianAccount, now: datetime, lost: set[str]
+    ) -> tuple[bool | None, MeridianPrices | None]:
+        """
+        Return whether an account has price sensors, and their prices.
+
+        Only an account with one property and one meter point is asked; the
+        answer says whether its plan is all-day. Until an answer has come,
+        there is no saying (None), and sensors that exist are left as they
+        are.
+        """
+        properties = account.properties
+        if len(properties) != 1 or len(properties[0].meter_points) != 1:
+            return False, None
+        extra = await self._async_extra(
+            "prices",
+            account.number,
+            now,
+            partial(self.client.async_get_prices, account.number, properties[0].id),
+        )
+        if extra.at is None:
+            return None, None
+        if extra.value is None:
+            return False, None
+        prices: MeridianPrices | None = extra.kept("prices", now)
+        if extra.failing and prices is None:
+            lost.add("prices")
+        return True, prices
 
 
 def _note_stored(memory: _Memory, hours: Collection[datetime]) -> None:
@@ -1078,8 +1298,7 @@ def _error_detail(err: BaseException) -> str:
     if isinstance(err, MeridianUpstreamError | MeridianRejectedError):
         return err.detail
     if isinstance(err, MeridianGraphQLError):
-        codes = [code for code in err.codes if code != UNKNOWN_ERROR_CODE]
-        return ", ".join(codes) or "a Meridian service error"
+        return ", ".join(shown_codes(err.codes)) or "a Meridian service error"
     if _unreadable(err):
         return "not JSON"
     if isinstance(err, MeridianConnectionError):
@@ -1105,6 +1324,25 @@ def _error_phrase(err: Exception) -> str:
     return (
         "Meridian refused the request or sent an answer Meridian Energy can't "
         f"read: {_error_detail(err)}"
+    )
+
+
+def _dollars(days: Collection[Reading]) -> Decimal | None:
+    """Return days' cost in NZD, None when one of them has none."""
+    cents = [day.cost_cents for day in days]
+    if None in cents:
+        return None
+    return sum((cost for cost in cents if cost is not None), Decimal(0)) / (
+        _CENTS_PER_DOLLAR
+    )
+
+
+def _has_feed_in(account: MeridianAccount) -> bool:
+    """Return whether any of an account's meters has an active feed-in register."""
+    return any(
+        meter.has_feed_in
+        for property_data in account.properties
+        for meter in property_data.meter_points
     )
 
 

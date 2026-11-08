@@ -35,6 +35,13 @@ from custom_components.meridian_energy.api import (
     _required_string,
     exception_chain,
 )
+from custom_components.meridian_energy.const import GRAPHQL_URL
+from custom_components.meridian_energy.graphql import (
+    BALANCE_NAME,
+    BALANCE_QUERY,
+    PRICES_NAME,
+    PRICES_QUERY,
+)
 from custom_components.meridian_energy.models import (
     MeasurementPage,
     MeridianMeasurement,
@@ -43,6 +50,8 @@ from custom_components.meridian_energy.models import (
     require_mapping,
 )
 from custom_components.meridian_energy.parsers import optional_date
+
+from .meridian_http import balance_data, prices_data
 
 
 def _tokens() -> MeridianTokenSet:
@@ -1719,3 +1728,85 @@ async def test_a_window_without_pacing_or_context_reads_its_pages() -> None:
     assert (
         client.async_get_measurements.await_args_list[0].kwargs["context"] == "page=1"
     )
+
+
+@pytest.mark.asyncio
+async def test_balance_and_prices_are_asked_as_the_web_app_asks() -> None:
+    """Each goes to its own operation's URL, with no address and no file link."""
+    client = MeridianApiClient(MagicMock(), tokens=_tokens())
+    client._async_graphql = AsyncMock(
+        side_effect=[
+            {"account": balance_data(date(2026, 7, 13))},
+            {"account": {"property": prices_data()}},
+        ]
+    )
+
+    balance = await client.async_get_balance("A-TEST-1")
+    prices = await client.async_get_prices("A-TEST-1", "synthetic-property")
+
+    assert balance.balance_cents == -4000
+    assert prices is not None
+    assert prices.daily_charge == Decimal(2)
+    balance_call, prices_call = client._async_graphql.await_args_list
+    assert balance_call.args == (
+        "balance",
+        BALANCE_QUERY,
+        {"accountNumber": "A-TEST-1"},
+    )
+    assert prices_call.args == (
+        "prices",
+        PRICES_QUERY,
+        {"accountNumber": "A-TEST-1", "propertyId": "synthetic-property"},
+    )
+    for call, name in ((balance_call, BALANCE_NAME), (prices_call, PRICES_NAME)):
+        assert call.kwargs == {
+            "operation_name": name,
+            "url": f"{GRAPHQL_URL}?opName={name}",
+        }
+    for query in (BALANCE_QUERY, PRICES_QUERY):
+        assert "temporaryUrl" not in query
+        assert "address" not in query.lower()
+
+
+def test_codes_not_in_krakens_form_are_never_shown() -> None:
+    """A code that could carry an identifier reads "an error code", once."""
+    codes = ("A-TEST-1", "KT-CT-1234", "UNKNOWN", "synthetic-account", "KT-CT-1234")
+
+    graphql = MeridianGraphQLError("balance", codes)
+    rejected = MeridianRejectedError(400, codes)
+
+    assert str(graphql) == (
+        "Meridian GraphQL operation balance failed (an error code, KT-CT-1234)"
+    )
+    assert rejected.detail == "HTTP 400, an error code, KT-CT-1234"
+    assert str(MeridianGraphQLError("prices", ("UNKNOWN",))) == (
+        "Meridian GraphQL operation prices failed"
+    )
+    for text in (str(graphql), rejected.detail):
+        assert "A-TEST-1" not in text
+        assert "synthetic" not in text
+
+
+@pytest.mark.asyncio
+async def test_a_graphql_failure_logs_only_codes_in_krakens_form(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    client = MeridianApiClient(MagicMock(), tokens=_tokens())
+    client._async_json_request = AsyncMock(
+        return_value={
+            "errors": [
+                {"message": "x", "extensions": {"errorCode": "A-TEST-1"}},
+                {"message": "y", "extensions": {"errorCode": "KT-CT-4321"}},
+            ]
+        }
+    )
+
+    with pytest.raises(MeridianGraphQLError):
+        await client._async_graphql("balance", "query", {})
+
+    assert (
+        "Meridian GraphQL operation balance failed with codes an error code,KT-CT-4321"
+        in caplog.text
+    )
+    assert "A-TEST-1" not in caplog.text

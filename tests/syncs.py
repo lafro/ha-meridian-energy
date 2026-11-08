@@ -82,11 +82,11 @@ async def refresh(
 
 
 def measurement_dates(session: FakeMeridianSession) -> list[tuple[date, date]]:
-    """Return each window asked for, as (startOn, endOn), first pages only."""
+    """Return each hourly window asked for, as (startOn, endOn), first pages only."""
     return [
         (date.fromisoformat(item["startOn"]), date.fromisoformat(item["endOn"]))
         for item in session.kraken.requests
-        if "before" not in item
+        if "before" not in item and "frequency" not in item
     ]
 
 

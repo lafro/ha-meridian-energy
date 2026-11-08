@@ -13,18 +13,18 @@ async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: MeridianConfigEntry
 ) -> dict[str, Any]:
     """
-    Return diagnostics without account, address, email, usage or token data.
+    Return diagnostics without identifiers, addresses, amounts or tokens.
 
     Units are named by their account's and property's positions and their
     direction, never by an identifier; the last failure by its category and
-    the class of the error behind it.
+    the class of the error behind it. Of each account's figures, only
+    whether each is known.
     """
     del hass
     coordinator = entry.runtime_data.coordinator
     data = coordinator.data
     last_exception = coordinator.last_exception
     cause = getattr(last_exception, "__cause__", None)
-    billing_cache_age = coordinator.billing_metadata_cache_age_seconds
     diagnostics: dict[str, Any] = {
         "config_entry": {
             "version": entry.version,
@@ -42,12 +42,7 @@ async def async_get_config_entry_diagnostics(
             ),
             "first_sync_pending": data is None,
             "account_count": len(coordinator.accounts),
-            "billing_metadata_unavailable_count": (
-                coordinator.billing_metadata_unavailable_count
-            ),
-            "billing_metadata_cache_age_seconds": (
-                round(billing_cache_age, 3) if billing_cache_age is not None else None
-            ),
+            "extras": coordinator.extras_diagnostics(),
             "units": coordinator.unit_diagnostics(),
         },
     }
@@ -82,17 +77,22 @@ async def async_get_config_entry_diagnostics(
                         if result.billing_period is not None
                         else None
                     ),
-                    "billing_data_complete": {
-                        "usage": result.usage_complete,
-                        "cost": result.cost_complete,
-                        "export": result.export_complete,
-                        "credit": result.credit_complete,
-                    },
                     "has_feed_in": result.has_feed_in,
-                    "usage_available": result.current_bill_usage is not None,
-                    "cost_available": result.current_bill_cost is not None,
-                    "export_available": result.current_bill_export is not None,
-                    "credit_available": result.current_bill_credit is not None,
+                    "price_sensors": result.price_sensors,
+                    "known": {
+                        "bill_usage": result.bill.usage is not None,
+                        "bill_cost": result.bill.cost is not None,
+                        "bill_export": result.bill.export is not None,
+                        "bill_credit": result.bill.credit is not None,
+                        "bill_estimate": result.bill.estimate is not None,
+                        "total_due": result.total_due is not None,
+                        "last_bill": result.last_bill is not None,
+                        "last_payment": result.last_payment is not None,
+                        "daily_charge": result.prices is not None
+                        and result.prices.daily_charge is not None,
+                        "anytime_price": result.prices is not None
+                        and result.prices.anytime is not None,
+                    },
                 }
                 for result in data.account_results
             ],

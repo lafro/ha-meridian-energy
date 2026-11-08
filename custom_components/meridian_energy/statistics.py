@@ -10,8 +10,6 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from functools import partial
 from hashlib import sha256
-from itertools import pairwise
-from typing import cast
 
 from homeassistant.components.recorder import get_instance  # type: ignore[attr-defined]
 from homeassistant.components.recorder.models import (
@@ -20,7 +18,6 @@ from homeassistant.components.recorder.models import (
     StatisticMetaData,
 )
 from homeassistant.components.recorder.statistics import (
-    StatisticsRow,
     async_add_external_statistics,
     statistics_during_period,
 )
@@ -35,12 +32,10 @@ from .const import (
     STAT_GENERATION,
     STAT_GENERATION_CREDIT,
 )
-from .models import BillingPeriodTotals
 
 _LOGGER = logging.getLogger(__name__)
 _COST_UNIT = "NZD"
 CLEAR_STATISTICS_TIMEOUT_SECONDS = 30
-_SECONDS_PER_HOUR = 3600
 _HOUR = timedelta(hours=1)
 # A write reads the stored rows from 14 days before its earliest hour.
 _NEAR_LOOKBACK = timedelta(days=14)
@@ -329,185 +324,6 @@ def _close(value: float | None, expected: float | None) -> bool:
         and expected is not None
         and abs(value - expected) <= _SUM_TOLERANCE
     )
-
-
-async def async_account_period_totals(
-    hass: HomeAssistant,
-    *,
-    property_keys: tuple[str, ...],
-    feed_in_keys: tuple[str, ...],
-    start: datetime,
-    end: datetime,
-) -> BillingPeriodTotals:
-    """
-    Return complete account totals for an exact UTC billing-period range.
-
-    A barrier first waits up to 30 s for queued statistics; a row still
-    missing then is a gap, which leaves its total unknown. A total sums its
-    rows' changes, so it is known only when a row for every hour from the
-    period's start steps from the one before by its own state: a seam or an
-    adjusted sum there leaves it unknown, and the money total with it.
-    Export and credit count the properties in ``feed_in_keys``.
-    """
-    instance = get_instance(hass)
-    if not await _async_run_removal(hass, []):
-        _LOGGER.debug(
-            "Home Assistant had not finished saving statistics after 30 s; the "
-            "bill totals read what it has saved"
-        )
-    statistic_ids: set[str] = set()
-    pairs: list[tuple[str, str, bool]] = []
-    for key in property_keys:
-        consumption_energy, consumption_cost = consumption_ids(key)
-        pairs.append((consumption_energy, consumption_cost, False))
-        statistic_ids.update((consumption_energy, consumption_cost))
-        if key in feed_in_keys:
-            generation_energy, generation_credit = generation_ids(key)
-            pairs.append((generation_energy, generation_credit, True))
-            statistic_ids.update((generation_energy, generation_credit))
-
-    result = await instance.async_add_executor_job(
-        partial(
-            statistics_during_period,
-            hass,
-            start,
-            end,
-            statistic_ids,
-            "hour",
-            None,
-            {"change", "state"},
-        )
-    )
-
-    usage = Decimal(0)
-    cost = Decimal(0)
-    exported = Decimal(0)
-    credit = Decimal(0)
-    consumption_complete = True
-    cost_complete = True
-    generation_complete = True
-    credit_complete = True
-    saw_consumption = False
-    saw_generation = False
-
-    pair_rows = [
-        (
-            _change_rows(result.get(energy_id, []), start, end),
-            _change_rows(result.get(money_id, []), start, end),
-            generation,
-            _steps_follow_states(result.get(energy_id, []), start, end),
-            _steps_follow_states(result.get(money_id, []), start, end),
-        )
-        for energy_id, money_id, generation in pairs
-    ]
-    consumption_horizon = max(
-        (
-            row[0]
-            for energy_rows, _money_rows, generation, *_consistent in pair_rows
-            if not generation
-            for row in energy_rows
-        ),
-        default=None,
-    )
-    generation_horizon = max(
-        (
-            row[0]
-            for energy_rows, _money_rows, generation, *_consistent in pair_rows
-            if generation
-            for row in energy_rows
-        ),
-        default=None,
-    )
-
-    for (
-        energy_rows,
-        money_rows,
-        generation,
-        energy_consistent,
-        money_consistent,
-    ) in pair_rows:
-        energy_starts = {row[0] for row in energy_rows}
-        money_starts = {row[0] for row in money_rows}
-        energy_complete = energy_consistent and _hourly_rows_are_contiguous(
-            energy_starts,
-            start,
-            generation_horizon if generation else consumption_horizon,
-        )
-        if generation:
-            saw_generation |= bool(energy_rows)
-            generation_complete &= energy_complete
-            credit_complete &= energy_starts == money_starts and money_consistent
-            exported += sum((row[1] for row in energy_rows), Decimal(0))
-            credit += sum((row[1] for row in money_rows), Decimal(0))
-        else:
-            saw_consumption |= bool(energy_rows)
-            consumption_complete &= energy_complete
-            cost_complete &= energy_starts == money_starts and money_consistent
-            usage += sum((row[1] for row in energy_rows), Decimal(0))
-            cost += sum((row[1] for row in money_rows), Decimal(0))
-
-    usage_complete = saw_consumption and consumption_complete
-    cost_data_complete = usage_complete and cost_complete
-    export_complete = saw_generation and generation_complete
-    credit_data_complete = export_complete and credit_complete
-    return BillingPeriodTotals(
-        usage=usage if usage_complete else None,
-        cost=cost if cost_data_complete else None,
-        export=exported if export_complete else None,
-        credit=credit if credit_data_complete else None,
-        usage_complete=usage_complete,
-        cost_complete=cost_data_complete,
-        export_complete=export_complete,
-        credit_complete=credit_data_complete,
-    )
-
-
-def _hourly_rows_are_contiguous(
-    starts: set[float], period_start: datetime, expected_horizon: float | None
-) -> bool:
-    """Return whether published rows cover every UTC hour from period start."""
-    if (
-        not starts
-        or expected_horizon is None
-        or min(starts) != period_start.timestamp()
-        or max(starts) != expected_horizon
-    ):
-        return False
-    ordered = sorted(starts)
-    return all(
-        later - earlier == _SECONDS_PER_HOUR for earlier, later in pairwise(ordered)
-    )
-
-
-def _steps_follow_states(
-    rows: list[StatisticsRow], start: datetime, end: datetime
-) -> bool:
-    """
-    Return whether each row in a range steps from the one before by its state.
-
-    The first row's change is from the newest stored row before the range,
-    or from zero when there is none, as for a statistic's first row.
-    """
-    for row in rows:
-        timestamp = _timestamp(cast("float | datetime", row["start"]))
-        if not start.timestamp() <= timestamp < end.timestamp():
-            continue
-        if not _close(row.get("change"), row.get("state")):
-            return False
-    return True
-
-
-def _change_rows(
-    rows: list[StatisticsRow], start: datetime, end: datetime
-) -> list[tuple[float, Decimal]]:
-    """Return timestamp/change pairs constrained to the requested range."""
-    result: list[tuple[float, Decimal]] = []
-    for row in rows:
-        timestamp = _timestamp(cast("float | datetime", row["start"]))
-        change = row.get("change")
-        if start.timestamp() <= timestamp < end.timestamp() and change is not None:
-            result.append((timestamp, Decimal(str(change))))
-    return result
 
 
 def energy_metadata(stat_id: str, name: str) -> StatisticMetaData:

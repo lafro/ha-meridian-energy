@@ -124,6 +124,31 @@ def hourly_readings(
         if (row.end or start + HOUR).astimezone(UTC) > now:
             continue
         _keep(kept, channels.setdefault(start, set()), start, row)
+    return _summed(kept)
+
+
+def day_readings(
+    rows: Iterable[MeridianMeasurement], start_on: date, end_on: date
+) -> dict[date, Reading]:
+    """
+    Return the New Zealand dates' readings from day rows, future ones included.
+
+    Only dates from ``start_on`` to ``end_on`` count; channels are kept and
+    summed as for hours, and a date is actual only when every channel is.
+    """
+    kept: dict[tuple[datetime, str], MeridianMeasurement] = {}
+    channels: dict[datetime, set[str]] = {}
+    for row in rows:
+        start = _hour_start(row)
+        if start_on <= nz_date(start) <= end_on:
+            _keep(kept, channels.setdefault(start, set()), start, row)
+    return {nz_date(start): reading for start, reading in _summed(kept).items()}
+
+
+def _summed(
+    kept: dict[tuple[datetime, str], MeridianMeasurement],
+) -> dict[datetime, Reading]:
+    """Sum each start's channels: a cost only when every channel has one."""
     readings: dict[datetime, Reading] = {}
     for (start, _channel), row in sorted(kept.items()):
         cost = row.cost_cents
