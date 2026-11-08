@@ -155,6 +155,16 @@ _EXTRA_BACK = {
     "balance": "Meridian Energy is getting the balance again",
     "prices": "Meridian Energy is getting the prices again",
 }
+# How much each lost line leaves unknown: across accounts, the wider is said.
+_LOST_RANK = {
+    "billing": 0,
+    "billing_bill": 1,
+    "days": 0,
+    "days_all": 1,
+    "balance": 0,
+    "prices_unanswered": 0,
+    "prices": 1,
+}
 
 type UnitKey = tuple[str, str]
 
@@ -1084,8 +1094,10 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
 
         A billing period is withheld once it has ended. It is asked for again
         at the first update after its end, and every 6 hours until a new one
-        comes. ``lost`` gathers the kinds that failed and show unknown, each
-        with the key of the line that says what is unknown.
+        comes, both decided from the last period Meridian gave; until a new
+        one shows, the billing period is not reported back. ``lost`` gathers
+        the kinds that failed and show unknown, each with the key of the line
+        that says what is unknown.
         """
         number = account.number
         today = nz_date(now)
@@ -1095,23 +1107,29 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             now,
             partial(self.client.async_get_billing_period, number),
         )
-        period: MeridianBillingPeriod | None = billing.kept("billing", now)
-        end = period.end if period is not None else None
-        if end is not None and today > end:
-            period = None
-            if billing.due is not None:
-                billing.due = min(billing.due, now + BILL_DAYS_INTERVAL)
-        elif end is not None and billing.at == now and billing.due is not None:
-            billing.due = min(billing.due, local_midnight(end + _DAY))
+        last: MeridianBillingPeriod | None = billing.value
+        ended = last is not None and last.end is not None and today > last.end
+        period: MeridianBillingPeriod | None = (
+            None if ended else billing.kept("billing", now)
+        )
+        if last is not None and last.end is not None and billing.due is not None:
+            billing.due = min(
+                billing.due,
+                now + BILL_DAYS_INTERVAL if ended else local_midnight(last.end + _DAY),
+            )
         bill = await self._async_bill(account, period, failed, now, lost)
-        if billing.failing and period is None:
-            lost["billing"] = "billing_bill" if bill == BillFigures() else "billing"
+        if period is None and (
+            billing.failing or (ended and "billing" in self._extras_lost)
+        ):
+            _lose(
+                lost, "billing", "billing_bill" if bill == BillFigures() else "billing"
+            )
         extra = await self._async_extra(
             "balance", number, now, partial(self.client.async_get_balance, number)
         )
         balance: MeridianBalance | None = extra.kept("balance", now)
         if extra.failing and balance is None:
-            lost["balance"] = "balance"
+            _lose(lost, "balance", "balance")
         price_sensors, prices = await self._async_prices(account, now, lost)
         result = AccountSyncResult(
             account_key=account_key(number),
@@ -1182,7 +1200,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         current = bill is not None and nz_date(now) <= bill.end
         kept = current and extra.kept("days", now) is not None
         if extra.failing and not kept:
-            lost["days"] = "days" if current else "days_all"
+            _lose(lost, "days", "days" if current else "days_all")
         if bill is None or not current:
             return BillFigures()
         return bill.figures if kept else BillFigures(estimate=bill.figures.estimate)
@@ -1280,14 +1298,19 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         )
         if extra.at is None:
             if extra.failing:
-                lost["prices"] = "prices_unanswered"
+                _lose(lost, "prices", "prices_unanswered")
             return None, None
         if extra.value is None:
             return False, None
         prices: MeridianPrices | None = extra.kept("prices", now)
         if extra.failing and prices is None:
-            lost["prices"] = "prices"
+            _lose(lost, "prices", "prices")
         return True, prices
+
+
+def _lose(lost: dict[str, str], kind: str, key: str) -> None:
+    """Note a kind lost, keeping the line that leaves the most unknown."""
+    lost[kind] = max(lost.get(kind, key), key, key=_LOST_RANK.__getitem__)
 
 
 def _note_stored(memory: _Memory, hours: Collection[datetime]) -> None:

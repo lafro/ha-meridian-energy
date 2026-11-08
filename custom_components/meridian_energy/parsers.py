@@ -37,6 +37,10 @@ class TokenParseError(ValueError):
 
 
 _MAX_TOKEN_LIFETIME_SECONDS = 86400
+# The largest power of ten a measurement's value or cost may reach: no
+# hour's or day's kWh, nor any cost in cents, comes near 1E+13, and a number
+# far past it would overflow when added up.
+_LARGEST_EXPONENT = 12
 _KNOWN_COST_TYPES = COST_STATISTIC_TYPES | GENERATION_CREDIT_TYPES
 _COST_TYPE_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
 # What a type is named in the log when it is not a plain upper-case name.
@@ -330,13 +334,15 @@ def _log_unknown_cost_type(cost_type: object) -> None:
 
 
 def _finite_decimal(value: Any, context: str) -> Decimal:
-    """Parse one finite upstream decimal value."""
+    """Parse one finite upstream decimal value, smaller than 1E+13 either way."""
     try:
         parsed = Decimal(str(value))
     except (InvalidOperation, TypeError) as err:
         raise ValueError(f"Invalid {context}") from err
     if not parsed.is_finite():
         raise ValueError(f"{context.capitalize()} is not finite")
+    if parsed.adjusted() > _LARGEST_EXPONENT:
+        raise ValueError(f"{context.capitalize()} is out of range")
     return parsed
 
 

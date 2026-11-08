@@ -93,6 +93,29 @@ def test_a_day_node_off_new_zealand_midnights_is_refused(start: str, end: str) -
         parse_measurement(_day_node(start, end), "CONSUMPTION", _DAY)
 
 
+@pytest.mark.parametrize("field", ["value", "cost"])
+def test_a_number_past_1e12_is_refused(field: str) -> None:
+    """No kWh, nor any cost in cents, comes near: the sum of a few would overflow."""
+
+    def node(number: str) -> dict[str, Any]:
+        day = _day_node("2026-07-13T00:00:00+12:00", "2026-07-14T00:00:00+12:00")
+        if field == "value":
+            day["value"] = number
+        else:
+            day["metaData"]["statistics"][0]["costInclTax"]["estimatedAmount"] = number
+        return day
+
+    for number in ("123456.789", "9E+12"):
+        row = parse_measurement(node(number), "CONSUMPTION", _DAY)
+        if field == "value":
+            assert row.value_kwh == Decimal(number)
+        else:
+            assert row.cost_cents == Decimal(number) + 200
+    for number in ("1E+13", "1E+1000000"):
+        with pytest.raises(ValueError, match="out of range"):
+            parse_measurement(node(number), "CONSUMPTION", _DAY)
+
+
 def test_an_hour_node_in_a_day_answer_is_refused() -> None:
     node = _day_node(
         "2026-07-13T00:00:00+12:00",
