@@ -212,13 +212,16 @@ def parse_prices(property_data: dict[str, Any]) -> MeridianPrices | None:
     if agreement is None:
         return None
     agreement = require_mapping(agreement, "agreement")
-    rates = [require_mapping(rate, "rate") for rate in agreement.get("rates") or []]
+    rates = [
+        require_mapping(rate, "rate")
+        for rate in require_list(agreement.get("rates") or [], "rates")
+    ]
     bands = {
         band: [rate for rate in rates if rate.get("bandCategory") == band]
         for band in _PRICE_NAMES
     }
     if any(len(found) != 1 for found in bands.values()) or any(
-        rate.get("touBucketName") not in {None, ""} for rate in rates
+        rate.get("touBucketName") not in (None, "") for rate in rates
     ):
         return None
     return MeridianPrices(
@@ -366,7 +369,7 @@ def optional_string(value: Any) -> str | None:
 
 def optional_date(value: Any) -> date | None:
     """Parse an optional ISO local date."""
-    if value in {None, ""}:
+    if value is None or value == "":
         return None
     if not isinstance(value, str):
         raise ValueError("Invalid Meridian billing date")

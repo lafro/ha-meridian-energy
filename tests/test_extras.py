@@ -32,15 +32,19 @@ from .meridian_http import (
     FakeMeridianSession,
     Response,
     account_data,
+    balance_data,
+    billing_data,
     json_response,
+    prices_data,
     rate,
 )
-from .syncs import DAY, HOUR, NOW, TODAY, coordinator_for, sync
+from .syncs import DAY, HOUR, NOW, TODAY, coordinator_for, refresh, sync
 
 _INTEGRATION = "custom_components.meridian_energy"
 # The current period: 1 to 31 July, today the 16th.
 _PERIOD = (TODAY - 15 * DAY, TODAY + 15 * DAY)
 _FAILED = json_response({}, status=503)
+_FIGURES = frozenset({"billingPeriods", "balance", "prices"})
 _BILLING_AND_BILL_LOST = (
     "Meridian Energy couldn't get the billing period; the billing period and bill "
     "sensors show unknown until it can"
@@ -570,26 +574,59 @@ async def test_no_figure_is_asked_for_after_a_measurements_rate_limit(
     assert data.account_results[0].bill == BillFigures()
 
 
+def _billing_with(**changes: Any) -> Response:
+    account = billing_data(_PERIOD)
+    account["billingOptions"].update(changes)
+    return json_response({"data": {"account": account}})
+
+
+def _balance_with(connection: str, **changes: Any) -> Response:
+    account = balance_data(TODAY)
+    account[connection]["edges"][0]["node"].update(changes)
+    return json_response({"data": {"account": account}})
+
+
+def _prices_with(**changes: Any) -> Response:
+    prices = prices_data()
+    agreement = prices["meterPoints"][0]["activeAgreement"]
+    if "rates" in changes:
+        agreement["rates"] = changes["rates"]
+    else:
+        agreement["rates"][0].update(changes)
+    return json_response({"data": {"account": {"property": prices}}})
+
+
 @pytest.mark.parametrize(
-    ("answer", "failure"),
+    ("operations", "answer", "failure"),
     [
-        (_FAILED, None),
+        (_FIGURES, _FAILED, None),
         (
+            _FIGURES,
             json_response({"errors": [{"extensions": {"errorCode": "KT-CT-4321"}}]}),
             None,
         ),
-        (json_response({"data": {"account": {"balance": "lots"}}}), None),
-        (json_response({}, status=401), ConfigEntryAuthFailed),
+        (_FIGURES, json_response({"data": {"account": {"balance": "lots"}}}), None),
+        # A field of the wrong JSON type is as unreadable as a wrong value,
+        # except a time-of-use bucket: any but none ties a rate to a time.
+        ({"prices"}, _prices_with(rates=5), None),
+        ({"prices"}, _prices_with(touBucketName=["x"]), None),
+        ({"balance"}, _balance_with("bills", issuedDate={}), None),
+        ({"balance"}, _balance_with("payments", paymentDate=[]), None),
+        ({"billingPeriods"}, _billing_with(currentBillingPeriodEndDate=["x"]), None),
+        (_FIGURES, json_response({}, status=401), ConfigEntryAuthFailed),
     ],
 )
 async def test_failed_figures_never_fail_an_update_but_an_ended_sign_in_does(
     hass: HomeAssistant,
     session: FakeMeridianSession,
+    operations: frozenset[str],
     answer: Response,
     failure: type[Exception] | None,
 ) -> None:
+    """A failed figure shows unknown, and is asked for again only when due."""
+    session.billing_period = _PERIOD
     session.hook = lambda operation, _variables: (
-        answer if operation in {"billingPeriods", "balance", "prices"} else None
+        answer if operation in operations else None
     )
     coordinator = coordinator_for(hass, session)
 
@@ -597,8 +634,21 @@ async def test_failed_figures_never_fail_an_update_but_an_ended_sign_in_does(
         with pytest.raises(failure):
             await sync(coordinator, NOW, session)
         return
-    data = await sync(coordinator, NOW, session)
-    assert data.account_results[0].total_due is None
+    await refresh(coordinator, NOW, session)
+
+    assert coordinator.last_update_success
+    (result,) = coordinator.data.account_results
+    unknown = {
+        "billingPeriods": result.billing_period is None,
+        "balance": result.total_due is None,
+        "prices": result.prices is None,
+    }
+    assert all(unknown[operation] for operation in operations)
+    asked = [name for name in session.operations if name in operations]
+    assert len(asked) == len(operations)
+    await refresh(coordinator, NOW + HOUR, session)
+    assert coordinator.last_update_success
+    assert [name for name in session.operations if name in operations] == asked
 
 
 async def test_a_property_whose_grid_import_failed_skips_its_day_request(
