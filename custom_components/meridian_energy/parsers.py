@@ -7,9 +7,10 @@ import hashlib
 import json
 import logging
 import re
-from datetime import UTC, date, datetime, timedelta, tzinfo
+from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from decimal import Decimal, InvalidOperation
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .const import (
     AGGREGATE_CHANNEL_ID,
@@ -17,7 +18,16 @@ from .const import (
     GENERATION_CREDIT_TYPES,
     READING_FREQUENCY_HOUR,
 )
-from .models import MeridianMeasurement, MeridianTokenSet, require_list, require_mapping
+from .models import (
+    MeridianBalance,
+    MeridianBill,
+    MeridianMeasurement,
+    MeridianPayment,
+    MeridianPrices,
+    MeridianTokenSet,
+    require_list,
+    require_mapping,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -34,6 +44,15 @@ _UNNAMED_COST_TYPE = "UNNAMED"
 # The unknown types already logged since Home Assistant started: every hour
 # of every window would carry one, so each is logged once.
 _logged_cost_types: set[str] = set()
+_NZ = ZoneInfo("Pacific/Auckland")
+# A price as the web app formats it, in dollars or in cents, per day or kWh.
+_DOLLAR_RATE = re.compile(r"\$\s?(\d+(?:\.\d+)?)\s?/\s?(day|kWh)")
+_CENT_RATE = re.compile(r"(\d+(?:\.\d+)?)\s?c\s?/\s?(day|kWh)")
+_STANDING, _CONSUMPTION = "STANDING_CHARGE", "CONSUMPTION_CHARGE"
+_PRICE_NAMES = {_STANDING: "daily charge", _CONSUMPTION: "anytime price"}
+# Each price's field already logged as unreadable, by band and field: each
+# price's field is logged once.
+_logged_rates: set[tuple[str, str]] = set()
 
 
 def parse_firebase_tokens(payload: dict[str, Any]) -> MeridianTokenSet:
@@ -82,13 +101,24 @@ def firebase_user_id(payload: dict[str, Any], id_token: str) -> str:
 
 
 def parse_measurement(
-    node: dict[str, Any], expected_direction: str
+    node: dict[str, Any],
+    expected_direction: str,
+    frequency: str = READING_FREQUENCY_HOUR,
 ) -> MeridianMeasurement:
-    """Parse one hourly electricity measurement."""
+    """
+    Parse one electricity measurement: an hour, or a New Zealand date.
+
+    A date runs from its midnight to the next, so it has 23, 24 or 25 hours.
+    """
     start = parse_datetime(node.get("startAt"), "measurement start")
     end = parse_datetime(node.get("endAt"), "measurement end")
-    if end.astimezone(UTC) - start.astimezone(UTC) != timedelta(hours=1):
-        raise ValueError("Measurement interval is not exactly one hour")
+    if frequency == READING_FREQUENCY_HOUR:
+        if end.astimezone(UTC) - start.astimezone(UTC) != timedelta(hours=1):
+            raise ValueError("Measurement interval is not exactly one hour")
+    else:
+        day = start.astimezone(_NZ).date()
+        if (start, end) != (_nz_midnight(day), _nz_midnight(day + timedelta(days=1))):
+            raise ValueError("Measurement interval is not one New Zealand date")
     if required_string(node, "unit").casefold() != "kwh":
         raise ValueError("Unexpected measurement unit")
     value = _finite_decimal(node.get("value"), "measurement value")
@@ -100,7 +130,7 @@ def parse_measurement(
     direction = required_string(filters, "readingDirection")
     if direction != expected_direction:
         raise ValueError("Unexpected measurement direction")
-    if required_string(filters, "readingFrequencyType") != READING_FREQUENCY_HOUR:
+    if required_string(filters, "readingFrequencyType") != frequency:
         raise ValueError("Unexpected measurement frequency")
     quality = required_string(filters, "readingQuality")
     channel_id = _measurement_channel_id(filters)
@@ -114,6 +144,115 @@ def parse_measurement(
         channel_id=channel_id,
         cost_cents=_measurement_cost_cents(metadata, direction),
     )
+
+
+def _nz_midnight(day: date) -> datetime:
+    return datetime.combine(day, time.min, tzinfo=_NZ)
+
+
+def parse_balance(account: dict[str, Any]) -> MeridianBalance:
+    """Parse an account's balance, its bills and its payments; amounts in cents."""
+    bills: list[MeridianBill] = []
+    for node in _nodes(account.get("bills"), "bills"):
+        issued = optional_date(node.get("issuedDate"))
+        if issued is not None:
+            bills.append(
+                MeridianBill(
+                    issued=issued,
+                    start=optional_date(node.get("fromDate")),
+                    end=optional_date(node.get("toDate")),
+                )
+            )
+    payments: list[MeridianPayment] = []
+    for node in _nodes(account.get("payments"), "payments"):
+        paid_on = optional_date(node.get("paymentDate"))
+        if paid_on is not None:
+            payments.append(
+                MeridianPayment(
+                    amount_cents=_cents(node.get("amount"), "payment amount"),
+                    paid_on=paid_on,
+                    status=optional_string(node.get("status")),
+                )
+            )
+    return MeridianBalance(
+        balance_cents=_cents(account.get("balance"), "balance"),
+        bills=tuple(bills),
+        payments=tuple(payments),
+    )
+
+
+def _nodes(connection: Any, context: str) -> list[dict[str, Any]]:
+    """Return the nodes of a connection's edges."""
+    edges = require_list(require_mapping(connection, context).get("edges"), context)
+    return [
+        require_mapping(require_mapping(edge, context).get("node"), context)
+        for edge in edges
+    ]
+
+
+def _cents(value: Any, context: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(f"Invalid Meridian {context}")
+    return value
+
+
+def parse_prices(property_data: dict[str, Any]) -> MeridianPrices | None:
+    """
+    Parse an all-day plan's prices, or return None for any other plan.
+
+    All-day: one meter point, whose current agreement has one daily charge
+    and one price per kWh, and no rate tied to a time of day. Each price is
+    read strictly, its discounted form when it has a discount; one that does
+    not read as dollars or cents per day or kWh, as its band says, is None,
+    and the name of each price's field is logged once.
+    """
+    meters = require_list(property_data.get("meterPoints"), "meter points")
+    if len(meters) != 1:
+        return None
+    agreement = require_mapping(meters[0], "meter point").get("activeAgreement")
+    if agreement is None:
+        return None
+    agreement = require_mapping(agreement, "agreement")
+    rates = [
+        require_mapping(rate, "rate")
+        for rate in require_list(agreement.get("rates") or [], "rates")
+    ]
+    bands = {
+        band: [rate for rate in rates if rate.get("bandCategory") == band]
+        for band in _PRICE_NAMES
+    }
+    if any(len(found) != 1 for found in bands.values()) or any(
+        rate.get("touBucketName") not in (None, "") for rate in rates
+    ):
+        return None
+    return MeridianPrices(
+        plan=optional_string(agreement.get("displayName")),
+        daily_charge=_price(bands[_STANDING][0], _STANDING, "day"),
+        anytime=_price(bands[_CONSUMPTION][0], _CONSUMPTION, "kWh"),
+    )
+
+
+def _price(rate: dict[str, Any], band: str, unit: str) -> Decimal | None:
+    """Return a rate's price in NZD, or None when it does not read as its band's."""
+    field = (
+        "formattedRateIncludingTaxIncludingDiscount"
+        if rate.get("hasDiscount") is True
+        else "formattedRateIncludingTax"
+    )
+    text = rate.get(field)
+    text = text.strip() if isinstance(text, str) else ""
+    for pattern, dollars in ((_DOLLAR_RATE, Decimal(1)), (_CENT_RATE, Decimal(100))):
+        match = pattern.fullmatch(text)
+        if match is not None and match[2] == unit:
+            return Decimal(match[1]) / dollars
+    if (band, field) not in _logged_rates:
+        _logged_rates.add((band, field))
+        _LOGGER.info(
+            "Meridian Energy can't read the %s in %s; it shows unknown",
+            _PRICE_NAMES[band],
+            field,
+        )
+    return None
 
 
 def _measurement_channel_id(filters: dict[str, Any]) -> str:
@@ -167,7 +306,7 @@ def _measurement_cost_cents(metadata: dict[str, Any], direction: str) -> Decimal
             continue
         cost = require_mapping(raw_cost, "measurement cost")
         amount = cost.get("estimatedAmount")
-        if amount in {None, ""}:
+        if amount is None or amount == "":
             incomplete_cost = True
             continue
         cents = _finite_decimal(amount, "measurement cost")
@@ -231,7 +370,7 @@ def optional_string(value: Any) -> str | None:
 
 def optional_date(value: Any) -> date | None:
     """Parse an optional ISO local date."""
-    if value in {None, ""}:
+    if value is None or value == "":
         return None
     if not isinstance(value, str):
         raise ValueError("Invalid Meridian billing date")

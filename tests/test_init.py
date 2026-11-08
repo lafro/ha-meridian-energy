@@ -56,9 +56,13 @@ from custom_components.meridian_energy.const import (
 )
 from custom_components.meridian_energy.models import (
     AccountSyncResult,
+    BillFigures,
     MeridianAccount,
+    MeridianBill,
     MeridianBillingPeriod,
     MeridianMeterPoint,
+    MeridianPayment,
+    MeridianPrices,
     MeridianProperty,
     MeridianSyncData,
     MeridianTokenSet,
@@ -106,7 +110,7 @@ def _account(*, feed_in: bool = False) -> MeridianAccount:
     )
 
 
-def _sync_data(*, feed_in: bool = False) -> MeridianSyncData:
+def _sync_data(*, feed_in: bool = False, prices: bool = False) -> MeridianSyncData:
     now = datetime.now(UTC).replace(minute=0, second=0, microsecond=0)
     key = account_key("synthetic-account")
     return MeridianSyncData(
@@ -127,15 +131,9 @@ def _sync_data(*, feed_in: bool = False) -> MeridianSyncData:
             AccountSyncResult(
                 account_key=key,
                 billing_period=None,
-                current_bill_usage=Decimal(1),
-                current_bill_cost=Decimal("0.25"),
-                current_bill_export=None,
-                current_bill_credit=None,
                 has_feed_in=feed_in,
-                usage_complete=False,
-                cost_complete=False,
-                export_complete=False,
-                credit_complete=False,
+                bill=BillFigures(usage=Decimal(1), cost=Decimal("0.25")),
+                price_sensors=prices,
             ),
         ),
         synced_at=now,
@@ -519,14 +517,14 @@ class TestPublicConfigEntryLifecycle:
     async def test_entity_snapshot(
         self, recorder_mock, hass, entity_registry, snapshot, freezer
     ) -> None:
-        """Snapshot every entity's registry entry and state for a feed-in account."""
+        """Snapshot every entity's registry entry and state: feed-in, all-day plan."""
         del recorder_mock
         freezer.move_to("2026-07-15T01:00:00+00:00")
         entry = _entry()
         entry.add_to_hass(hass)
 
         def _data() -> MeridianSyncData:
-            data = _sync_data(feed_in=True)
+            data = _sync_data(feed_in=True, prices=True)
             account_result = replace(
                 data.account_results[0],
                 billing_period=MeridianBillingPeriod(
@@ -538,12 +536,27 @@ class TestPublicConfigEntryLifecycle:
                     next_billing_date=date(2026, 8, 1),
                     period_start_day=1,
                 ),
-                current_bill_export=Decimal("2.5"),
-                current_bill_credit=Decimal("0.42"),
-                usage_complete=True,
-                cost_complete=True,
-                export_complete=True,
-                credit_complete=True,
+                bill=BillFigures(
+                    usage=Decimal(1),
+                    cost=Decimal("0.25"),
+                    export=Decimal("2.5"),
+                    credit=Decimal("0.42"),
+                    estimate=Decimal("80.5"),
+                ),
+                total_due=Decimal(40),
+                last_bill=MeridianBill(
+                    issued=date(2026, 7, 3),
+                    start=date(2026, 6, 1),
+                    end=date(2026, 6, 30),
+                ),
+                last_payment=MeridianPayment(
+                    amount_cents=5000, paid_on=date(2026, 7, 5), status="CLEARED"
+                ),
+                prices=MeridianPrices(
+                    plan="Synthetic Plan",
+                    daily_charge=Decimal(2),
+                    anytime=Decimal("0.3"),
+                ),
             )
             return replace(data, account_results=(account_result,))
 
@@ -570,11 +583,13 @@ class TestPublicConfigEntryLifecycle:
             await hass.async_block_till_done(wait_background_tasks=True)
             assert entry.state is ConfigEntryState.LOADED
             first_coordinator = entry.runtime_data.coordinator
-            assert len(first_coordinator._listeners) == 8
+            # Twelve sensors and the two feed-in ones, three of them disabled,
+            # and the platform's own listener.
+            assert len(first_coordinator._listeners) == 12
 
             registry = er.async_get(hass)
             entry_entities = er.async_entries_for_config_entry(registry, entry.entry_id)
-            assert len(entry_entities) == 10
+            assert len(entry_entities) == 14
             provisional_entry = next(
                 item
                 for item in entry_entities
@@ -586,13 +601,16 @@ class TestPublicConfigEntryLifecycle:
             assert provisional_state.attributes["state_class"] == "measurement"
             assert "unit_of_measurement" not in provisional_state.attributes
 
-            # The current-bill sensors keep no long-term statistics (NRG-15):
-            # no state class and no last_reset, but the period is still shown.
+            # The bill sensors keep no long-term statistics: no state class
+            # and no last_reset.
             for suffix in (
-                "_current_bill_usage",
-                "_current_bill_cost",
-                "_current_bill_export",
-                "_current_bill_credit",
+                "_bill_usage",
+                "_bill_cost",
+                "_bill_export",
+                "_bill_credit",
+                "_bill_estimate",
+                "_total_due",
+                "_last_payment",
             ):
                 bill_entry = next(
                     item for item in entry_entities if item.unique_id.endswith(suffix)
@@ -602,7 +620,6 @@ class TestPublicConfigEntryLifecycle:
                 assert bill_state is not None
                 assert "state_class" not in bill_state.attributes
                 assert "last_reset" not in bill_state.attributes
-                assert "billing_period_start" in bill_state.attributes
 
             topology["feed_in"] = False
             assert await hass.config_entries.async_reload(entry.entry_id)
@@ -611,8 +628,10 @@ class TestPublicConfigEntryLifecycle:
             assert len(first_coordinator._listeners) == 0
             reloaded_coordinator = entry.runtime_data.coordinator
             assert reloaded_coordinator is not first_coordinator
-            assert len(reloaded_coordinator._listeners) == 6
-            assert len(er.async_entries_for_config_entry(registry, entry.entry_id)) == 8
+            assert len(reloaded_coordinator._listeners) == 10
+            assert (
+                len(er.async_entries_for_config_entry(registry, entry.entry_id)) == 12
+            )
 
             assert await hass.config_entries.async_unload(entry.entry_id)
             await hass.async_block_till_done()
@@ -650,7 +669,7 @@ class TestPublicConfigEntryLifecycle:
 
             registry = er.async_get(hass)
             entities = er.async_entries_for_config_entry(registry, entry.entry_id)
-            assert len(entities) == 8
+            assert len(entities) == 12
             provisional = next(
                 item
                 for item in entities
@@ -666,7 +685,7 @@ class TestPublicConfigEntryLifecycle:
         state = hass.states.get(provisional.entity_id)
         assert state is not None
         assert state.state == "0"
-        assert len(er.async_entries_for_config_entry(registry, entry.entry_id)) == 8
+        assert len(er.async_entries_for_config_entry(registry, entry.entry_id)) == 12
         assert await hass.config_entries.async_unload(entry.entry_id)
 
     @pytest.mark.asyncio

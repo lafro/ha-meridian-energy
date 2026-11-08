@@ -32,35 +32,83 @@ from .statistics import account_key
 PARALLEL_UPDATES = 0
 
 NativeValue = date | datetime | Decimal | int | None
-ValueFn = Callable[[MeridianSyncData, str], NativeValue]
+_FEED_IN = "feed_in"
+_PRICES = "prices"
 
 
 @dataclass(frozen=True, kw_only=True)
 class MeridianSensorDescription(SensorEntityDescription):
-    """Description of one account-scoped Meridian sensor."""
+    """
+    Description of one account-scoped Meridian sensor.
 
-    value_fn: ValueFn
-    conditional_feed_in: bool = False
+    ``condition`` names what the sensor needs: a feed-in register, or an
+    all-day plan for the price sensors.
+    """
+
+    value_fn: Callable[[MeridianSyncData, AccountSyncResult], NativeValue]
+    attrs_fn: Callable[[AccountSyncResult], dict[str, Any]] | None = None
+    condition: str | None = None
 
 
+@dataclass(frozen=True, kw_only=True)
+class _EnergyDescription(MeridianSensorDescription):
+    """A sensor in kWh."""
+
+    device_class: SensorDeviceClass | None = SensorDeviceClass.ENERGY
+    native_unit_of_measurement: str | None = UnitOfEnergy.KILO_WATT_HOUR
+    suggested_display_precision: int | None = 1
+
+
+@dataclass(frozen=True, kw_only=True)
+class _MoneyDescription(MeridianSensorDescription):
+    """A sensor in NZD."""
+
+    device_class: SensorDeviceClass | None = SensorDeviceClass.MONETARY
+    native_unit_of_measurement: str | None = "NZD"
+    suggested_display_precision: int | None = 2
+
+
+@dataclass(frozen=True, kw_only=True)
+class _PriceDescription(MeridianSensorDescription):
+    """A price, with no device class: the monetary class takes a currency alone."""
+
+    condition: str | None = _PRICES
+    attrs_fn: Callable[[AccountSyncResult], dict[str, Any]] | None = lambda result: {
+        "plan": result.prices.plan if result.prices else None
+    }
+
+
+@dataclass(frozen=True, kw_only=True)
+class _BillingDateDescription(MeridianSensorDescription):
+    """A date of the billing period, disabled at first."""
+
+    device_class: SensorDeviceClass | None = SensorDeviceClass.DATE
+    entity_category: EntityCategory | None = EntityCategory.DIAGNOSTIC
+    entity_registry_enabled_default: bool = False
+
+
+# No sensor but the diagnostic count has a state class, so Home Assistant
+# keeps no long-term statistics for them: the external statistics are the
+# long-term record.
 DESCRIPTIONS = (
     MeridianSensorDescription(
         key="last_sync",
         translation_key="last_sync",
         device_class=SensorDeviceClass.TIMESTAMP,
         entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda data, _key: data.synced_at,
+        value_fn=lambda data, _result: data.synced_at,
     ),
     MeridianSensorDescription(
         key="latest_meter_data",
         translation_key="latest_meter_data",
         device_class=SensorDeviceClass.TIMESTAMP,
         entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda data, key: max(
+        value_fn=lambda data, result: max(
             (
                 item.latest_reading
                 for item in data.results
-                if item.account_key == key and item.latest_reading is not None
+                if item.account_key == result.account_key
+                and item.latest_reading is not None
             ),
             default=None,
         ),
@@ -71,71 +119,108 @@ DESCRIPTIONS = (
         entity_category=EntityCategory.DIAGNOSTIC,
         state_class=SensorStateClass.MEASUREMENT,
         suggested_display_precision=0,
-        value_fn=lambda data, key: sum(
-            item.estimated_rows for item in data.results if item.account_key == key
+        value_fn=lambda data, result: sum(
+            item.estimated_rows
+            for item in data.results
+            if item.account_key == result.account_key
         ),
     ),
-    # The current-bill sensors deliberately have no state class, so Home
-    # Assistant keeps no long-term statistics for them and does not offer them
-    # in the Energy dashboard. The external grid statistics are the long-term
-    # record; a bill-to-date total would only duplicate them.
-    MeridianSensorDescription(
-        key="current_bill_usage",
-        translation_key="current_bill_usage",
-        device_class=SensorDeviceClass.ENERGY,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        suggested_display_precision=1,
-        value_fn=lambda data, key: _billing_total(data, key, "usage"),
+    _EnergyDescription(
+        key="bill_usage",
+        translation_key="bill_usage",
+        value_fn=lambda _data, result: result.bill.usage,
+    ),
+    _MoneyDescription(
+        key="bill_cost",
+        translation_key="bill_cost",
+        value_fn=lambda _data, result: result.bill.cost,
+    ),
+    _EnergyDescription(
+        key="bill_export",
+        translation_key="bill_export",
+        condition=_FEED_IN,
+        value_fn=lambda _data, result: result.bill.export,
+    ),
+    _MoneyDescription(
+        key="bill_credit",
+        translation_key="bill_credit",
+        condition=_FEED_IN,
+        value_fn=lambda _data, result: result.bill.credit,
+    ),
+    _MoneyDescription(
+        key="bill_estimate",
+        translation_key="bill_estimate",
+        value_fn=lambda _data, result: result.bill.estimate,
+    ),
+    _MoneyDescription(
+        key="total_due",
+        translation_key="total_due",
+        value_fn=lambda _data, result: result.total_due,
+        # A state's attributes must be JSON: Home Assistant can't write a
+        # Decimal.
+        attrs_fn=lambda result: {
+            "credit": None if result.credit is None else round(float(result.credit), 2)
+        },
     ),
     MeridianSensorDescription(
-        key="current_bill_cost",
-        translation_key="current_bill_cost",
-        device_class=SensorDeviceClass.MONETARY,
-        native_unit_of_measurement="NZD",
-        suggested_display_precision=2,
-        value_fn=lambda data, key: _billing_total(data, key, "cost"),
+        key="last_bill",
+        translation_key="last_bill",
+        device_class=SensorDeviceClass.DATE,
+        value_fn=lambda _data, result: (
+            result.last_bill.issued if result.last_bill else None
+        ),
+        attrs_fn=lambda result: {
+            "period_start": result.last_bill.start if result.last_bill else None,
+            "period_end": result.last_bill.end if result.last_bill else None,
+        },
     ),
-    MeridianSensorDescription(
-        key="current_bill_export",
-        translation_key="current_bill_export",
-        device_class=SensorDeviceClass.ENERGY,
-        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
-        suggested_display_precision=1,
-        conditional_feed_in=True,
-        value_fn=lambda data, key: _billing_total(data, key, "export"),
+    _MoneyDescription(
+        key="last_payment",
+        translation_key="last_payment",
+        value_fn=lambda _data, result: (
+            Decimal(result.last_payment.amount_cents) / 100
+            if result.last_payment
+            else None
+        ),
+        attrs_fn=lambda result: {
+            "date": result.last_payment.paid_on if result.last_payment else None,
+            "status": result.last_payment.status if result.last_payment else None,
+        },
     ),
-    MeridianSensorDescription(
-        key="current_bill_credit",
-        translation_key="current_bill_credit",
-        device_class=SensorDeviceClass.MONETARY,
-        native_unit_of_measurement="NZD",
-        suggested_display_precision=2,
-        conditional_feed_in=True,
-        value_fn=lambda data, key: _billing_total(data, key, "credit"),
+    _PriceDescription(
+        key="daily_charge",
+        translation_key="daily_charge",
+        native_unit_of_measurement="NZD/day",
+        value_fn=lambda _data, result: (
+            result.prices.daily_charge if result.prices else None
+        ),
     ),
-    MeridianSensorDescription(
+    _PriceDescription(
+        key="anytime_price",
+        translation_key="anytime_price",
+        native_unit_of_measurement="NZD/kWh",
+        value_fn=lambda _data, result: result.prices.anytime if result.prices else None,
+    ),
+    _BillingDateDescription(
         key="billing_period_start",
         translation_key="billing_period_start",
-        device_class=SensorDeviceClass.DATE,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-        value_fn=lambda data, key: _billing_value(data, key, "start"),
+        value_fn=lambda _data, result: (
+            result.billing_period.start if result.billing_period else None
+        ),
     ),
-    MeridianSensorDescription(
+    _BillingDateDescription(
         key="billing_period_end",
         translation_key="billing_period_end",
-        device_class=SensorDeviceClass.DATE,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-        value_fn=lambda data, key: _billing_value(data, key, "end"),
+        value_fn=lambda _data, result: (
+            result.billing_period.end if result.billing_period else None
+        ),
     ),
-    MeridianSensorDescription(
+    _BillingDateDescription(
         key="next_billing_date",
         translation_key="next_billing_date",
-        device_class=SensorDeviceClass.DATE,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        entity_registry_enabled_default=False,
-        value_fn=lambda data, key: _billing_value(data, key, "next_billing_date"),
+        value_fn=lambda _data, result: (
+            result.billing_period.next_billing_date if result.billing_period else None
+        ),
     ),
 )
 
@@ -151,47 +236,43 @@ async def async_setup_entry(
 
     @callback
     def _update_entities() -> None:
-        """Add newly discovered entities and remove stale account devices."""
+        """
+        Add the sensors an account now has, and remove those it no longer has.
+
+        A sensor whose condition can't be told yet, as the price sensors'
+        before Meridian has said what plan an account is on, is left as it is.
+        """
         new_entities: list[MeridianAccountSensor] = []
         current_account_keys: set[str] = set()
-        desired_sensor_keys: set[tuple[str, str]] = set()
-        conditional_sensor_keys: set[tuple[str, str]] = set()
-        incoherent_account_keys: set[str] = set()
-        multiple_properties = (
-            sum(len(account.properties) for account in coordinator.accounts) > 1
-        )
+        desired: set[tuple[str, str]] = set()
+        conditional: set[tuple[str, str]] = set()
+        undecided: set[tuple[str, str]] = set()
 
         for account in coordinator.accounts:
             key = account_key(account.number)
             current_account_keys.add(key)
-            if coordinator.data is None:
-                # Before the first sync, entities come from the cached topology
-                # and stay unavailable until that sync supplies their values.
-                has_feed_in = _account_has_feed_in(account)
-            else:
-                result = _account_result(coordinator.data, key)
-                if result is None:
-                    incoherent_account_keys.add(key)
-                    continue
-                has_feed_in = result.has_feed_in
+            met = _conditions(coordinator.data, account, key)
+            if met is None:
+                # Not in the sync's results yet: left as it is until it is.
+                undecided.update((key, item.key) for item in DESCRIPTIONS)
+                continue
             for description in DESCRIPTIONS:
                 sensor_key = (key, description.key)
-                if description.conditional_feed_in:
-                    conditional_sensor_keys.add(sensor_key)
-                if description.conditional_feed_in and not has_feed_in:
-                    continue
-                desired_sensor_keys.add(sensor_key)
+                if description.condition is not None:
+                    conditional.add(sensor_key)
+                    wanted = met.get(description.condition)
+                    if wanted is None:
+                        # Not known yet: one already registered shows unknown.
+                        undecided.add(sensor_key)
+                        wanted = _entity_id(hass, entry, sensor_key) is not None
+                    if not wanted:
+                        continue
+                desired.add(sensor_key)
                 if sensor_key in created_sensors:
                     continue
                 created_sensors.add(sensor_key)
                 new_entities.append(
-                    MeridianAccountSensor(
-                        coordinator,
-                        account,
-                        key,
-                        description,
-                        disambiguate=multiple_properties,
-                    )
+                    MeridianAccountSensor(coordinator, key, description)
                 )
 
         if new_entities:
@@ -200,21 +281,32 @@ async def async_setup_entry(
         _remove_stale_devices(hass, entry, current_account_keys)
 
         # The entity registry survives an integration reload while
-        # ``created_sensors`` does not. Reconcile every conditional key so stale
-        # feed-in entities are removed even on a fresh platform setup.
-        stale_sensor_keys = (created_sensors | conditional_sensor_keys) - (
-            desired_sensor_keys
-        )
-        stale_sensor_keys = {
-            sensor_key
-            for sensor_key in stale_sensor_keys
-            if sensor_key[0] not in incoherent_account_keys
-        }
-        _remove_stale_entities(hass, entry, stale_sensor_keys)
-        created_sensors.difference_update(stale_sensor_keys)
+        # ``created_sensors`` does not. Reconcile every conditional key so
+        # stale entities are removed even on a fresh platform setup.
+        stale = (created_sensors | conditional) - desired - undecided
+        _remove_stale_entities(hass, entry, stale)
+        created_sensors.difference_update(stale)
 
     _update_entities()
     entry.async_on_unload(coordinator.async_add_listener(_update_entities))
+
+
+def _conditions(
+    data: MeridianSyncData | None, account: MeridianAccount, key: str
+) -> dict[str, bool | None] | None:
+    """
+    Return whether an account meets each sensor condition, None if unknown.
+
+    Before the first sync, the feed-in register comes from the cached
+    accounts, and the plan is unknown. None when the sync's results lack
+    the account.
+    """
+    if data is None:
+        return {_FEED_IN: _account_has_feed_in(account), _PRICES: None}
+    result = _account_result(data, key)
+    if result is None:
+        return None
+    return {_FEED_IN: result.has_feed_in, _PRICES: result.price_sensors}
 
 
 @callback
@@ -224,16 +316,24 @@ def _remove_stale_entities(
     stale_sensor_keys: set[tuple[str, str]],
 ) -> None:
     """Remove account entities that no longer apply to current topology."""
+    for sensor_key in stale_sensor_keys:
+        if (entity_id := _entity_id(hass, entry, sensor_key)) is not None:
+            er.async_get(hass).async_remove(entity_id)
+
+
+def _entity_id(
+    hass: HomeAssistant, entry: MeridianConfigEntry, sensor_key: tuple[str, str]
+) -> str | None:
+    """Return the entity ID of an account's sensor registered for the entry."""
     entity_registry = er.async_get(hass)
-    for account_key_value, sensor_key in stale_sensor_keys:
-        entity_id = entity_registry.async_get_entity_id(
-            "sensor", DOMAIN, f"{account_key_value}_{sensor_key}"
-        )
-        if entity_id is None:
-            continue
-        entity_entry = entity_registry.async_get(entity_id)
-        if entity_entry is not None and entity_entry.config_entry_id == entry.entry_id:
-            entity_registry.async_remove(entity_id)
+    account_key_value, key = sensor_key
+    entity_id = entity_registry.async_get_entity_id(
+        "sensor", DOMAIN, f"{account_key_value}_{key}"
+    )
+    entity_entry = None if entity_id is None else entity_registry.async_get(entity_id)
+    if entity_entry is None or entity_entry.config_entry_id != entry.entry_id:
+        return None
+    return entity_id
 
 
 @callback
@@ -275,41 +375,31 @@ class MeridianAccountSensor(CoordinatorEntity[MeridianDataCoordinator], SensorEn
     def __init__(
         self,
         coordinator: MeridianDataCoordinator,
-        account: MeridianAccount,
         key: str,
         description: MeridianSensorDescription,
-        *,
-        disambiguate: bool,
     ) -> None:
         super().__init__(coordinator)
         self.entity_description = description
         self._description = description
         self._account_key = key
         self._attr_unique_id = f"{key}_{description.key}"
-        device_name = NAME
-        if disambiguate:
-            if len(account.properties) == 1:
-                suffix = _one_line_address(account.properties[0].address)
-            elif account.properties:
-                suffix = f"{len(account.properties)} properties"
-            else:
-                suffix = "Account"
-            device_name = f"{NAME} — {suffix}"
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, key)},
             entry_type=DeviceEntryType.SERVICE,
             manufacturer="Meridian Energy",
             model="MyMeridian",
-            name=device_name,
+            name=NAME,
             configuration_url="https://app.meridianenergy.nz/",
         )
 
     @property
     def native_value(self) -> NativeValue:
         """Return this account's current value."""
-        if self.coordinator.data is None:
+        data = self.coordinator.data
+        result = _account_result(data, self._account_key)
+        if result is None:
             return None
-        return self._description.value_fn(self.coordinator.data, self._account_key)
+        return self._description.value_fn(data, result)
 
     @property
     def available(self) -> bool:
@@ -322,28 +412,14 @@ class MeridianAccountSensor(CoordinatorEntity[MeridianDataCoordinator], SensorEn
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
         """Expose useful, non-sensitive context for diagnostics and billing."""
-        if self.coordinator.data is None:
+        result = _account_result(self.coordinator.data, self._account_key)
+        if result is None:
             return None
-        key = self.entity_description.key
-        if key == "estimated_readings":
+        if self.entity_description.key == "estimated_readings":
             return self._provisional_attributes()
-        if key in {
-            "current_bill_usage",
-            "current_bill_cost",
-            "current_bill_export",
-            "current_bill_credit",
-        }:
-            result = _account_result(self.coordinator.data, self._account_key)
-            if result is None:
-                return None
-            period = result.billing_period
-            return {
-                "billing_period_start": period.start if period else None,
-                "billing_period_end": period.end if period else None,
-                "next_billing_date": period.next_billing_date if period else None,
-                "data_complete": _billing_data_complete(result, key),
-            }
-        return None
+        if self._description.attrs_fn is None:
+            return None
+        return self._description.attrs_fn(result)
 
     def _provisional_attributes(self) -> dict[str, Any]:
         data = self.coordinator.data
@@ -392,46 +468,3 @@ def _account_has_feed_in(account: MeridianAccount) -> bool:
         for property_data in account.properties
         for meter in property_data.meter_points
     )
-
-
-def _billing_total(data: MeridianSyncData, key: str, metric: str) -> Decimal | None:
-    """Return one current-bill metric when the account result is coherent."""
-    result = _account_result(data, key)
-    if result is None:
-        return None
-    if metric == "usage":
-        return result.current_bill_usage
-    if metric == "cost":
-        return result.current_bill_cost
-    if metric == "export":
-        return result.current_bill_export
-    if metric == "credit":
-        return result.current_bill_credit
-    raise ValueError("Unsupported billing metric")
-
-
-def _billing_value(data: MeridianSyncData, key: str, field: str) -> date | None:
-    """Return one date from an account's current billing metadata."""
-    result = _account_result(data, key)
-    if result is None:
-        return None
-    period = result.billing_period
-    return getattr(period, field) if period is not None else None
-
-
-def _billing_data_complete(result: AccountSyncResult, sensor_key: str) -> bool:
-    """Return the completeness flag belonging to one bill-to-date sensor."""
-    if sensor_key == "current_bill_usage":
-        return result.usage_complete
-    if sensor_key == "current_bill_cost":
-        return result.cost_complete
-    if sensor_key == "current_bill_export":
-        return result.export_complete
-    if sensor_key == "current_bill_credit":
-        return result.credit_complete
-    raise ValueError("Unsupported billing sensor")
-
-
-def _one_line_address(value: str) -> str:
-    """Normalize an address for compact local-only display."""
-    return " ".join(value.split())

@@ -565,6 +565,17 @@ def test_a_syncs_windows_are_read_from_the_journal(tmp_path: Path) -> None:
             # A page after the first is the same window.
             standin.journal({**record, "continuation": True})
     standin.journal({"at": now.isoformat(), "operation": "GetAccounts"})
+    # The bill's day totals are not a window.
+    standin.journal(
+        {
+            "at": now.isoformat(),
+            "operation": "measurements",
+            "direction": meridian_standin.CONSUMPTION,
+            "start_on": "2026-07-01",
+            "end_on": "2026-07-31",
+            "frequency": "DAY_INTERVAL",
+        }
+    )
     assert journey.windows(since) == journeys.newest_windows(today, 3)
     journey.check_windows("the reload", since, 3)
     journey.check_windows("the reload", since, 3, meridian_standin.GENERATION)
@@ -604,6 +615,95 @@ def test_the_repair_notice_is_read_as_repairs_shows_it(tmp_path: Path) -> None:
     assert journey.notice("E1") == ("Not updating", "No answer\n\nGoes away.")
     assert journey.notice("E1") == ("Not updating", "No answer\n\nGoes away.")
     assert client.translated == [("meridian_energy", "issues")]
+
+
+def test_every_figure_must_have_a_sensor_with_a_value(tmp_path: Path) -> None:
+    client = _Client()
+    journey = _journey(tmp_path, client)
+    client.registry = [
+        {"entity_id": f"sensor.{key}", "config_entry_id": "E1", "translation_key": key}
+        for key in ("bill_usage", "bill_cost", "total_due")
+    ] + [
+        {
+            "entity_id": "sensor.billing_period_end",
+            "config_entry_id": "E1",
+            "translation_key": "billing_period_end",
+            "disabled_by": "integration",
+        },
+        {"entity_id": "sensor.other", "config_entry_id": "E2", "translation_key": "x"},
+    ]
+    client.answers = {
+        "/api/states/sensor.bill_usage": {"state": "12.5"},
+        "/api/states/sensor.bill_cost": {"state": "unknown"},
+        "/api/states/sensor.total_due": {"state": "40"},
+    }
+
+    assert journey.sensor_states("E1") == {
+        "bill_usage": "12.5",
+        "bill_cost": "unknown",
+        "total_due": "40",
+    }
+    journey.check_figures("E1", ("bill_usage", "total_due"))
+    journey.check_figures("E1", ("total_due", "bill_cost", "bill_export"))
+
+    passed, failed = journey.result.checks
+    assert passed.ok
+    assert (
+        passed.name == "every figure from Meridian has a value: bill usage, total due"
+    )
+    assert not failed.ok
+    assert failed.detail == "missing: bill_export; unknown: bill_cost"
+    assert set(journeys.FIGURES) == {
+        "bill_usage",
+        "bill_cost",
+        "bill_export",
+        "bill_credit",
+        "bill_estimate",
+        "total_due",
+        "last_bill",
+        "last_payment",
+        "daily_charge",
+        "anytime_price",
+    }
+
+
+def test_a_sensor_is_found_by_its_key_and_unknown_ones_are_checked(
+    tmp_path: Path,
+) -> None:
+    client = _Client()
+    journey = _journey(tmp_path, client)
+    client.registry = [
+        {"entity_id": f"sensor.{key}", "config_entry_id": "E1", "translation_key": key}
+        for key in ("bill_usage", "bill_cost", "total_due")
+    ] + [
+        {
+            "entity_id": "sensor.other_total_due",
+            "config_entry_id": "E2",
+            "translation_key": "total_due",
+        },
+    ]
+    due = {"state": "0", "attributes": {"credit": 12.5}}
+    client.answers = {
+        "/api/states/sensor.bill_usage": {"state": "unknown"},
+        "/api/states/sensor.bill_cost": {"state": "12.5"},
+        "/api/states/sensor.total_due": due,
+    }
+
+    assert journey.sensor("E1", "total_due") == due
+    assert journey.sensor("E1", "daily_charge") is None
+    journey.check_unknown("the first sync", "E1", ("bill_usage",))
+    journey.check_unknown("the first sync", "E1", ("bill_usage", "bill_cost"))
+
+    unknown, known = journey.result.checks
+    assert unknown.ok
+    assert unknown.name == "the first sync: bill usage show unknown"
+    assert not known.ok
+    assert known.detail == "bill_cost 12.5, bill_usage unknown"
+    assert journeys.CREDIT == 12.5
+    assert set(journeys.FIGURES) - set(journeys.FIGURES_WITHOUT_FEED_IN) == {
+        "bill_export",
+        "bill_credit",
+    }
 
 
 def test_each_unit_must_have_its_history_complete(tmp_path: Path) -> None:
@@ -771,7 +871,9 @@ def test_the_lines_above_debug_must_be_those_expected(tmp_path: Path) -> None:
     with log.open("a") as out:
         out.write(_log_line("DEBUG", _OWN, "another request"))
     journey.check_log("the restart", quiet)
-    unread, both, reordered, loud, calm = journey.result.checks
+    # Each log check also checks Home Assistant's watched loggers.
+    unread, both, reordered, loud, calm = journey.result.checks[::2]
+    assert all(check.ok for check in journey.result.checks[1::2])
     assert not unread.ok
     assert unread.detail == "no line from it in home-assistant.log"
     assert both.ok
@@ -785,6 +887,57 @@ def test_the_lines_above_debug_must_be_those_expected(tmp_path: Path) -> None:
     assert loud.detail == 'ERROR "Error fetching"; INFO "recovered"'
     assert calm.ok
     assert calm.detail == "nothing above debug level"
+
+
+def test_a_warning_about_a_state_fails_the_log_check(tmp_path: Path) -> None:
+    """The recorder, websocket API and sensor platform are watched; others not."""
+    journey = _journey(tmp_path, _Client(state=tmp_path))
+    log = tmp_path / "config" / journeys.LOG_FILE
+    log.parent.mkdir()
+    log.write_text(_log_line("DEBUG", _OWN, "a request"))
+    mark = journey.log_mark()
+    with log.open("a") as out:
+        out.write(_log_line("DEBUG", _OWN, "another request"))
+        out.write(_log_line("WARNING", "homeassistant.loader", "a custom integration"))
+        out.write(_log_line("INFO", "homeassistant.components.recorder.core", "fine"))
+    journey.check_log("quiet", mark)
+    journey.check_warnings("quiet", mark, every_logger=True)
+    for name in (
+        "homeassistant.components.recorder.core",
+        "homeassistant.components.websocket_api.http.connection",
+        "homeassistant.components.sensor",
+    ):
+        with log.open("a") as out:
+            out.write(_log_line("WARNING", name, "State attributes can't be JSON"))
+        journey.check_log("loud", mark)
+    journey.check_warnings("loud", mark, every_logger=True)
+    checks = journey.result.checks
+    assert [check.ok for check in checks] == [
+        True,
+        True,
+        False,
+        True,
+        False,
+        True,
+        False,
+        True,
+        False,
+        False,
+    ]
+    watched, every = checks[1], checks[2]
+    assert watched.name == (
+        "quiet: Home Assistant's recorder, websocket API and sensor logged no warning"
+    )
+    assert every.name == "quiet: nothing logged a warning"
+    assert every.detail == "WARNING [homeassistant.loader] a custom integration"
+    assert checks[-2].detail == "; ".join(
+        f"WARNING [{name}] State attributes can't be JSON"
+        for name in (
+            "homeassistant.components.recorder.core",
+            "homeassistant.components.websocket_api.http.connection",
+            "homeassistant.components.sensor",
+        )
+    )
 
 
 def test_refused_requests_and_fake_errors_fail_the_check(tmp_path: Path) -> None:

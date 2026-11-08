@@ -16,7 +16,7 @@ import logging
 import re
 from collections.abc import Iterator
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import patch
 
@@ -75,6 +75,8 @@ _PRIVATE = (
     ID_TOKEN,
     *ID_TOKEN.split("."),
     "synthetic-user-0123",
+    "Synthetic Plan",
+    "/day",
     "<html",
     # Any URL, and the key the session requests carry in theirs.
     "://",
@@ -92,6 +94,9 @@ def auto_enable_custom_integrations(
 @pytest.fixture
 def meridian() -> Iterator[FakeMeridianSession]:
     session = FakeMeridianSession(_NOW)
+    # A billing period, so the bill's day totals are asked for too.
+    today = (_NOW + timedelta(hours=12)).date()
+    session.billing_period = (today - timedelta(days=10), today + timedelta(days=20))
     with (
         patch.object(
             config_flow_module, "async_get_clientsession", return_value=session
@@ -179,21 +184,38 @@ def _assert_private(
         assert not runs, checked
 
 
-def _assert_request_lines(records: list[logging.LogRecord]) -> None:
-    """Fail unless each measurements request logged its line, by day offsets."""
+def _assert_request_lines(records: list[logging.LogRecord], *, synced: bool) -> None:
+    """
+    Fail unless each request logged its line, a window only by day offsets.
+
+    A sync that succeeded also asked for the bill's day totals, the balance
+    and the prices.
+    """
     lines = [
         record.getMessage()
         for record in records
-        if record.getMessage().startswith("Meridian request: operation=measurements")
+        if record.getMessage().startswith("Meridian request: operation=")
     ]
-    assert lines
-    for line in lines:
+    measurements = [line for line in lines if "operation=measurements" in line]
+    assert measurements
+    for line in measurements:
         assert re.fullmatch(
-            r"Meridian request: operation=measurements grid_import window="
-            r"-?\d+\.\.-?\d+d page=\d status=(\d+|-) content=\w+ "
-            r"(bytes=\d+|error=\w+) elapsed=\d+\.\ds",
+            r"Meridian request: operation=measurements grid_import "
+            r"(window=-?\d+\.\.-?\d+d|bill_days) page=\d status=(\d+|-) "
+            r"content=\w+ (bytes=\d+|error=\w+) elapsed=\d+\.\ds",
             line,
         ), line
+    if synced:
+        assert any("bill_days" in line for line in measurements)
+        for operation in ("balance", "prices"):
+            assert any(
+                re.fullmatch(
+                    rf"Meridian request: operation={operation} status=200 "
+                    r"content=\w+ bytes=\d+ elapsed=\d+\.\ds",
+                    line,
+                )
+                for line in lines
+            ), operation
 
 
 def _root_name(err: BaseException) -> str:
@@ -254,7 +276,7 @@ async def test_setup_and_first_sync_logs_carry_no_private_values(
     assert coordinator.last_update_success is scenario.synced
     if not scenario.synced:
         _assert_failed_privately(failure, scenario)
-    _assert_request_lines(_integration_records(caplog))
+    _assert_request_lines(_integration_records(caplog), synced=scenario.synced)
     _assert_private(_integration_records(caplog), meridian)
 
 

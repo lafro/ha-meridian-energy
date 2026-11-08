@@ -28,6 +28,12 @@ codes, for any window starting on a date or only for one longer than a day
 (``week_codes``), and past hours still estimated (``estimated``). Every
 value is synthetic.
 
+A ``DAY_INTERVAL`` request gets a row for each channel and New Zealand date
+from ``startOn`` to ``endOn`` (none before the history starts), with the
+date's hours summed: dates to come included, as estimates, as Meridian
+answers a billing period. A date is actual once it has ended and none of
+its hours is an estimate.
+
 The fake answers at two levels: ``graphql`` returns the HTTP body for the
 integration's real client (see ``meridian_http.FakeMeridianSession``), and
 ``async_get_measurements`` stands in for the client itself, parsing the same
@@ -39,6 +45,7 @@ from __future__ import annotations
 import base64
 from collections.abc import Callable, Iterable
 from datetime import UTC, date, datetime, time, timedelta
+from decimal import Decimal
 from typing import Any
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
@@ -226,6 +233,38 @@ class FakeKraken:
             return start_on < self.history_start.astimezone(NZ).date()
         return local_midnight(end_on + timedelta(days=1)) <= self.history_start
 
+    def day_rows(self, start_on: date, end_on: date) -> list[tuple[date, int]]:
+        """Return the rows a request for a window's dates gets, one per date."""
+        first = max(start_on, self.history_start.astimezone(NZ).date())
+        return [
+            (first + timedelta(days=offset), channel)
+            for offset in range((end_on - first).days + 1)
+            for channel in range(self.channels)
+        ]
+
+    def day_node(self, day: date, channel: int, direction: str) -> dict[str, Any]:
+        """Return one date's node: its hours summed, as Kraken sends it."""
+        start, end = local_midnight(day), local_midnight(day + timedelta(days=1))
+        hours = [start + HOUR * offset for offset in range(round((end - start) / HOUR))]
+        costs = [self.cost(hour, channel) for hour in hours]
+        node = self.node(start, channel, direction)
+        filters = node["metaData"]["utilityFilters"]
+        filters["readingFrequencyType"] = "DAY_INTERVAL"
+        filters["readingQuality"] = (
+            "ACTUAL"
+            if end <= local_midnight(self.now.astimezone(NZ).date())
+            and not self.estimated.intersection(hours)
+            else "ESTIMATE"
+        )
+        node["metaData"]["statistics"][0]["costInclTax"] = (
+            None
+            if None in costs
+            else {"estimatedAmount": str(sum(Decimal(str(cost)) for cost in costs))}
+        )
+        node["value"] = str(sum(Decimal(self.value(hour, channel)) for hour in hours))
+        node["readAt"] = node["endAt"] = end.astimezone(NZ).isoformat()
+        return node
+
     def node(self, start: datetime, channel: int, direction: str) -> dict[str, Any]:
         """Return one measurement node, as Kraken sends it."""
         end = start + HOUR
@@ -297,6 +336,7 @@ class FakeKraken:
         start_on = date.fromisoformat(variables["startOn"])
         end_on = date.fromisoformat(variables["endOn"])
         self.sent_dates.update({variables["startOn"], variables["endOn"]})
+        days = variables.get("readingFrequencyType") == "DAY_INTERVAL"
         self.requests.append(
             {
                 name: variables[name]
@@ -304,6 +344,7 @@ class FakeKraken:
                 if variables.get(name) is not None
             }
             | {"direction": variables.get("readingDirectionType")}
+            | ({"frequency": "DAY_INTERVAL"} if days else {})
         )
         code = self.codes.get(start_on)
         if code is None and end_on > start_on:
@@ -314,7 +355,12 @@ class FakeKraken:
         if self.refuses(start_on, end_on):
             self.materialized.append(0)
             return _errors(str(self.pre_supply_error))
-        rows = self.window_rows(start_on, end_on)
+        rows: list[tuple[Any, int]] = (
+            list(self.day_rows(start_on, end_on))
+            if days
+            else self.window_rows(start_on, end_on)
+        )
+        make_node = self.day_node if days else self.node
         self.materialized.append(len(rows))
         end = len(rows)
         before = variables.get("before")
@@ -326,7 +372,7 @@ class FakeKraken:
         edges = [
             {
                 "cursor": cursor(offset),
-                "node": self.node(
+                "node": make_node(
                     *rows[offset], str(variables["readingDirectionType"])
                 ),
             }
