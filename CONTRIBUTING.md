@@ -45,7 +45,7 @@ uv run python scripts/journeys.py --only reauth restart  # some of them
 uv run python scripts/journeys.py --clean-up             # delete a left-over instance
 ```
 
-A run builds a disposable Home Assistant as the live test does, in its own folder (`journeys-meridian_energy`) on port 8125; `--clean-up` deletes one a killed run left behind. The stand-in (`tests/meridian_standin.py`) answers Meridian requests with synthetic data and refuses every other aiohttp request, TCP connection and name lookup from Home Assistant that would leave the computer; building the instance still downloads Home Assistant from PyPI.
+A run builds a disposable Home Assistant as the live test does, in its own folder (`journeys-meridian_energy`) on port 8125. The stand-in (`tests/meridian_standin.py`) answers Meridian requests with synthetic data and refuses every other aiohttp request, TCP connection and forward name lookup from Home Assistant that would leave the computer, but not UDP or other programs; building the instance and its first start download from PyPI.
 
 | Journey | What it does |
 | --- | --- |

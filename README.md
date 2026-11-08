@@ -28,7 +28,7 @@ Setup finishes once the code is accepted. Meridian Energy then fetches your last
 
 Updates appear under **Settings → Updates**: install one there, then restart Home Assistant when asked.
 
-Beta versions are GitHub pre-releases, offered only if you opt in: in the Marketplace, **Meridian Energy → ⋮ → Include pre-releases**; in HACS on 2026.10, enable and turn on the **Pre-release** switch on Meridian Energy's device under **Settings → Devices & services → HACS**.
+Beta versions are GitHub pre-releases, offered only if you opt in: in the Marketplace, **Meridian Energy → ⋮ → Include pre-releases** (before **Install**, to start on a beta); in HACS on 2026.10, enable and turn on the **Pre-release** switch on Meridian Energy's device under **Settings → Devices & services → HACS**.
 
 If an entry says it was set up by an earlier version, remove it and add Meridian Energy again, ideally with a [clean start](#starting-again).
 
@@ -88,17 +88,17 @@ actions:
 
 - Meridian Energy asks Meridian for new data every hour.
 - Meridian's readings usually arrive 2–3 days late, as estimates until then, and gaps usually fill in within a week or two. Each update asks again for the last three days, and once a day (and after each restart or reload) for the last three weeks, so readings replace the estimates.
-- The statistics go back 90 days. Hours missing in that time, as after an outage, are filled in by the next updates.
-- The **so far** sensors count actual readings only, as Meridian's app does, so they can read lower than the Energy dashboard, which shows estimates too.
+- Hours missing in the last 90 days, as after an outage, are filled in by the next updates; earlier history stays.
+- The **so far** sensors count actual readings only, so they can read lower than the Energy dashboard, which shows estimates too.
 - Each hour's cost includes its share of the daily charge, which Meridian spreads over the day.
-- The billing period follows Meridian's billing cycle, as its app does, so its dates can differ by a day or two from those printed on your bill.
+- The billing period follows Meridian's billing cycle, so its dates can differ by a day or two from those printed on your bill.
 - Some hours have no figure at Meridian, such as cost from before your account moved to Meridian's current system. Meridian Energy asks for them once more after each restart or reload.
 - If Meridian refuses a request for older dates, Meridian Energy stops filling in older history until Home Assistant restarts.
 - An **Adjust sum** (in **Settings → Tools → Statistics**) made in about the last five weeks, or anywhere in history still being filled in, is replaced by Meridian's figures at a later update.
 
 ## Troubleshooting
 
-- **Reconnect requested:** Meridian ended the sign-in. Open the request under **Settings → Devices & services**, select **Submit**, and enter the new code Meridian emails you.
+- **Reconnect requested:** Meridian ended the sign-in. Under **Settings → Devices & services**, select **Reconfigure**, then **Submit**, and enter the new code Meridian emails you.
 - **"Meridian Energy isn't updating":** this repair notice appears after three failed updates in a row, or at once when Meridian stops listing any active or dormant account for the login. It gives the reason, for example:
 
   > Couldn't get an answer from Meridian (HTTP 504). Meridian Energy tries again automatically.
@@ -106,14 +106,14 @@ actions:
   > This notice goes away by itself once an update works.
 
   An ended sign-in asks you to reconnect instead.
-- **Asked to wait:** at setup, try again later; after that, Meridian Energy waits as asked, then carries on by itself.
-- **A warning that Meridian Energy couldn't update grid import or export:** that part failed while the rest kept updating; the next update tries it again.
-- **An answer Meridian Energy can't read:** it tries again by itself; if this keeps happening, check for an update to Meridian Energy.
+- **Asked to wait:** at setup, try again later; afterwards, Meridian Energy waits as asked, then carries on.
+- **A warning that Meridian Energy couldn't update grid import or export:** the rest kept updating, so the update still counts as working; the next update tries that part again.
+- **An answer Meridian Energy can't read:** it tries again; if this keeps happening, check for an update to Meridian Energy.
 - **Reporting a problem:** in the integration's ⋮ menu, select **Enable debug logging**, reproduce the problem, then **Disable debug logging** to download the log. Download diagnostics from the same menu. Both leave out your email, account and meter numbers, address, tokens, usage and amounts, but check them before sharing.
 
 ### Starting again
 
-For a clean start, delete **Meridian Energy** under **Settings → Devices & services**, delete its statistics in **Settings → Tools → Statistics** (select them, then **Delete selected statistics**), and add it again. The statistics keep their IDs, so the Energy dashboard needs no change.
+For a clean start, delete **Meridian Energy** under **Settings → Devices & services** (choose **Keep** if asked), delete its statistics in **Settings → Tools → Statistics** (select them, then **Delete selected statistics**), and add it again. The statistics keep their IDs, so the Energy dashboard needs no change.
 
 ## Removal
 

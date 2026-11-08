@@ -8,17 +8,18 @@
 
 ## Cutting a release (maintainer)
 
-1. Run the [journeys](../CONTRIBUTING.md#journeys) on the pull request's branch, for a beta and a stable release alike; every journey must pass.
+1. Run the [journeys](../CONTRIBUTING.md#journeys) on the pull request's branch; every journey must pass.
 2. Merge the pull request that bumps the version and adds the CHANGELOG section. `main` is squash-only and requires `python`, `hassfest`, `hacs`, `dependency-review`, `Analyze Python`, `secrets` and `private-terms`.
 3. Run the **Release** workflow from `main` with the tag `vX.Y.Z` (or `vX.Y.ZbN` for a beta). After the gates pass, publishing waits in the `release` environment for the maintainer's approval (the run's **Review deployments** button).
 4. The workflow re-runs every gate without a cache, checks the tag against the version and the CHANGELOG, tags the commit it tested, and publishes the release, with the version's CHANGELOG section as its notes.
+5. Install the published release and confirm it loads and completes a sync.
 
 Tags and releases are immutable by repository ruleset. A tag is never created, moved or deleted by hand; if the workflow fails after creating the tag, re-run it on the same commit.
 
 ## Beta pre-releases (maintainer)
 
 1. In the pull request, set the version to `X.Y.ZbN` in `manifest.json` and `pyproject.toml`, and run `uv lock`. The CHANGELOG keeps the `## X.Y.Z` section of the release it previews; `check_versions.py` reads a beta's notes from it.
-2. Merge, then run the **Release** workflow with `vX.Y.ZbN`. It publishes a GitHub pre-release, not marked latest, offered only to installations that opted in to pre-releases (see the README).
+2. Merge, then run the **Release** workflow with `vX.Y.ZbN`. It publishes a GitHub pre-release, not marked latest, offered only to installations that opted in to pre-releases.
 3. A beta that changes sign-in, setup or the first import is also tried as a new installation, with the [live test](../CONTRIBUTING.md#live-test) (`--ref vX.Y.ZbN`).
 4. Once the beta is verified on a real installation, a pull request sets the version to `X.Y.Z` with no code change, and the stable release follows. A defect found in the beta is fixed in the pull request for `X.Y.ZbN+1`.
 
