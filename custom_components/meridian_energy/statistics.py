@@ -11,6 +11,9 @@ the span, and the others keep their steps: an "Adjust sum" a user made
 after that first row is kept, and one made at it is undone. Its writes are
 confirmed before it returns, and the next replay of statistics whose writes
 were not confirmed waits until the recorder has saved them before it reads.
+
+``async_write_hours`` is a simpler write with no shift, lock or read-back.
+Nothing calls it yet.
 """
 
 from __future__ import annotations
@@ -414,6 +417,128 @@ class _Row:
     start: datetime
     state: float | None
     sum: float | None
+
+
+async def async_write_hours(
+    hass: HomeAssistant,
+    statistics: Iterable[tuple[StatisticMetaData, Mapping[datetime, Decimal]]],
+) -> bool:
+    """
+    Bring external statistics in line with the hourly states given for them.
+
+    Each statistic comes with its hours' states, keyed by UTC hour start.
+    One barrier first waits up to 30 s for the recorder's earlier work, so
+    the reads normally include the writes queued before. On MySQL or
+    MariaDB an import that met a lock error queues itself again behind that
+    barrier and can be saved after the reads; the seam it leaves heals at
+    the next write whose read covers that hour. On a timeout nothing is
+    read or written, and this returns False. True means the rows were
+    queued, not that they were saved. Then, for each statistic:
+
+    1. read its stored rows from 14 days before its earliest hour on;
+    2. start the span at the earlier of its first hour not stored as given
+       and the first row read whose sum does not step from the row before
+       by its own state, a seam; with neither, leave it as it is;
+    3. end the span at the later of its newest hour and the newest stored;
+    4. continue the sums from the newest stored row with a sum before the
+       span, searching back with no limit; with none, from zero;
+    5. give each hour of the span its given state, else its stored one.
+
+    The rows are queued with no await between them, one call (one recorder
+    transaction) per statistic. A dropped write heals at a later one, which
+    finds the stored rows differ. An "Adjust sum" in the span, or anywhere
+    in the rows read (where it is a seam), is overwritten.
+
+    Each statistic is given at most once per call; a caller merges a
+    unit's hours into one mapping. Callers must not write one statistic
+    from two calls at once: each reads the stored rows before the other's
+    are saved, and the later one leaves a seam that only a later write
+    whose read covers it heals. The coordinator's refresh lock serialises
+    its writes.
+    """
+    given = [(metadata, hours) for metadata, hours in statistics if hours]
+    ids = [metadata["statistic_id"] for metadata, _hours in given]
+    if len(set(ids)) != len(ids):
+        raise ValueError("Each statistic may be given once per call")
+    if not given:
+        return True
+    if not await _async_run_removal(hass, []):
+        _LOGGER.debug(
+            "The recorder stayed busy for %s s, so these hours were not written; "
+            "a later update writes them",
+            CLEAR_STATISTICS_TIMEOUT_SECONDS,
+        )
+        return False
+    planned = [
+        (metadata, await _async_rows_to_write(hass, metadata["statistic_id"], hours))
+        for metadata, hours in given
+    ]
+    # From here until every write is queued, nothing is awaited.
+    for metadata, rows in planned:
+        if rows:
+            _LOGGER.debug(
+                "Writing %d hours of %s statistics from %s",
+                len(rows),
+                _statistic_kind(metadata["statistic_id"]),
+                rows[0]["start"],
+            )
+            async_add_external_statistics(hass, metadata, rows)
+    return True
+
+
+async def _async_rows_to_write(
+    hass: HomeAssistant, statistic_id: str, hours: Mapping[datetime, Decimal]
+) -> list[StatisticData]:
+    """Return the rows that bring one statistic in line with its hours."""
+    read_from = min(hours) - _NEAR_LOOKBACK
+    stored = (await _async_read_rows(hass, {statistic_id}, read_from, None))[
+        statistic_id
+    ]
+    start = _span_start(hours, stored)
+    if start is None:
+        return []
+    predecessor = _newest_sum_before(stored, start)
+    if predecessor is None:
+        older = await _async_read_rows(hass, {statistic_id}, _EPOCH, read_from)
+        predecessor = _newest_sum_before(older[statistic_id], start)
+    states = {row.start: _decimal(row.state) for row in stored if row.start >= start}
+    states.update((hour, value) for hour, value in hours.items() if hour >= start)
+    total = Decimal(0) if predecessor is None else _decimal(predecessor.sum)
+    rows: list[StatisticData] = []
+    for hour in sorted(states):
+        total += states[hour]
+        rows.append({"start": hour, "state": float(states[hour]), "sum": float(total)})
+    return rows
+
+
+def _span_start(
+    hours: Mapping[datetime, Decimal], stored: list[_Row]
+) -> datetime | None:
+    """Return the first hour not stored as given or the first seam, if any."""
+    by_start = {row.start: row for row in stored}
+    changed = (
+        hour
+        for hour in sorted(hours)
+        if (row := by_start.get(hour)) is None
+        or not _close(float(hours[hour]), row.state)
+    )
+    seams = (
+        row.start
+        for index, row in enumerate(stored)
+        if row.sum is None or (index and not _steps_to(stored[index - 1], row))
+    )
+    return min(
+        (hour for hour in (next(changed, None), next(seams, None)) if hour is not None),
+        default=None,
+    )
+
+
+def _newest_sum_before(rows: list[_Row], start: datetime) -> _Row | None:
+    """Return the newest of some rows, oldest first, with a sum before an hour."""
+    return next(
+        (row for row in reversed(rows) if row.start < start and row.sum is not None),
+        None,
+    )
 
 
 @dataclass(slots=True)
