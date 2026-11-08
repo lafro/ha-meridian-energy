@@ -39,7 +39,7 @@ from .meridian_http import (
     json_response,
     property_id,
 )
-from .syncs import DAY, HOUR, NOW, coordinator_for, refresh, sync
+from .syncs import DAY, HOUR, NOW, TODAY, coordinator_for, refresh, sync
 
 _HTML = {"Content-Type": "text/html"}
 _GATEWAY = Response(b"<html>504</html>", status=504, headers=_HTML)
@@ -83,7 +83,7 @@ def _measurements(answer: Any) -> Any:
         (
             Response(b"", error=TimeoutError()),
             "cannot_connect",
-            "no answer in time",
+            "timed out",
         ),
         (
             Response(b"", error=ClientConnectionError()),
@@ -290,6 +290,96 @@ async def test_an_empty_grid_export_never_hides_a_failing_grid_import(
     assert failure.value.translation_key == "cannot_connect"
     # A failed first sync is tried again after 10 minutes.
     assert failure.value.retry_after == 600
+
+
+@pytest.mark.parametrize(
+    ("feed_in", "cut", "answer", "key", "retry_after", "fill_failure"),
+    [
+        (True, 21, _GATEWAY, "cannot_connect", 600, "cannot_connect (HTTP 504)"),
+        (True, 21, _coded("KT-CT-1199"), "rate_limited", 3600, None),
+        (False, 56, _GATEWAY, "cannot_connect", 600, "cannot_connect (HTTP 504)"),
+    ],
+)
+async def test_a_unit_without_readings_cut_short_never_hides_a_failing_one(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+    *,
+    feed_in: bool,
+    cut: int,
+    answer: Response,
+    key: str,
+    retry_after: int,
+    fill_failure: str | None,
+) -> None:
+    """An empty grid export, or a dormant account, whose search fails part-way."""
+    caplog.set_level(logging.INFO)
+    entry = _entry(hass)
+    session = (
+        FakeMeridianSession(NOW, feed_in=(ACCOUNT_NUMBER,))
+        if feed_in
+        else FakeMeridianSession(NOW, accounts=(ACCOUNT_NUMBER, _DORMANT))
+    )
+    empty = FakeKraken(NOW, withdrawn_from=NOW - 400 * DAY)
+    cut_on = (TODAY - cut * DAY).isoformat()
+
+    def measurements(operation: str, variables: dict[str, Any]) -> Response | None:
+        if operation != "measurements":
+            return None
+        if variables["propertyId"] == property_id(ACCOUNT_NUMBER) and (
+            variables["readingDirectionType"] == "CONSUMPTION"
+        ):
+            return _GATEWAY
+        if variables["endOn"] == cut_on:
+            return answer
+        return json_response(empty.graphql(variables))
+
+    session.hook = measurements
+    coordinator = coordinator_for(hass, session, config_entry=entry)
+
+    await refresh(coordinator, NOW, session)
+
+    failure = coordinator.last_exception
+    assert isinstance(failure, UpdateFailed)
+    assert (failure.translation_key, failure.retry_after) == (key, retry_after)
+    lines = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert [r.levelno for r in lines] == [logging.ERROR]
+    assert lines[0].getMessage().startswith("Error fetching Meridian Energy data: ")
+    unit = coordinator.unit_diagnostics()[1]
+    assert (unit["quiet"], unit["fill_failure"]) == (False, fill_failure)
+
+
+@pytest.mark.parametrize("all_fail_first", [False, True])
+async def test_a_unit_that_failed_then_went_quiet_shows_no_failure(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture, *, all_fail_first: bool
+) -> None:
+    caplog.set_level(logging.INFO)
+    session = FakeMeridianSession(NOW, accounts=(ACCOUNT_NUMBER, _DORMANT))
+    dormant = FakeKraken(NOW, withdrawn_from=NOW - 400 * DAY)
+    first = True
+
+    def measurements(operation: str, variables: dict[str, Any]) -> Response | None:
+        if operation != "measurements":
+            return None
+        if variables["propertyId"] == property_id(_DORMANT):
+            return _GATEWAY if first else json_response(dormant.graphql(variables))
+        return _GATEWAY if first and all_fail_first else None
+
+    session.hook = measurements
+    coordinator = coordinator_for(hass, session)
+    await refresh(coordinator, NOW, session)
+    assert [unit["last_failure"] for unit in coordinator.unit_diagnostics()] == [
+        "cannot_connect" if all_fail_first else None,
+        "cannot_connect",
+    ]
+
+    first = False
+    await refresh(coordinator, NOW + HOUR, session)
+
+    assert coordinator.last_update_success
+    unit = coordinator.unit_diagnostics()[1]
+    assert (unit["quiet"], unit["last_failure"]) == (True, None)
+    # It has not recovered, so it never says it is updating again.
+    assert not [r for r in caplog.records if "is updating" in r.getMessage()]
 
 
 async def test_no_account_raises_the_notice_at_once_and_removal_clears_it(

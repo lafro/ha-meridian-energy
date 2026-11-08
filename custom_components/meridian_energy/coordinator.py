@@ -179,14 +179,19 @@ class _Unit:
     names: tuple[str, str]
     place: str
     memory: _Memory
-    # Whether its recent dates came back in the sync in progress, or some
-    # readings did before a rate limit.
+    # Whether it has readings, fetched in the sync in progress or stored,
+    # and its recent dates came back, or readings came before a rate limit.
     imported: bool = False
+
+    @property
+    def kind(self) -> str:
+        """Return the unit's direction as logs name it, as ``grid import``."""
+        return _LABELS[self.direction]
 
     @property
     def label(self) -> str:
         """Return what logs call the unit, as ``grid import for property 2 of 3``."""
-        return f"{_LABELS[self.direction]}{self.place}"
+        return f"{self.kind}{self.place}"
 
 
 @dataclass(slots=True)
@@ -403,11 +408,13 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 if unit.imported:
                     outcome.ok.append(unit)
                 break
-            # A quiet unit counts as neither.
             if error is not None:
                 outcome.failed.append((unit, error))
-            elif not unit.memory.quiet:
+            elif unit.imported:
                 outcome.ok.append(unit)
+            else:
+                # A unit without readings, quiet or not, counts as neither.
+                unit.memory.failure = None
         self._settle(outcome)
         account_results = await self._async_account_results(accounts, now)
         if self._rate_limit is None:
@@ -434,7 +441,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         Decide whether a sync succeeded, and log what changed for its units.
 
         It succeeds when a unit with readings imported its recent dates, or
-        every unit is quiet. Then a unit that failed logs one WARNING, until
+        none failed, as when every unit is quiet: a unit without readings
+        counts as neither. Then a unit that failed logs one WARNING, until
         it works again, which logs one INFO. Otherwise it raises the rate
         limit that stopped it, or its first failure: Home Assistant logs
         that one.
@@ -503,14 +511,12 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         error: Exception | None = None
         try:
             await self._async_fetch_unit(unit, fetched, now)
-        except MeridianRateLimitError, MeridianAuthenticationError:
-            await self._async_write(unit, fetched)
-            if fetched.energy:
-                unit.imported = True
-            raise
         except (MeridianError, ValueError) as err:
             error = err
         await self._async_write(unit, fetched)
+        unit.imported = bool(fetched.energy) or (
+            unit.imported and memory.newest is not None
+        )
         today = nz_date(now)
         oldest_quality = local_midnight(today - _DAY * (DAILY_DATES - 1))
         memory.quality = {
@@ -533,6 +539,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             len(fetched.energy),
             "" if error is None else f", stopped by {type(error).__name__}",
         )
+        if isinstance(error, MeridianRateLimitError | MeridianAuthenticationError):
+            raise error
         return error
 
     async def _async_fetch_unit(
@@ -583,11 +591,12 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         """
         Fetch the dates missing from the target to the recent ones, newest first.
 
-        A date is missing when one of its hours is in neither statistic and
-        Meridian's last answer for that date did not leave it out. Dates
-        waiting after a failure are skipped. Return whether the fill searched
-        the whole way to the target without a failure; the history is
-        complete when it did and was not stopped.
+        A date is missing when one of its hours is absent from either
+        statistic and Meridian's last answer for that date did not leave it
+        out. Dates waiting after a failure are skipped, and a wait ends once
+        its date is no longer missing. Return whether the fill searched the
+        whole way to the target without a failure; the history is complete
+        when it did and was not stopped.
         """
         memory = unit.memory
         memory.complete = False
@@ -603,7 +612,9 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 local_midnight(recent_start),
             )
         except SQLAlchemyError:
-            _LOGGER.debug("Couldn't read the stored %s hours; no fill", unit.label)
+            _LOGGER.debug(
+                "Couldn't read the stored %s hours%s; no fill", unit.kind, unit.place
+            )
             return False
         energy, cost = stored[energy_id], stored[cost_id]
         _note_stored(memory, energy)
@@ -612,6 +623,15 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             for day in _dates(max(target, memory.history_start or target), recent_start)
             if _missing(memory, day, energy, cost)
         ]
+        waiting = set(missing)
+        memory.cooldowns = {
+            day: cooldown
+            for day, cooldown in memory.cooldowns.items()
+            if day in waiting
+        }
+        if not memory.cooldowns:
+            memory.fill_noted = False
+            memory.fill_failure = None
         ready = [
             day
             for day in missing
@@ -680,9 +700,10 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             return
         unit.memory.fill_stopped = True
         _LOGGER.info(
-            "Meridian Energy stopped filling in older %s history until Home "
+            "Meridian Energy stopped filling in older %s history%s until Home "
             "Assistant restarts: Meridian refused a request for older dates",
-            unit.label,
+            unit.kind,
+            unit.place,
         )
 
     async def _async_stored_before(
@@ -714,17 +735,19 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             memory.cooldowns[day] = _Cooldown(now + wait, wait, since)
         memory.fill_failure = f"{_error_key(err)} ({_error_detail(err)})"
         _LOGGER.debug(
-            "Older %s history failed (%s); asking again in %d min",
-            unit.label,
+            "Older %s history%s failed (%s); asking again in %d min",
+            unit.kind,
+            unit.place,
             _error_phrase(err),
             wait / timedelta(minutes=1),
         )
         if now - since >= _DAY and not memory.fill_noted:
             memory.fill_noted = True
             _LOGGER.info(
-                "Meridian Energy has been unable to fetch some older %s history "
+                "Meridian Energy has been unable to fetch some older %s history%s "
                 "for a day; it keeps trying",
-                unit.label,
+                unit.kind,
+                unit.place,
             )
 
     async def _async_fetch(
@@ -763,7 +786,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         """Ask for one window, resending once after a failure that may pass."""
         today = nz_date(now)
         context = (
-            f"{_LABELS[unit.direction].replace(' ', '_')} "
+            f"{unit.kind.replace(' ', '_')} "
             f"window={(window.start_on - today).days}..{(window.end_on - today).days}d"
         )
         for attempt in range(_SENDS):
@@ -810,7 +833,9 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             )
         except SQLAlchemyError:
             _LOGGER.debug(
-                "Couldn't read the stored %s statistics; none written", unit.label
+                "Couldn't read the stored %s statistics%s; none written",
+                unit.kind,
+                unit.place,
             )
             written = False
         if written:
@@ -1005,7 +1030,7 @@ def _dates(first: date, end: date) -> Iterable[date]:
 def _missing(
     memory: _Memory, day: date, energy: frozenset[datetime], cost: frozenset[datetime]
 ) -> bool:
-    """Return whether a date has an hour in neither statistic Meridian may return."""
+    """Return whether either statistic lacks an hour of a date Meridian may return."""
     no_energy = memory.unreturned_energy.get(day, frozenset())
     no_cost = memory.unreturned_cost.get(day, frozenset())
     return any(

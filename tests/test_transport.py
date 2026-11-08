@@ -341,7 +341,7 @@ async def test_timeout_before_an_answer_logs_its_class_and_elapsed_time(
 
     assert raised.value.status is None
     assert raised.value.gateway is True
-    assert raised.value.detail == "no answer in time"
+    assert raised.value.detail == "timed out"
     (record,) = _transport_records(caplog)
     assert record.getMessage() == (
         "Meridian request: operation=measurements status=- content=- "

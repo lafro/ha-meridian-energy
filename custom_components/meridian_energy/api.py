@@ -188,7 +188,7 @@ class MeridianUpstreamError(MeridianConnectionError):
     @property
     def detail(self) -> str:
         """Describe the failure without identifiers, as in ``HTTP 503``."""
-        return "no answer in time" if self.status is None else f"HTTP {self.status}"
+        return "timed out" if self.status is None else f"HTTP {self.status}"
 
 
 class MeridianRejectedError(MeridianConnectionError):
