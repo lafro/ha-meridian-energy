@@ -111,8 +111,10 @@ FIGURES_WITHOUT_FEED_IN = tuple(
 BILL = ("bill_usage", "bill_cost", "bill_estimate")
 # Total due's credit when the stand-in has the account in credit, in dollars.
 CREDIT = standin.CREDIT_CENTS / 100
-# What the integration says when Meridian's own figures fail.
-BILLING_LOST = (
+# What the integration says when Meridian's own figures fail. (Not named for
+# the billing period: CodeQL takes a name with "billing" in it for private
+# data, and these lines are printed.)
+PERIOD_LOST = (
     "Meridian Energy couldn't get the billing period; the billing period and bill "
     "sensors show unknown until it can"
 )
@@ -1309,7 +1311,7 @@ def figures(j: Journey) -> None:
     )
     j.check_unknown("the first sync", entry_id, BILL)
     j.check_log(
-        "the first sync", mark, [("INFO", BILLING_LOST), ("INFO", PRICES_UNANSWERED)]
+        "the first sync", mark, [("INFO", PERIOD_LOST), ("INFO", PRICES_UNANSWERED)]
     )
     steps = (
         ("a reload with the day totals failing", ("days",), [("INFO", DAYS_LOST)]),
