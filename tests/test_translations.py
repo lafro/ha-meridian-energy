@@ -129,11 +129,12 @@ class _ModuleKeys:
         name = _call_name(call)
         for keyword in call.keywords:
             if keyword.arg == "translation_key":
-                section = (
-                    f"entity.{self.module}"
-                    if self.module in _ENTITY_PLATFORMS and name.endswith("Description")
-                    else "exceptions"
-                )
+                if name == "async_create_issue":
+                    section = "issues"
+                elif self.module in _ENTITY_PLATFORMS and name.endswith("Description"):
+                    section = f"entity.{self.module}"
+                else:
+                    section = "exceptions"
                 self.keys[section] |= self._resolve(keyword.value)
             elif keyword.arg == "step_id" and name == "async_show_form":
                 self.keys["config.step"] |= self._resolve(keyword.value)
@@ -194,6 +195,7 @@ def _section(strings: dict[str, Any], dotted: str) -> dict[str, Any]:
         "config.error",
         "config.step",
         "exceptions",
+        "issues",
         "entity.sensor",
     ],
 )
@@ -213,6 +215,7 @@ def test_every_translation_key_the_code_uses_exists(section: str) -> None:
         "config.error",
         "config.step",
         "exceptions",
+        "issues",
         "entity.sensor",
     ],
 )

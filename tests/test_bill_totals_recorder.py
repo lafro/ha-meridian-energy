@@ -14,6 +14,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from homeassistant.core import HomeAssistant
+from pytest_homeassistant_custom_component.components.recorder.common import (
+    async_wait_recording_done,
+)
 
 from custom_components.meridian_energy.coordinator import MeridianDataCoordinator
 from custom_components.meridian_energy.models import (
@@ -25,13 +28,16 @@ from custom_components.meridian_energy.models import (
 from custom_components.meridian_energy.windows import local_midnight
 
 from .kraken_fake import FakeKraken
-from .test_lanes_recorder import DAY, HOUR, NOW, TODAY, _floor_hour, _sync
-from .test_windows_recorder import (
-    mock_recorder_before_hass,  # noqa: F401 - the recorder fixture's setup
-)
+from .syncs import DAY, HOUR, NOW, TODAY, sync
 
 _NUMBER = "A-TEST-1"
 _PROPERTIES = ("synthetic-property-1", "synthetic-property-2")
+
+
+@pytest.fixture
+def mock_recorder_before_hass(recorder_db_url: str) -> None:
+    """Prepare Recorder storage before the Home Assistant fixture starts."""
+    del recorder_db_url
 
 
 def _account() -> MeridianAccount:
@@ -51,10 +57,9 @@ def _account() -> MeridianAccount:
     )
 
 
-@pytest.mark.asyncio
 @pytest.mark.parametrize("second_exports", [True, False])
 async def test_an_export_missing_from_one_property_leaves_the_bill_export_unknown(
-    recorder_mock, hass: HomeAssistant, second_exports: bool
+    recorder_mock: Any, hass: HomeAssistant, second_exports: bool
 ) -> None:
     del recorder_mock
     kraken = FakeKraken(NOW, history_start=NOW - 400 * DAY, future_rows=False)
@@ -63,7 +68,7 @@ async def test_an_export_missing_from_one_property_leaves_the_bill_export_unknow
         NOW, history_start=NOW - 400 * DAY, withdrawn_from=NOW - 400 * DAY
     )
 
-    async def measurements(**kwargs: Any) -> Any:
+    async def window(**kwargs: Any) -> Any:
         source = kraken
         if (
             not second_exports
@@ -71,7 +76,7 @@ async def test_an_export_missing_from_one_property_leaves_the_bill_export_unknow
             and kwargs["direction"] == "GENERATION"
         ):
             source = silent
-        return await source.async_get_measurements(**kwargs)
+        return await source.async_get_window(**kwargs)
 
     start = TODAY - 10 * DAY
     client = MagicMock()
@@ -87,16 +92,17 @@ async def test_an_export_missing_from_one_property_leaves_the_bill_export_unknow
             period_start_day=start.day,
         )
     )
-    client.async_get_measurements = AsyncMock(side_effect=measurements)
+    client.async_get_window = AsyncMock(side_effect=window)
     coordinator = MeridianDataCoordinator(hass, client)
 
     for update in range(2):
         at = NOW + update * HOUR
         kraken.now = silent.now = at
-        data = await _sync(hass, coordinator, at)
+        data = await sync(coordinator, at)
+        await async_wait_recording_done(hass)
 
     (totals,) = data.account_results
-    hours = (_floor_hour(at) - local_midnight(start)) / HOUR
+    hours = (at.replace(minute=0) - local_midnight(start)) / HOUR
     # Usage counts both properties either way.
     assert totals.usage_complete is True
     assert float(totals.current_bill_usage or 0) == pytest.approx(2 * 0.5 * hours)

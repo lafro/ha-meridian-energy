@@ -196,14 +196,7 @@ def _log(
 
 
 def _status_failure(head: _Head | None, err: Exception) -> MeridianHttpError | None:
-    """
-    Return the HTTP error for an unsuccessful status whose body then failed.
-
-    The status and headers are the server's answer, whole: a gateway's 504
-    whose page was cut off is still a gateway timeout, and a 429's
-    Retry-After still applies. A successful status whose body failed has
-    no answer to give, so it stays a network error or a timeout (None).
-    """
+    """Return the HTTP error of an unsuccessful status whose body failed, or None."""
     if head is None or head.status < _HTTP_BAD_REQUEST:
         return None
     return MeridianHttpError(

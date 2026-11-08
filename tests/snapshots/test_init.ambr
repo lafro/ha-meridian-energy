@@ -536,10 +536,8 @@
   StateSnapshot({
     'attributes': ReadOnlyDict({
       <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Meridian Energy Provisional data intervals',
-      'last_sync_mode': <SyncMode.TIP: 'tip'>,
       'newest_provisional_interval': None,
       'oldest_provisional_interval': None,
-      'reconciliation_window_start': HAFakeDatetime(2026, 7, 14, 1, 0, tzinfo=datetime.timezone.utc),
       <SensorEntityCapabilityAttribute.STATE_CLASS: 'state_class'>: <SensorStateClass.MEASUREMENT: 'measurement'>,
       'upstream_quality_counts': dict({
         'ACTUAL': 24,

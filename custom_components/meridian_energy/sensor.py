@@ -370,11 +370,7 @@ class MeridianAccountSensor(CoordinatorEntity[MeridianDataCoordinator], SensorEn
                 ),
                 default=None,
             ),
-            "reconciliation_window_start": min(
-                (item.requested_since for item in results), default=None
-            ),
             "upstream_quality_counts": dict(sorted(quality_counts.items())),
-            "last_sync_mode": data.sync_mode,
         }
 
 

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, date, datetime
+from datetime import UTC, datetime
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import ConfigEntryError
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceEntry
 from homeassistant.helpers.start import async_at_started
@@ -19,8 +20,6 @@ from .const import (
     CONF_REFRESH_TOKEN,
     CONFIG_ENTRY_VERSION,
     DOMAIN,
-    UNCONFIRMED_REPLAYS,
-    UNSAVED_COVERAGE,
 )
 from .coordinator import MeridianDataCoordinator
 from .models import MeridianTokenSet
@@ -40,56 +39,12 @@ class MeridianRuntimeData:
 type MeridianConfigEntry = ConfigEntry[MeridianRuntimeData]
 
 
-def _unconfirmed_replays(
-    hass: HomeAssistant, entry: MeridianConfigEntry
-) -> dict[tuple[str, str], datetime]:
-    """
-    Return where the entry's coordinators keep their unconfirmed deep replays.
-
-    Each coordinator updates it in place (``MeridianDataCoordinator``), so
-    after a reload of the entry, including the one reauthentication makes,
-    the new one still reaches back to the oldest hour
-    such a replay wrote: it reads the newest stored hours from the recorder,
-    which usage saved without its cost has moved on. A restart of Home
-    Assistant forgets it.
-    """
-    replays: dict[str, dict[tuple[str, str], datetime]] = hass.data.setdefault(
-        DOMAIN, {}
-    ).setdefault(UNCONFIRMED_REPLAYS, {})
-    return replays.setdefault(entry.entry_id, {})
-
-
-def _unsaved_coverage(
-    hass: HomeAssistant, entry: MeridianConfigEntry
-) -> dict[tuple[str, str], dict[date, datetime]]:
-    """
-    Return where the entry's coordinators keep their lanes' unconfirmed dates.
-
-    The dates whose coverage import Home Assistant did not confirm, with
-    when each is tried again: the recorder may have saved their rows but
-    not the shift of the newer rows after them, which no stored state
-    shows, so each is replayed in full when it comes back
-    (``lanes.LaneState.unsaved``). Each coordinator updates it in place,
-    so after a reload of the entry the new one still does that. A restart
-    of Home Assistant forgets them.
-    """
-    unsaved: dict[str, dict[tuple[str, str], dict[date, datetime]]] = (
-        hass.data.setdefault(DOMAIN, {}).setdefault(UNSAVED_COVERAGE, {})
-    )
-    return unsaved.setdefault(entry.entry_id, {})
-
-
 async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> bool:
     """
     Set up Meridian Energy from a config entry.
 
-    Setup only renews the stored session and caches the accounts, every
-    active or dormant one on the login, so Home Assistant start-up does not
-    wait for the measurement sync. The first sync, which imports statistics,
-    runs as a background task once Home Assistant has started, or straight
-    away when it is already running, as right after the setup flow. It first
-    waits for the recorder to save what was queued before it, such as the
-    last import before a reload.
+    Setup only renews the session and caches the accounts; the first sync
+    runs as a background task once Home Assistant has started.
     """
 
     async def async_store_tokens(tokens: MeridianTokenSet) -> None:
@@ -118,13 +73,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> 
         tokens=tokens,
         token_update_callback=async_store_tokens,
     )
-    coordinator = MeridianDataCoordinator(
-        hass,
-        client,
-        config_entry=entry,
-        unconfirmed=_unconfirmed_replays(hass, entry),
-        unsaved=_unsaved_coverage(hass, entry),
-    )
+    coordinator = MeridianDataCoordinator(hass, client, config_entry=entry)
     await coordinator.async_prepare_topology()
     entry.runtime_data = MeridianRuntimeData(client, coordinator)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -145,14 +94,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: MeridianConfigEntry) ->
 
 
 async def async_remove_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> None:
-    """
-    Forget what a removed entry kept across its reloads.
-
-    Its unconfirmed deep replays (``_unconfirmed_replays``) and its lanes'
-    unconfirmed coverage dates (``_unsaved_coverage``).
-    """
-    for kept in (UNCONFIRMED_REPLAYS, UNSAVED_COVERAGE):
-        hass.data.get(DOMAIN, {}).get(kept, {}).pop(entry.entry_id, None)
+    """Remove a removed entry's repair notice that updates are failing."""
+    ir.async_delete_issue(hass, DOMAIN, f"sync_failing_{entry.entry_id}")
 
 
 async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -160,13 +103,8 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     Refuse entries an earlier version set up; accept a later minor version.
 
     Entries before version 4 chose their accounts and imported in the setup
-    flow; this version follows every account and imports in the background,
-    so such an entry is set up again rather than converted. The translated
-    ``ConfigEntryError`` leaves it in ``migration_error`` with a reason the
-    user can act on. A higher minor version of version 4 is accepted
-    unchanged: Home Assistant treats minor versions as backward compatible,
-    so rolling back to this release must still load an entry a later 4.x
-    release wrote. Home Assistant itself refuses a higher major version.
+    flow, so they are set up again rather than converted (``entry_too_old``).
+    A later 4.x minor version loads unchanged, so a rollback still loads it.
     """
     del hass
     if entry.version < CONFIG_ENTRY_VERSION:

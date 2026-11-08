@@ -35,74 +35,39 @@ CONNECT_TIMEOUT_SECONDS = 20
 MEASUREMENTS_TIMEOUT_SECONDS = 75
 
 UPDATE_INTERVAL = timedelta(hours=1)
-INITIAL_BACKFILL = timedelta(days=90)
-REVISION_OVERLAP = timedelta(days=14)
-TIP_WINDOW = timedelta(hours=24)
-TARGETED_RECONCILIATION_MINIMUM = timedelta(hours=48)
-TARGETED_RECONCILIATION_INTERVAL = timedelta(days=1)
-FULL_RECONCILIATION_INTERVAL = timedelta(days=7)
 TOPOLOGY_CACHE_INTERVAL = timedelta(days=1)
 BILLING_CACHE_INTERVAL = timedelta(days=1)
-RECONCILIATION_SAFETY_MARGIN = timedelta(hours=6)
-# How far before the newest stored usage hour a walk the frontier rule moves
-# back may reach for the hours whose cost Meridian published later: a cost
-# statistic that stopped for good must not make every such walk 90 days long.
-COST_LAG_MARGIN = timedelta(hours=48)
-PAGE_SIZE = 744
-MIN_PAGE_SIZE = 24
 # Every measurements request asks for one window of whole New Zealand dates,
-# both ends inclusive, at most this many days long, newest first.
+# both ends included, at most this many dates long.
 WINDOW_DAYS = 7
-# Days each window repeats of the newer one next to it. Held in reserve at 0:
-# set to 1 only if a live check shows Meridian's window edges are shifted, and
-# a repeated hour then counts once when its readings are identical.
-WINDOW_OVERLAP_DAYS = 0
-# A window may take this many pages of PAGE_SIZE rows, or as many smaller pages
-# as hold the same rows (windows.page_limit).
-MAX_WINDOW_PAGES = 16
-# Consecutive windows with no readings that mark the start of the history.
-EMPTY_WINDOWS_AT_HISTORY_START = 2
-# At least this long between the starts of two measurements requests in a
-# sync, so no sync sends more than 60 a minute.
+# A window may take this many pages; a longer one is an answer this can't read.
+MAX_WINDOW_PAGES = 8
+# The recent request set: the last 21 dates when the daily set has not
+# succeeded for a day (always so after a start), else the last 3.
+DAILY_DATES = 21
+RECENT_DATES = 3
+DAILY_INTERVAL = timedelta(days=1)
+# How far back the fill completes each unit's history, in New Zealand dates.
+HISTORY_DAYS = 90
+# The most fill windows a unit sends in one sync.
+FILL_WINDOWS = 13
+# A fill window that failed waits this long before it is asked for again,
+# doubling for each failure in a row up to the longest.
+FILL_COOLDOWN = timedelta(hours=1)
+MAX_FILL_COOLDOWN = timedelta(days=1)
+# At least this long between the starts of two measurements requests.
 MEASUREMENTS_PACING_SECONDS = 1.0
-# A new request starts only while this much of a sync's time budget remains,
-# enough for a measurements request to time out (the first always starts).
-REQUEST_START_RESERVE_SECONDS = 80
-# After a gateway timeout no measurements request goes to the same property
-# for at least this long (or for as long as the failed request took): the
-# service behind the gateway may still be working on it.
-GATEWAY_COOLDOWN_SECONDS = 75
-# The wait before one resend after another passing failure, chosen at random.
+# The wait before one resend after a passing failure, chosen at random.
 TRANSIENT_RESEND_DELAY_SECONDS = (2.0, 5.0)
-# Statuses of a service that answered with an error a resend may not meet.
-TRANSIENT_STATUSES = frozenset({408, 502, 503, 520, 521, 522, 523})
+# Statuses of a gateway or service that failed in a way a resend may not meet.
+TRANSIENT_STATUSES = frozenset({408, 502, 503, 504, 520, 521, 522, 523, 524})
 
 FIRST_SYNC_RETRY_SECONDS = 600
 # Until an entry's first sync has succeeded, a failed one is tried again after
 # these waits in turn, then hourly, as the update interval does.
 FIRST_SYNC_RETRY_SCHEDULE = (FIRST_SYNC_RETRY_SECONDS, 1800, 3600)
-# An hourly update's time budget: no measurements request after its first
-# starts once less than REQUEST_START_RESERVE_SECONDS of it remain.
-POLL_BUDGET_SECONDS = 240
-# How many 30 s waits an entry's first sync makes for the recorder to save
-# the work queued before it, such as the last import before a reload, before
-# it reads any statistics. When the recorder is still behind, the sync tries
-# again after FIRST_SYNC_RETRY_SECONDS.
-FIRST_SYNC_RECORDER_WAITS = 10
-# An hourly update that walks back further than 14 days for a direction, as
-# a first import or a catch-up after a long outage, has this budget instead:
-# it imports what it fetched all the same, but a search for the newest
-# reading of a supply that ended must finish to show it ended, or it would
-# start again at every update. Its newest windows still go first.
-DEEP_WALK_BUDGET_SECONDS = 900
-# Where each entry keeps, across its reloads, the oldest hour of each unit's
-# deep replay that was not confirmed, in hass.data[DOMAIN], keyed by the
-# entry's ID. A restart of Home Assistant forgets it.
-UNCONFIRMED_REPLAYS = "unconfirmed_replays"
-# Where each entry keeps, across its reloads, the dates of each unit's lane
-# whose coverage import was not confirmed, with when each is tried again, in
-# hass.data[DOMAIN], keyed by the entry's ID. A restart forgets them too.
-UNSAVED_COVERAGE = "unsaved_coverage"
+# Failed updates in a row before the repair notice that updates are failing.
+FAILED_UPDATES_BEFORE_ISSUE = 3
 DEFAULT_RETRY_AFTER_SECONDS = 3600
 MIN_RETRY_AFTER_SECONDS = 60
 MAX_RETRY_AFTER_SECONDS = 86400
@@ -119,7 +84,7 @@ READING_QUALITY_COMBINED = "COMBINED"
 AGGREGATE_CHANNEL_ID = "aggregate"
 
 # The cost types Meridian's own app adds up for an hour's cost, each with its
-# sign, so a credit lowers it. Only the first two have been seen on an account.
+# sign, so a credit lowers it.
 COST_STATISTIC_TYPES = frozenset(
     {
         "CONSUMPTION_COST",
