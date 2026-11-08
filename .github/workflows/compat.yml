@@ -17,7 +17,8 @@ name: Compatibility
 #   scripts/compat_pytest_plugin.py from this checkout and the repository
 #   contract tests left out (they check the pinned harness on purpose). A
 #   broken outcome is retried once. Each target uploads its result as the
-#   artifact compat-result-<target>-<channel> (schema: docs/releasing.md).
+#   artifact compat-result-<target>-<channel> (schema: the docstring of
+#   scripts/compat_results.py).
 # - report: keeps one issue labelled compat open while any target is broken
 #   and one labelled deprecation while Home Assistant reports a deprecation,
 #   comments when what they list changes, and closes them when clear. Pull
