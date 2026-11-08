@@ -490,7 +490,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 unit.memory.failure = None
         self._settle(outcome)
         failed = {
-            property_key(unit.account_number, unit.property_id)
+            (property_key(unit.account_number, unit.property_id), unit.direction)
             for unit, _err in outcome.failed
         }
         account_results = await self._async_account_results(accounts, failed, now)
@@ -1048,7 +1048,10 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         return extra
 
     async def _async_account_results(
-        self, accounts: tuple[MeridianAccount, ...], failed: set[str], now: datetime
+        self,
+        accounts: tuple[MeridianAccount, ...],
+        failed: set[UnitKey],
+        now: datetime,
     ) -> tuple[AccountSyncResult, ...]:
         """Return every account's figures, then log each kind lost or back."""
         lost: dict[str, str] = {}
@@ -1070,7 +1073,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
     async def _async_account_result(
         self,
         account: MeridianAccount,
-        failed: set[str],
+        failed: set[UnitKey],
         now: datetime,
         lost: dict[str, str],
     ) -> AccountSyncResult:
@@ -1135,7 +1138,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         self,
         account: MeridianAccount,
         period: MeridianBillingPeriod | None,
-        failed: set[str],
+        failed: set[UnitKey],
         now: datetime,
         lost: dict[str, str],
     ) -> BillFigures:
@@ -1143,8 +1146,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         Return the bill's figures, asking for its day totals when due.
 
         They need every property's, so they are not asked for while one of
-        the account's properties failed its recent dates in this sync, and
-        are asked for at once when the period changes. Once their period has
+        the account's properties failed its recent grid import dates in this
+        sync, and are asked for at once when the period changes. Once their period has
         ended they are withheld; until then the 'so far' figures are kept
         for two intervals, and the estimate throughout.
         """
@@ -1155,7 +1158,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             and period.start is not None
             and period.end is not None
             and not any(
-                property_key(number, item.id) in failed for item in account.properties
+                (property_key(number, item.id), READING_CONSUMPTION) in failed
+                for item in account.properties
             )
         ):
             known: _Bill | None = extra.value if extra is not None else None
@@ -1163,7 +1167,9 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 "days",
                 number,
                 now,
-                partial(self._async_bill_days, account, period.start, period.end),
+                partial(
+                    self._async_bill_days, account, period.start, period.end, failed
+                ),
                 due=known is not None
                 and (known.start, known.end) != (period.start, period.end)
                 and not (extra is not None and extra.failing),
@@ -1180,47 +1186,75 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         return bill.figures if kept else BillFigures(estimate=bill.figures.estimate)
 
     async def _async_bill_days(
-        self, account: MeridianAccount, start_on: date, end_on: date
+        self,
+        account: MeridianAccount,
+        start_on: date,
+        end_on: date,
+        failed: set[UnitKey],
     ) -> _Bill:
         """
         Return a bill's figures from every property's day totals.
 
         'So far' counts the actual days only; the estimate adds every day's
-        cost, future estimates included.
+        cost, future estimates included. The export and its credit are asked
+        for after the rest, and are unknown when a property's grid export
+        failed in this sync or its day totals fail.
         """
-        days: dict[str, list[Reading]] = {
-            READING_CONSUMPTION: [],
-            READING_GENERATION: [],
-        }
-        for property_data in account.properties:
-            key = property_key(account.number, property_data.id)
-            for direction, _ids in _directions(key, property_data):
-                rows = await self.client.async_get_window(
-                    account_number=account.number,
-                    property_id=property_data.id,
-                    direction=direction,
-                    start_on=start_on,
-                    end_on=end_on,
-                    last=(end_on - start_on).days + 1,
-                    frequency=READING_FREQUENCY_DAY,
-                    pace=self._async_pace,
-                    context=f"{_LABELS[direction].replace(' ', '_')} bill_days",
-                )
-                days[direction].extend(day_readings(rows, start_on, end_on).values())
-        used = [day for day in days[READING_CONSUMPTION] if day.quality == _ACTUAL]
+        number = account.number
+        days = await self._async_days(account, start_on, end_on, READING_CONSUMPTION)
+        used = [day for day in days if day.quality == _ACTUAL]
         figures = BillFigures(
             usage=sum((day.energy for day in used), Decimal(0)),
             cost=_dollars(used),
-            estimate=_dollars(days[READING_CONSUMPTION]),
+            estimate=_dollars(days),
         )
-        if _has_feed_in(account):
-            sent = [day for day in days[READING_GENERATION] if day.quality == _ACTUAL]
-            figures = replace(
-                figures,
-                export=sum((day.energy for day in sent), Decimal(0)),
-                credit=_dollars(sent),
+        if not _has_feed_in(account):
+            return _Bill(start_on, end_on, figures)
+        if any(
+            (property_key(number, item.id), READING_GENERATION) in failed
+            for item in account.properties
+        ):
+            _LOGGER.debug("Not asking for the bill's grid export: it failed")
+            return _Bill(start_on, end_on, figures)
+        try:
+            days = await self._async_days(account, start_on, end_on, READING_GENERATION)
+        except MeridianAuthenticationError, MeridianRateLimitError:
+            raise
+        except (MeridianError, ValueError) as err:
+            _LOGGER.debug(
+                "Couldn't get the bill's grid export (%s)", _error_detail(err)
             )
+            return _Bill(start_on, end_on, figures)
+        sent = [day for day in days if day.quality == _ACTUAL]
+        figures = replace(
+            figures,
+            export=sum((day.energy for day in sent), Decimal(0)),
+            credit=_dollars(sent),
+        )
         return _Bill(start_on, end_on, figures)
+
+    async def _async_days(
+        self, account: MeridianAccount, start_on: date, end_on: date, direction: str
+    ) -> list[Reading]:
+        """Return one direction's day totals from each property that has it."""
+        days: list[Reading] = []
+        for property_data in account.properties:
+            key = property_key(account.number, property_data.id)
+            if direction not in dict(_directions(key, property_data)):
+                continue
+            rows = await self.client.async_get_window(
+                account_number=account.number,
+                property_id=property_data.id,
+                direction=direction,
+                start_on=start_on,
+                end_on=end_on,
+                last=(end_on - start_on).days + 1,
+                frequency=READING_FREQUENCY_DAY,
+                pace=self._async_pace,
+                context=f"{_LABELS[direction].replace(' ', '_')} bill_days",
+            )
+            days.extend(day_readings(rows, start_on, end_on).values())
+        return days
 
     async def _async_prices(
         self, account: MeridianAccount, now: datetime, lost: dict[str, str]

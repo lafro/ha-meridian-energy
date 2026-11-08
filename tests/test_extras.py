@@ -589,7 +589,7 @@ async def test_failed_figures_never_fail_an_update_but_an_ended_sign_in_does(
     assert data.account_results[0].total_due is None
 
 
-async def test_a_property_whose_recent_dates_failed_skips_its_day_request(
+async def test_a_property_whose_grid_import_failed_skips_its_day_request(
     hass: HomeAssistant,
 ) -> None:
     """The account's bill needs every property's days: none are asked for."""
@@ -598,7 +598,7 @@ async def test_a_property_whose_recent_dates_failed_skips_its_day_request(
     session.hook = lambda operation, variables: (
         _FAILED
         if operation == "measurements"
-        and variables["readingDirectionType"] == "GENERATION"
+        and variables["readingDirectionType"] == "CONSUMPTION"
         else None
     )
     coordinator = coordinator_for(hass, session)
@@ -609,6 +609,39 @@ async def test_a_property_whose_recent_dates_failed_skips_its_day_request(
     (result,) = data.account_results
     assert result.bill == BillFigures()
     assert result.total_due == Decimal(40)
+
+
+@pytest.mark.parametrize("failing", ["hours", "days"])
+async def test_a_failing_grid_export_leaves_the_rest_of_the_bill(
+    hass: HomeAssistant, failing: str
+) -> None:
+    """Its hours failing skip its day request; its day request may fail alone."""
+    session = FakeMeridianSession(NOW, feed_in=(ACCOUNT_NUMBER,))
+    session.billing_period = _PERIOD
+    asked: list[str] = []
+
+    def answer(operation: str, variables: dict[str, Any]) -> Response | None:
+        if operation != "measurements":
+            return None
+        direction = variables["readingDirectionType"]
+        by_day = variables["readingFrequencyType"] == "DAY_INTERVAL"
+        if by_day:
+            asked.append(direction)
+        if direction == "GENERATION" and (failing == "days") == by_day:
+            return json_response({}, status=400)
+        return None
+
+    session.hook = answer
+    coordinator = coordinator_for(hass, session)
+
+    data = await sync(coordinator, NOW, session)
+
+    assert asked == (
+        ["CONSUMPTION"] if failing == "hours" else ["CONSUMPTION", "GENERATION"]
+    )
+    assert data.account_results[0].bill == BillFigures(
+        usage=Decimal(180), cost=Decimal(54), estimate=Decimal("111.6")
+    )
 
 
 def _account_with(**changes: Any) -> Response:
