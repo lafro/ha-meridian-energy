@@ -24,6 +24,7 @@ from custom_components.meridian_energy.const import (
     FIRST_SYNC_RETRY_SECONDS,
     MAX_WINDOW_PAGES,
     PAGE_SIZE,
+    READING_CONSUMPTION,
 )
 from custom_components.meridian_energy.coordinator import MeridianDataCoordinator
 from custom_components.meridian_energy.models import (
@@ -35,6 +36,7 @@ from custom_components.meridian_energy.models import (
     MeridianProperty,
     RequestContext,
 )
+from custom_components.meridian_energy.statistics import property_key
 
 from .kraken_fake import FakeKraken
 from .walks import fetch_since
@@ -281,8 +283,14 @@ async def test_an_update_fails_while_a_login_has_no_account(hass) -> None:
     """
     client = MagicMock()
     client.async_get_accounts = AsyncMock(return_value=(_account(),))
-    coordinator = MeridianDataCoordinator(hass, client)
+    unit = (property_key("A-SYNTHETIC", "property"), READING_CONSUMPTION)
+    replayed_from = datetime(2026, 1, 1, tzinfo=UTC)
+    coordinator = MeridianDataCoordinator(
+        hass, client, unconfirmed={unit: replayed_from}
+    )
     await coordinator.async_prepare_topology()
+    billing = MeridianBillingPeriod(None, None, False, None, None, None, None)
+    coordinator._billing_periods["A-SYNTHETIC"] = billing
     client.async_get_accounts.return_value = ()
 
     coordinator._topology_cached_at = None
@@ -292,6 +300,8 @@ async def test_an_update_fails_while_a_login_has_no_account(hass) -> None:
 
     assert raised.value.translation_key == "no_accounts"
     assert coordinator.accounts == (_account(),)
+    assert coordinator._unconfirmed == {unit: replayed_from}
+    assert coordinator._billing_periods == {"A-SYNTHETIC": billing}
 
 
 @pytest.mark.asyncio

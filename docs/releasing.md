@@ -8,7 +8,7 @@
 
 ## Cutting a release (maintainer)
 
-1. Run the [journeys](../CONTRIBUTING.md#journeys) on the pull request's branch, for a beta and a stable release alike; all six must pass.
+1. Run the [journeys](../CONTRIBUTING.md#journeys) on the pull request's branch, for a beta and a stable release alike; all four must pass.
 2. Merge the pull request that bumps the version and adds the CHANGELOG section. `main` is squash-only and requires `python`, `hassfest`, `hacs`, `dependency-review`, `Analyze Python`, `secrets` and `private-terms`.
 3. Run the **Release** workflow from `main` with the tag `vX.Y.Z` (or `vX.Y.ZbN` for a beta, below). After the gates pass, the publishing job waits in the `release` environment until the maintainer approves it (the run's **Review deployments** button).
 4. The workflow re-runs every gate without a dependency cache, checks the tag against the committed version and the CHANGELOG, creates the tag on the exact commit it tested, and publishes the release. The release notes are the version's CHANGELOG section, followed by GitHub's generated list of pull requests.
@@ -26,7 +26,7 @@ Tags and releases are immutable by repository ruleset. A tag is never created, m
 
 ## After release
 
-Users update through HACS and restart Home Assistant. A problem found after release is fixed forward with a new patch version. To return to earlier code, either install the previous release from HACS, or release the earlier code again as a new patch version. Config-entry minor versions stay backward compatible so either route loads existing entries (see [architecture](architecture.md#config-entries)). Running totals stay consistent either way, but a history that 0.3.0 or later is still completing stays incomplete under earlier code, which asks only for the hours after the newest one stored and for the last 14 days: let it fill in first (diagnostics show `reaches_target` for each grid import and export).
+Users update through HACS and restart Home Assistant. A problem found after release is fixed forward with a new patch version. To return to earlier code, either install the previous release from HACS, or release the earlier code again as a new patch version. Config-entry minor versions stay backward compatible so either route loads existing entries (see [architecture](architecture.md#config-entries)). Releases before 0.3.0 cannot load a version-4 entry, so going back across 0.3.0 means removing the integration and adding it again; its statistics are kept. Running totals stay consistent either way, but a history that 0.3.0 or later is still completing stays incomplete under earlier code, which asks only for the hours after the newest one stored and for the last 14 days: let it fill in first (diagnostics show `reaches_target` for each grid import and export).
 
 ## Compatibility runs
 

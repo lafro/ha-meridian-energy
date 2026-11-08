@@ -27,7 +27,14 @@ from .api import (
     MeridianRejectedError,
     http_status,
 )
-from .const import CONF_FIREBASE_USER_ID, CONF_REFRESH_TOKEN, DOMAIN, NAME
+from .const import (
+    CONF_FIREBASE_USER_ID,
+    CONF_REFRESH_TOKEN,
+    CONFIG_ENTRY_VERSION,
+    DOMAIN,
+    NAME,
+)
+from .graphql import is_service_failure
 from .models import MeridianTokenSet
 
 OTP_LENGTH = 6
@@ -46,7 +53,7 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
     so a slow Meridian never fails setup.
     """
 
-    VERSION = 4
+    VERSION = CONFIG_ENTRY_VERSION
     MINOR_VERSION = 1
 
     def __init__(self) -> None:
@@ -176,7 +183,14 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
             accounts = await self._discovery_client.async_get_accounts()
         except MeridianAuthenticationError:
             return self.async_abort(reason="login_expired")
-        except (MeridianRejectedError, MeridianGraphQLError, ValueError) as err:
+        except MeridianGraphQLError as err:
+            # Errors without a code, as for a failure inside Meridian's
+            # service, are Meridian not answering; a coded one is a refusal.
+            _log_discovery_failure(err)
+            error = (
+                "cannot_connect" if is_service_failure(err.codes) else "invalid_data"
+            )
+        except (MeridianRejectedError, ValueError) as err:
             # Before MeridianConnectionError, as a refusal is one too: a
             # retry asks the same, so the form says so rather than to wait.
             _log_discovery_failure(err)
@@ -316,7 +330,8 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
         except MeridianConnectionError as err:
             error = _connection_error_key(err)
         except MeridianAuthenticationError:
-            error = "email_not_found"
+            # There is no email to correct here: the entry's is the one sent.
+            error = "reauth_email_refused"
         else:
             return await self.async_step_otp()
         return self._show_reauth_confirm_form({"base": error})
@@ -355,16 +370,19 @@ def _log_discovery_failure(err: Exception) -> None:
     """
     Log why account discovery failed, without identifiers.
 
-    A refusal of the request, or data Home Assistant cannot use, is a defect
-    worth reporting, so it gets a warning with its traceback. A connection
-    failure or rate limit is already on the form, and the transport's debug
-    lines describe the answer, so it gets a debug line.
+    A refusal of the request (a client error, or a GraphQL error with a
+    code), or data Home Assistant cannot use, is a defect worth reporting,
+    so it gets a warning with its traceback. A connection failure, a rate
+    limit or GraphQL errors without a code are already on the form, and the
+    transport's debug lines describe the answer, so they get a debug line.
     """
-    if isinstance(err, MeridianRejectedError | MeridianGraphQLError | ValueError):
+    if isinstance(err, MeridianRejectedError | ValueError) or (
+        isinstance(err, MeridianGraphQLError) and not is_service_failure(err.codes)
+    ):
         _LOGGER.warning(
             "Meridian refused account discovery or returned data Home Assistant "
-            "could not use (%s)",
-            type(err).__name__,
+            "could not use: %s",
+            err,
             exc_info=err,
         )
         return

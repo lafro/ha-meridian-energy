@@ -61,7 +61,7 @@ from .const import (
     TRANSIENT_STATUSES,
     UPDATE_INTERVAL,
 )
-from .graphql import QUERY_LIMIT_CODES, UNKNOWN_ERROR_CODE
+from .graphql import QUERY_LIMIT_CODES, is_service_failure
 from .lanes import (
     COVERAGE,
     COVERAGE_PAUSE_SECONDS,
@@ -4656,7 +4656,7 @@ def _is_refusal(
     if rows.inside or (oldest_seen is not None and rows.window.end > oldest_seen):
         return False
     if isinstance(err, MeridianGraphQLError):
-        return bool(set(err.codes) - {UNKNOWN_ERROR_CODE}) and not (
+        return not is_service_failure(err.codes) and not (
             QUERY_LIMIT_CODES.intersection(err.codes) or _is_topology_error(err)
         )
     return isinstance(err, MeridianRejectedError)

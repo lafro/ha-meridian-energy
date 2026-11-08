@@ -5,6 +5,10 @@ from datetime import timedelta
 DOMAIN = "meridian_energy"
 NAME = "Meridian Energy"
 
+# The config entry version the setup flow creates and the oldest that loads;
+# an entry below it is removed and added again (async_migrate_entry).
+CONFIG_ENTRY_VERSION = 4
+
 CONF_REFRESH_TOKEN = "refresh_token"  # noqa: S105 - config-entry field name
 CONF_FIREBASE_USER_ID = "firebase_user_id"
 

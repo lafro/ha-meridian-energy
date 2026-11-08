@@ -472,10 +472,16 @@ async def test_a_second_reauth_confirmation_sends_no_second_code(
 
 @pytest.mark.parametrize(
     ("error", "expected"),
-    [*_CONNECTION_ERRORS, (MeridianAuthenticationError(), "email_not_found")],
+    [*_CONNECTION_ERRORS, (MeridianAuthenticationError(), "reauth_email_refused")],
 )
 @pytest.mark.asyncio
 async def test_reauth_send_errors(hass, error: Exception, expected: str) -> None:
+    """
+    Reauthentication names its failures as setup does, but for the email.
+
+    Its form has no email to correct, so a refused email says to set
+    Meridian Energy up again with the one now used for MyMeridian.
+    """
     entry = _configured_entry(hass)
     client = MagicMock()
     client.async_send_otp = AsyncMock(side_effect=error)
@@ -633,6 +639,16 @@ def _discovery_failure(kind: str, stalled: Any) -> Response | StalledConnection:
         "graphql_error": json_response(
             {"errors": [{"message": message, "extensions": {"errorCode": "KT-CT-1"}}]}
         ),
+        # Errors without a code, as for a failure inside Meridian's service.
+        "uncoded_graphql_error": json_response({"errors": [{"message": message}]}),
+        "mixed_graphql_errors": json_response(
+            {
+                "errors": [
+                    {"message": message},
+                    {"message": message, "extensions": {"errorCode": "KT-CT-1"}},
+                ]
+            }
+        ),
     }
     return answers.get(
         kind, json_response({"data": {"viewer": {"accounts": "not a list"}}})
@@ -646,6 +662,8 @@ _DISCOVERY_FAILURES = [
     ("no_connection", "cannot_connect", "MeridianConnectionError status=-"),
     ("rejected", "invalid_data", "MeridianRejectedError"),
     ("graphql_error", "invalid_data", "MeridianGraphQLError"),
+    ("uncoded_graphql_error", "cannot_connect", "MeridianGraphQLError status=-"),
+    ("mixed_graphql_errors", "invalid_data", "MeridianGraphQLError"),
     ("unusable_data", "invalid_data", "ValueError"),
 ]
 
@@ -662,12 +680,13 @@ async def test_account_discovery_failures_are_named_and_logged(
     """
     Finding the accounts says what failed and logs it, then Submit tries again.
 
-    A refusal of the request, or data Home Assistant cannot use, is a defect
-    to report, so it leaves one warning with its traceback, and the form
-    says a retry asks the same. A failure to get an answer is already on
-    the form, and the transport describes the answer, so it gets one debug
-    line. The real client and transport run in front of a synthetic
-    service, through Home Assistant's flow manager.
+    A refusal of the request (a client error, or a GraphQL error with a
+    code), or data Home Assistant cannot use, is a defect to report, so it
+    leaves one warning with its traceback, and the form says a retry asks
+    the same. A failure to get an answer, GraphQL errors without a code
+    included, is already on the form, and the transport describes the
+    answer, so it gets one debug line. The real client and transport run in
+    front of a synthetic service, through Home Assistant's flow manager.
     """
     kind, expected, error = failure
     caplog.set_level(logging.DEBUG, logger=config_flow_module.__name__)
@@ -712,12 +731,14 @@ async def test_account_discovery_failures_are_named_and_logged(
     if expected == "invalid_data":
         (record,) = records
         assert record.levelno == logging.WARNING
-        assert record.getMessage() == (
-            "Meridian refused account discovery or returned data Home Assistant "
-            f"could not use ({error})"
-        )
         assert record.exc_info is not None
         assert type(record.exc_info[1]).__name__ == error
+        # The error's own words, which name no class.
+        assert record.getMessage() == (
+            "Meridian refused account discovery or returned data Home Assistant "
+            f"could not use: {record.exc_info[1]}"
+        )
+        assert error not in record.getMessage()
     else:
         assert [(record.levelno, record.getMessage()) for record in records] == [
             (logging.DEBUG, f"Meridian account discovery failed: error={error}")
@@ -907,6 +928,55 @@ async def test_a_second_code_submission_shows_the_step_the_first_produced(
         assert [answer["reason"] for answer in answers] == ["no_accounts"] * 2
     if outcome in {"created", "no_accounts"}:
         assert _flow_ids(hass) == set()
+
+
+@pytest.mark.asyncio
+async def test_a_second_discovery_retry_makes_no_second_request(
+    hass: HomeAssistant, meridian: _FakeMeridian
+) -> None:
+    """
+    Submit pressed twice on the retry form looks for the accounts once.
+
+    The second press waits for the first; the first created the entry, so
+    the second answers once the flow has ended, with an abort the dialog
+    drops.
+    """
+    looking = asyncio.Event()
+    finish_looking = asyncio.Event()
+    calls = 0
+
+    async def accounts() -> tuple[MeridianAccount, ...]:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise MeridianConnectionError
+        looking.set()
+        await finish_looking.wait()
+        return (_account(),)
+
+    meridian.async_get_accounts.side_effect = accounts
+    result = await _submit_login(hass)
+    assert result["step_id"] == "discovery_retry"
+    flow_id = result["flow_id"]
+    first = hass.async_create_task(
+        hass.config_entries.flow.async_configure(flow_id, {})
+    )
+    await looking.wait()
+    second = hass.async_create_task(
+        hass.config_entries.flow.async_configure(flow_id, {})
+    )
+    await asyncio.sleep(0.05)
+    assert not second.done()
+    finish_looking.set()
+    answers = [await first, await second]
+
+    assert meridian.async_get_accounts.await_count == 2
+    assert [(answer["type"], answer.get("reason")) for answer in answers] == [
+        (FlowResultType.CREATE_ENTRY, None),
+        (FlowResultType.ABORT, "already_configured"),
+    ]
+    assert len(hass.config_entries.async_entries(DOMAIN)) == 1
+    assert _flow_ids(hass) == set()
 
 
 @pytest.mark.asyncio

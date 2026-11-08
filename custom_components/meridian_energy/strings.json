@@ -15,7 +15,8 @@
       "otp_invalid": "That code isn't right. Check the email and try again.",
       "otp_not_found": "Meridian didn't find that code; it may already have been used. Close this window and start again to get a new one.",
       "otp_too_many_attempts": "Too many tries. Close this window and start again to get a new code.",
-      "rate_limited": "Meridian asked Meridian Energy to wait. Wait a while, then try again."
+      "rate_limited": "Meridian asked Meridian Energy to wait. Wait a while, then try again.",
+      "reauth_email_refused": "Meridian didn't accept the email for this entry. If you now sign in to MyMeridian with a different email, remove Meridian Energy and add it again with that email."
     },
     "step": {
       "user": {

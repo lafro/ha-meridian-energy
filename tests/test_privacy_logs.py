@@ -134,6 +134,8 @@ class _Scenario:
     # A warning the integration must log with its traceback attached, so
     # the privacy checks cover the traceback too.
     warned: str | None = None
+    # Whether the integration must log no warning or error at all.
+    quiet: bool = False
 
 
 _FIRST_PAGE = (
@@ -141,7 +143,7 @@ _FIRST_PAGE = (
 )
 _DISCOVERY_WARNING = (
     "Meridian refused account discovery or returned data Home Assistant could "
-    "not use ({})"
+    "not use: {}"
 )
 
 
@@ -374,14 +376,30 @@ _SCENARIOS = [
         answers={"accountsList": _graphql_error()},
         outcome="discovery_retry",
         error="invalid_data",
-        warned=_DISCOVERY_WARNING.format("MeridianGraphQLError"),
+        warned=_DISCOVERY_WARNING.format(
+            "Meridian GraphQL operation accountsList failed (KT-CT-4321)"
+        ),
+    ),
+    _Scenario(
+        # Errors without a code, as for a failure inside Meridian's service:
+        # Meridian did not answer, which the form says, with a debug line.
+        "discovery_service_failure",
+        answers={
+            "accountsList": json_response(
+                {"errors": [{"message": "No property synthetic-property on A-TEST-1"}]}
+            )
+        },
+        outcome="discovery_retry",
+        error="cannot_connect",
+        logged="Meridian account discovery failed: error=MeridianGraphQLError status=-",
+        quiet=True,
     ),
     _Scenario(
         "discovery_unusable_account",
         answers={"account": _unusable_account()},
         outcome="discovery_retry",
         error="invalid_data",
-        warned=_DISCOVERY_WARNING.format("ValueError"),
+        warned=_DISCOVERY_WARNING.format("Invalid Meridian register date"),
     ),
 ]
 
@@ -445,6 +463,8 @@ def _assert_logged(records: list[logging.LogRecord], scenario: _Scenario) -> Non
             and record.getMessage() == scenario.warned
         ]
         assert warning.exc_info is not None
+    if scenario.quiet:
+        assert not [record for record in records if record.levelno >= logging.WARNING]
 
 
 def _root_name(err: BaseException) -> str:

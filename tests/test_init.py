@@ -47,9 +47,11 @@ from custom_components.meridian_energy.api import (
     MeridianAuthenticationError,
     MeridianConnectionError,
 )
+from custom_components.meridian_energy.config_flow import MeridianEnergyConfigFlow
 from custom_components.meridian_energy.const import (
     CONF_FIREBASE_USER_ID,
     CONF_REFRESH_TOKEN,
+    CONFIG_ENTRY_VERSION,
     DOMAIN,
     UNCONFIRMED_REPLAYS,
     UNSAVED_COVERAGE,
@@ -390,6 +392,27 @@ async def test_migrate_refuses_entries_set_up_before_version_4(
 @pytest.mark.asyncio
 async def test_migrate_accepts_a_current_entry(hass) -> None:
     assert await async_migrate_entry(hass, _entry()) is True
+
+
+@pytest.mark.asyncio
+async def test_migrate_takes_the_version_the_flow_creates_and_refuses_the_one_before(
+    hass,
+) -> None:
+    """
+    Migration and the setup flow agree on the current version.
+
+    A flow bumped alone would create entries migration refuses, or leave
+    migration accepting the version before it unchanged.
+    """
+    version = MeridianEnergyConfigFlow.VERSION
+    minor_version = MeridianEnergyConfigFlow.MINOR_VERSION
+    assert version == CONFIG_ENTRY_VERSION
+
+    current = _entry(version=version, minor_version=minor_version)
+    assert await async_migrate_entry(hass, current) is True
+    with pytest.raises(ConfigEntryError) as raised:
+        await async_migrate_entry(hass, _entry(version=version - 1, minor_version=1))
+    assert raised.value.translation_key == "entry_too_old"
 
 
 @pytest.mark.asyncio

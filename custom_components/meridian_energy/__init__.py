@@ -17,6 +17,7 @@ from .api import MeridianApiClient
 from .const import (
     CONF_FIREBASE_USER_ID,
     CONF_REFRESH_TOKEN,
+    CONFIG_ENTRY_VERSION,
     DOMAIN,
     UNCONFIRMED_REPLAYS,
     UNSAVED_COVERAGE,
@@ -26,8 +27,6 @@ from .models import MeridianTokenSet
 from .statistics import account_key
 
 PLATFORMS = [Platform.SENSOR]
-CONFIG_ENTRY_VERSION = 4
-CONFIG_ENTRY_MINOR_VERSION = 1
 
 
 @dataclass(slots=True)

@@ -10,7 +10,7 @@ An unofficial Home Assistant integration for Meridian electricity usage, cost an
 ## What it provides
 
 - Passwordless setup using Meridian's emailed six-digit code.
-- Automatic session renewal; every active electricity account on the login is followed.
+- Automatic session renewal; every active or dormant electricity account on the login is followed, including one added later.
 - Hourly grid-import and cost statistics for Home Assistant's Energy dashboard.
 - Current-billing-period usage and cost.
 - Grid-export and export-credit data when Meridian reports feed-in metering.
@@ -23,7 +23,7 @@ An unofficial Home Assistant integration for Meridian electricity usage, cost an
 3. Go to **Settings → Devices & services → Add integration → Meridian Energy**.
 4. Enter your MyMeridian email address and the six-digit code Meridian sends you.
 
-Setup finishes once the code is accepted. Meridian Energy then fetches your last 90 days of usage and cost in the background, which can take several minutes; until then its sensors show as unavailable. If Meridian is down, it tries again after 10 minutes, then 30, then hourly. Every active electricity account on the login is followed, including one added later.
+Setup finishes once the code is accepted. Meridian Energy then fetches your last 90 days of usage and cost in the background, which can take several minutes; until then its sensors show as unavailable. If Meridian is down, it tries again after 10 minutes, then 30, then hourly.
 
 Beta versions are GitHub pre-releases: HACS offers them only when beta versions are turned on for this repository.
 
@@ -144,11 +144,11 @@ For Energy dashboard sources, use the **Meridian grid import** statistics descri
 The integration supports multiple accounts, properties, registers and time-of-use interval costs. It does not expose tariff-rate entities, fixed-charge entities, bills or payment data. Live testing has primarily used one property on an all-day plan without feed-in; other account types are covered by synthetic automated tests.
 
 - If setup cannot connect, confirm MyMeridian is available and try again later.
-- If Meridian lists no active electricity account for the login, setup stops and says so. An entry whose accounts have all closed retries setup by itself; if they have closed for good, remove the integration.
+- If Meridian lists no active or dormant electricity account for the login, setup stops and says so. An entry whose accounts have all closed retries setup by itself; if they have closed for good, remove the integration.
 - With several properties, one that fails, such as one whose supply ended, logs a warning and is tried again later; the others update as usual.
 - If Home Assistant requests reauthentication, complete the emailed-code flow.
 - If current-bill cost shows unknown, with its `data_complete` attribute false, Meridian may not have supplied cost for every interval yet. It also shows unknown for a billing period in which the stored running total of the cost does not follow the hourly costs, as after **Adjust sum** was used on the cost statistic: the total could not be trusted. The same holds for current-bill usage and export and their statistics, and the cost or export credit that goes with them then shows unknown too.
-- If setup or an update says that older Meridian Energy statistics can't be continued, Home Assistant already has Meridian Energy statistics for that property, such as from an earlier installation, that are more than 800 days older than the history to import, or that have no running total in those 800 days. Nothing is imported for them, rather than start the running total again from zero, and trying again gives the same result until they are deleted in **Settings → Tools → Statistics**: select them, then **Delete selected statistics**.
+- If an update says that older Meridian Energy statistics can't be continued, Home Assistant already has Meridian Energy statistics for that property, such as from an earlier installation, that are more than 800 days older than the history to import, or that have no running total in those 800 days. Nothing is imported for them, rather than start the running total again from zero, and trying again gives the same result until they are deleted in **Settings → Tools → Statistics**: select them, then **Delete selected statistics**.
 - For a reproducible problem, use the integration page's three-dot menu to **Enable debug logging**, reproduce the issue, then disable it to download the log. Download diagnostics from the same menu, review both files, and follow the redaction warning in the issue form.
 - The debug lines describe each request to Meridian: its kind, the HTTP status, the size and type of the answer, which server wrote an error page and how long it took; and for usage history, which week it asked for, as days before today, and what came back. They contain no email, account, address, token, usage or cost, and give times as hours or days before now rather than dates. With the time of each log line, though, they show how far back your usage history goes: when it is shorter than the 90 days, or the billing period, that the updates complete, they show the hour of your first reading. Check the log before posting it publicly.
 
