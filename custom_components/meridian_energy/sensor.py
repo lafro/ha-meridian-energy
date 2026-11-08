@@ -260,10 +260,12 @@ async def async_setup_entry(
                 sensor_key = (key, description.key)
                 if description.condition is not None:
                     conditional.add(sensor_key)
-                    if met.get(description.condition) is None:
+                    wanted = met.get(description.condition)
+                    if wanted is None:
+                        # Not known yet: one already registered shows unknown.
                         undecided.add(sensor_key)
-                        continue
-                    if not met[description.condition]:
+                        wanted = _entity_id(hass, entry, sensor_key) is not None
+                    if not wanted:
                         continue
                 desired.add(sensor_key)
                 if sensor_key in created_sensors:
@@ -314,16 +316,24 @@ def _remove_stale_entities(
     stale_sensor_keys: set[tuple[str, str]],
 ) -> None:
     """Remove account entities that no longer apply to current topology."""
+    for sensor_key in stale_sensor_keys:
+        if (entity_id := _entity_id(hass, entry, sensor_key)) is not None:
+            er.async_get(hass).async_remove(entity_id)
+
+
+def _entity_id(
+    hass: HomeAssistant, entry: MeridianConfigEntry, sensor_key: tuple[str, str]
+) -> str | None:
+    """Return the entity ID of an account's sensor registered for the entry."""
     entity_registry = er.async_get(hass)
-    for account_key_value, sensor_key in stale_sensor_keys:
-        entity_id = entity_registry.async_get_entity_id(
-            "sensor", DOMAIN, f"{account_key_value}_{sensor_key}"
-        )
-        if entity_id is None:
-            continue
-        entity_entry = entity_registry.async_get(entity_id)
-        if entity_entry is not None and entity_entry.config_entry_id == entry.entry_id:
-            entity_registry.async_remove(entity_id)
+    account_key_value, key = sensor_key
+    entity_id = entity_registry.async_get_entity_id(
+        "sensor", DOMAIN, f"{account_key_value}_{key}"
+    )
+    entity_entry = None if entity_id is None else entity_registry.async_get(entity_id)
+    if entity_entry is None or entity_entry.config_entry_id != entry.entry_id:
+        return None
+    return entity_id
 
 
 @callback

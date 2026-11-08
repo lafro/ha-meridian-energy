@@ -145,6 +145,8 @@ _EXTRA_LOST = {
     "and Last payment show unknown until it can",
     "prices": "Meridian Energy couldn't get the prices; Daily charge and Anytime "
     "price show unknown until it can",
+    "prices_unanswered": "Meridian Energy couldn't get the prices; it asks again "
+    "in a day",
 }
 _EXTRA_BACK = {
     "accounts": "Meridian Energy has refreshed the list of accounts again",
@@ -1264,8 +1266,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
 
         Only an account with one property and one meter point is asked; the
         answer says whether its plan is all-day. Until an answer has come,
-        there is no saying (None), and sensors that exist are left as they
-        are.
+        there is no saying (None): sensors already registered stay, showing
+        unknown.
         """
         properties = account.properties
         if len(properties) != 1 or len(properties[0].meter_points) != 1:
@@ -1277,6 +1279,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             partial(self.client.async_get_prices, account.number, properties[0].id),
         )
         if extra.at is None:
+            if extra.failing:
+                lost["prices"] = "prices_unanswered"
             return None, None
         if extra.value is None:
             return False, None

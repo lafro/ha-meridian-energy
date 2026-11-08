@@ -504,7 +504,7 @@ async def test_prices_never_answered_leave_the_price_sensors_as_they_are(
     session: FakeMeridianSession,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """No saying yet whether the plan is all-day: no INFO about sensors."""
+    """No saying yet whether the plan is all-day: the line says only when it asks."""
     caplog.set_level(logging.INFO)
     session.hook = _failing("prices")
     coordinator = coordinator_for(hass, session)
@@ -512,7 +512,19 @@ async def test_prices_never_answered_leave_the_price_sensors_as_they_are(
     data = await sync(coordinator, NOW, session)
 
     assert data.account_results[0].price_sensors is None
-    assert not _own(caplog, logging.INFO)
+    assert _own(caplog, logging.INFO) == [
+        "Meridian Energy couldn't get the prices; it asks again in a day"
+    ]
+    await sync(coordinator, NOW + 23 * HOUR, session)
+    assert session.operations.count("prices") == 1
+
+    session.hook = lambda _operation, _variables: None
+    data = await sync(coordinator, NOW + DAY, session)
+    assert session.operations.count("prices") == 2
+    assert data.account_results[0].price_sensors is True
+    assert _own(caplog, logging.INFO)[1:] == [
+        "Meridian Energy is getting the prices again"
+    ]
 
 
 async def test_a_rate_limit_on_a_figure_fails_nothing_and_waits(
@@ -642,6 +654,65 @@ async def test_a_failing_grid_export_leaves_the_rest_of_the_bill(
     assert data.account_results[0].bill == BillFigures(
         usage=Decimal(180), cost=Decimal(54), estimate=Decimal("111.6")
     )
+
+
+async def test_a_rate_limit_on_the_grid_export_days_waits_like_any_other(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Nothing fails and nothing is said; no more requests, and the next waits."""
+    caplog.set_level(logging.INFO)
+    session = FakeMeridianSession(NOW, feed_in=(ACCOUNT_NUMBER,))
+    session.billing_period = _PERIOD
+    session.hook = lambda operation, variables: (
+        Response(b"", status=429, headers={"Retry-After": "10800"})
+        if operation == "measurements"
+        and variables["readingDirectionType"] == "GENERATION"
+        and variables["readingFrequencyType"] == "DAY_INTERVAL"
+        else None
+    )
+    coordinator = coordinator_for(hass, session)
+
+    data = await sync(coordinator, NOW, session)
+
+    assert coordinator.update_interval == timedelta(hours=3)
+    assert "balance" not in session.operations
+    assert data.account_results[0].bill == BillFigures()
+    assert not _own(caplog, logging.INFO)
+
+
+async def test_only_a_property_with_feed_in_is_asked_for_its_export_days(
+    hass: HomeAssistant, session: FakeMeridianSession
+) -> None:
+    account = account_data()
+    second = {
+        **account_data(feed_in=True)["properties"][0],
+        "id": "synthetic-property-2",
+    }
+    account["properties"].append(second)
+    session.billing_period = _PERIOD
+    asked: list[tuple[str, str]] = []
+
+    def answer(operation: str, variables: dict[str, Any]) -> Response | None:
+        if operation == "account":
+            return json_response({"data": {"account": account}})
+        if variables.get("readingFrequencyType") == "DAY_INTERVAL":
+            asked.append((variables["propertyId"], variables["readingDirectionType"]))
+        return None
+
+    session.hook = answer
+    coordinator = coordinator_for(hass, session)
+
+    data = await sync(coordinator, NOW, session)
+
+    assert asked == [
+        (account["properties"][0]["id"], "CONSUMPTION"),
+        ("synthetic-property-2", "CONSUMPTION"),
+        ("synthetic-property-2", "GENERATION"),
+    ]
+    bill = data.account_results[0].bill
+    assert bill.usage == Decimal(360)
+    assert bill.export is not None
 
 
 def _account_with(**changes: Any) -> Response:

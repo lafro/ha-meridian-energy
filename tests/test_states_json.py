@@ -1,10 +1,12 @@
 """
-Every state the integration writes is JSON, so Home Assistant can show and record it.
+The states the integration writes, through Home Assistant's real set-up.
 
 Each test signs in through Home Assistant's real flow, then runs the first
 sync with the real recorder, client and transport in front of a synthetic
-Meridian service at the HTTP level. A state Home Assistant can't serialise
-drops out of the frontend and the recorder, and its WARNING names the value.
+Meridian service at the HTTP level. Every state must be JSON: one Home
+Assistant can't serialise drops out of the frontend and the recorder, and its
+WARNING names the value. A sensor that stays registered must be written by
+the integration, not left as the unavailable state Home Assistant restores.
 """
 
 from __future__ import annotations
@@ -31,11 +33,15 @@ import custom_components.meridian_energy as integration_module
 from custom_components.meridian_energy import config_flow as config_flow_module
 from custom_components.meridian_energy.const import DOMAIN
 
-from .meridian_http import ACCOUNT_NUMBER, EMAIL, FakeMeridianSession
+from .meridian_http import ACCOUNT_NUMBER, EMAIL, FakeMeridianSession, json_response
 
 _NOW = datetime(2026, 7, 16, 12, 30, tzinfo=UTC)
 _TODAY = (_NOW + timedelta(hours=12)).date()
 _TOTAL_DUE = "sensor.meridian_energy_total_due"
+_PRICE_SENSORS = (
+    "sensor.meridian_energy_daily_charge",
+    "sensor.meridian_energy_anytime_price",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -139,4 +145,34 @@ async def test_every_state_of_the_entry_is_json(
     for state in shown:
         assert state.as_dict_json, state.entity_id
         assert state.as_compressed_state_json, state.entity_id
+    assert _warnings(caplog) == []
+
+
+async def test_price_sensors_stay_unknown_when_prices_fail_after_a_reload(
+    hass: HomeAssistant,
+    meridian: FakeMeridianSession,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Not yet asked again, so no saying whether they apply: they show unknown."""
+    caplog.set_level(logging.WARNING)
+    entry_id = await _set_up(hass, caplog)
+    for entity_id in _PRICE_SENSORS:
+        state = hass.states.get(entity_id)
+        assert state is not None
+        assert state.state not in {"unknown", "unavailable"}, entity_id
+
+    meridian.hook = lambda operation, _variables: (
+        json_response({}, status=503) if operation == "prices" else None
+    )
+    assert await hass.config_entries.async_reload(entry_id)
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    entry = hass.config_entries.async_get_entry(entry_id)
+    assert entry is not None
+    assert entry.runtime_data.coordinator.last_update_success
+    for entity_id in _PRICE_SENSORS:
+        state = hass.states.get(entity_id)
+        assert state is not None
+        assert state.state == "unknown", entity_id
+        assert "restored" not in state.attributes, entity_id
     assert _warnings(caplog) == []
