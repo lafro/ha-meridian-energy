@@ -198,11 +198,15 @@ def fresh_rate_log() -> None:
     [
         ("$2.000000 /day", "$0.300000 /kWh", (Decimal(2), Decimal("0.3"))),
         ("$2.12/day", "$0.3141/kWh", (Decimal("2.12"), Decimal("0.3141"))),
-        ("240.000 c/day", "31.41 c/kWh", (Decimal("2.4"), Decimal("0.3141"))),
+        ("212.500 c/day", "31.41 c/kWh", (Decimal("2.125"), Decimal("0.3141"))),
         # A wrong unit for its band, or a currency marker it can't read.
         ("$0.300000 /kWh", "$2.000000 /day", (None, None)),
         ("€2.00 /day", "NZD 0.30 /kWh", (None, None)),
         ("2.00 /day", "", (None, None)),
+        # More than a price: the whole text must read as one.
+        ("$2.00 /day + GST", "from $0.30 /kWh", (None, None)),
+        ("$2.00 /day $0.30 /kWh", "$0.30 /kWh, $0.25 /kWh off-peak", (None, None)),
+        ("212.500 c/day extra", "31.41 c/kWh more", (None, None)),
     ],
 )
 def test_prices_read_dollars_or_cents_per_their_band_unit(
@@ -213,20 +217,43 @@ def test_prices_read_dollars_or_cents_per_their_band_unit(
     assert prices == MeridianPrices("Synthetic Plan", *expected)
 
 
+_DAILY_UNREAD = (
+    "Meridian Energy can't read the daily charge in formattedRateIncludingTax; "
+    "it shows unknown"
+)
+_ANYTIME_UNREAD = (
+    "Meridian Energy can't read the anytime price in formattedRateIncludingTax; "
+    "it shows unknown"
+)
+
+
 def test_an_unreadable_price_logs_its_field_name_once(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    """Each price's field is named once, though both prices read the same field."""
     caplog.set_level(logging.INFO)
     for _answer in range(2):
         parse_prices(prices_data("2 dollars", "$0.30 /day"))
 
     assert [record.getMessage() for record in caplog.records] == [
-        (
-            "Meridian Energy can't read the daily charge in formattedRateIncludingTax; "
-            "it shows unknown"
-        ),
+        _DAILY_UNREAD,
+        _ANYTIME_UNREAD,
     ]
     assert "2 dollars" not in caplog.text
+    assert "$0.30 /day" not in caplog.text
+
+
+def test_the_other_price_unreadable_later_is_named_too(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+    parse_prices(prices_data("2 dollars", "$0.30 /kWh"))
+    parse_prices(prices_data("$2.00 /day", "30 cents"))
+
+    assert [record.getMessage() for record in caplog.records] == [
+        _DAILY_UNREAD,
+        _ANYTIME_UNREAD,
+    ]
 
 
 def test_a_discount_uses_the_discounted_price() -> None:

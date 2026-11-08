@@ -50,8 +50,9 @@ _DOLLAR_RATE = re.compile(r"\$\s?(\d+(?:\.\d+)?)\s?/\s?(day|kWh)")
 _CENT_RATE = re.compile(r"(\d+(?:\.\d+)?)\s?c\s?/\s?(day|kWh)")
 _STANDING, _CONSUMPTION = "STANDING_CHARGE", "CONSUMPTION_CHARGE"
 _PRICE_NAMES = {_STANDING: "daily charge", _CONSUMPTION: "anytime price"}
-# The price fields already logged as unreadable, each logged once.
-_logged_rates: set[str] = set()
+# Each price's field already logged as unreadable, by band and field: each
+# price's field is logged once.
+_logged_rates: set[tuple[str, str]] = set()
 
 
 def parse_firebase_tokens(payload: dict[str, Any]) -> MeridianTokenSet:
@@ -203,7 +204,7 @@ def parse_prices(property_data: dict[str, Any]) -> MeridianPrices | None:
     and one price per kWh, and no rate tied to a time of day. Each price is
     read strictly, its discounted form when it has a discount; one that does
     not read as dollars or cents per day or kWh, as its band says, is None,
-    and its field's name is logged once.
+    and the name of each price's field is logged once.
     """
     meters = require_list(property_data.get("meterPoints"), "meter points")
     if len(meters) != 1:
@@ -244,8 +245,8 @@ def _price(rate: dict[str, Any], band: str, unit: str) -> Decimal | None:
         match = pattern.fullmatch(text)
         if match is not None and match[2] == unit:
             return Decimal(match[1]) / dollars
-    if field not in _logged_rates:
-        _logged_rates.add(field)
+    if (band, field) not in _logged_rates:
+        _logged_rates.add((band, field))
         _LOGGER.info(
             "Meridian Energy can't read the %s in %s; it shows unknown",
             _PRICE_NAMES[band],
