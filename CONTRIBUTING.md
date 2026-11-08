@@ -2,11 +2,11 @@
 
 ## Requirements
 
-- Python 3.14.2 or newer
+- Python 3.14.2 or newer, below 3.15
 - `uv`
-- `lsof`, for the live test's and the journeys' checks (macOS and most Linux systems have it)
+- `lsof`, for the live test and the journeys (most systems have it)
 
-Never use production credentials in automated tests or commit captured Meridian responses. Fixtures must be synthetic and must not contain real account numbers, ICPs, addresses, tokens or usage.
+Never use real credentials in tests or commit captured Meridian answers. Fixtures are synthetic: no real emails, account numbers, ICPs, addresses, tokens, usage or cost.
 
 ## Setup
 
@@ -20,13 +20,11 @@ uv run mypy custom_components/meridian_energy
 uv run python scripts/check_versions.py
 ```
 
-`uv sync --locked` fails when `uv.lock` is out of date; update it with `uv lock` (or `uv lock --upgrade-package <name>`) rather than editing it. The exact `pytest-homeassistant-custom-component` pin selects the Home Assistant version under test.
-
-Run Hassfest and HACS validation through the GitHub Actions workflow before releasing. The weekly **Compatibility** workflow tests against the newest Home Assistant release and beta.
+`uv sync --locked` fails when `uv.lock` is out of date; update it with `uv lock`, never by hand. The exact `pytest-homeassistant-custom-component` pin selects the Home Assistant version under test, and the **Compatibility** workflow tests new releases and betas ([Compatibility runs](docs/releasing.md#compatibility-runs)).
 
 ## Live test
 
-The tests use a fake Meridian. To try the integration against the real service, run a disposable Home Assistant:
+To try the integration against the real Meridian, run a disposable Home Assistant:
 
 ```bash
 uv run python scripts/live_ha.py start                 # the working tree
@@ -34,51 +32,40 @@ uv run python scripts/live_ha.py start --ref v0.3.0b1  # or a release tag or com
 uv run python scripts/live_ha.py stop                  # remove it all
 ```
 
-`start` builds a new Home Assistant (the newest release, or `--ha-version`) in a folder of its own in the system's temporary directory, completes onboarding, and checks before it reports ready that the instance listens on 127.0.0.1 only and loads nothing that discovers or announces devices (no `default_config`), with Home Assistant's Marketplace (2026.11 and later), which fetches its catalog over the network, turned off. Open the printed link, add the integration and sign in with your own MyMeridian email: the browser on the same computer is signed in to the instance without a password, as is any other program on it (and, in principle, a web page open in that browser), so run `stop` as soon as you are done. The integration logs at debug level to the instance's log. `stop` removes the integration's entries, stops Home Assistant and deletes the folder with its database, log and stored session. Never commit anything from a live test.
+`start` builds a new Home Assistant (the newest release, or `--ha-version`) in its own folder in the system's temporary directory and completes onboarding. Before it reports ready, it checks that the instance listens on 127.0.0.1 only, loads nothing that discovers or announces devices, and has the Marketplace turned off. Open the printed link, add the integration and sign in with your own MyMeridian email; the integration logs at debug level. The browser on that computer is signed in to the instance without a password, as is any other program on it (and, in principle, a web page open in that browser), so run `stop` as soon as you are done: it removes the entries, stops Home Assistant and deletes the folder with its database, log and stored session. Never commit anything from a live test.
 
 ## Journeys
 
-The journeys run the integration end to end in a real Home Assistant against a stand-in Meridian, with no real sign-in:
+The journeys run the integration end to end in a real Home Assistant against a stand-in Meridian:
 
 ```bash
-uv run python scripts/journeys.py                      # the working tree, all five
-uv run python scripts/journeys.py --ref v0.3.0b2       # or a release tag or commit
+uv run python scripts/journeys.py                        # the working tree, all five
+uv run python scripts/journeys.py --ref v0.3.0b2         # or a release tag or commit
 uv run python scripts/journeys.py --only reauth restart  # some of them
-uv run python scripts/journeys.py --clean-up           # delete a left-over instance
+uv run python scripts/journeys.py --clean-up             # delete a left-over instance
 ```
 
-It builds a disposable Home Assistant as the live test does (the newest release, or `--ha-version`), but in a folder of its own (`journeys-meridian_energy`) on port 8125, so the two never meet. A run holds a lock while it lasts, so neither a second run nor `--clean-up` can start meanwhile; nor does a run start while that folder exists, which a killed run left behind: `--clean-up` deletes it. The stand-in (`tests/meridian_standin.py`, with the fakes the tests use) goes into that instance's Python through a `.pth` file. It answers the integration's Meridian requests from the scenario the journey sets, with synthetic data that depends only on the hour. In Home Assistant's process it refuses and records every other aiohttp request, TCP connection and name lookup that would leave the computer; Home Assistant does not start without it. It does not cover UDP or reverse lookups, nor other programs: building the instance, and Home Assistant's first start, download Home Assistant and the requirements it pins from PyPI (through uv), as for the live test.
+A run builds a disposable Home Assistant as the live test does, in its own folder (`journeys-meridian_energy`) on port 8125; `--clean-up` deletes one a killed run left behind. The stand-in (`tests/meridian_standin.py`) answers Meridian requests with synthetic data and refuses every other aiohttp request, TCP connection and name lookup from Home Assistant that would leave the computer; building the instance still downloads Home Assistant from PyPI.
 
 | Journey | What it does |
 | --- | --- |
-| `first_setup` | A property with a feed-in register; email and code create the entry within seconds; the first sync asks for 13 windows of each direction, back to midnight 90 dates ago, and completes both histories |
-| `outage` | Meridian answers 504 from the start; the entry is created all the same, its sensors unavailable; a repair notice after 3 failed updates; once Meridian answers, one update imports the 90 days and the notice goes |
-| `two_accounts` | A login with two accounts: no choice, both are followed |
-| `reauth` | Meridian ends the sign-in; the next update asks to reconnect; email code; history unbroken |
-| `restart` | Reload the entry and restart Home Assistant; each update asks again for the last 21 dates and nothing older; history unbroken |
+| `first_setup` | A feed-in register: the entry at once; the first sync asks for 13 windows per direction, back to midnight 90 dates ago, completing both histories; every figure from Meridian has a value |
+| `outage` | Meridian times out from the start: the entry is created, its sensors unavailable; a repair notice after 3 failed updates; once Meridian answers, one update imports the 90 dates and the notice goes |
+| `two_accounts` | Two accounts on one login, both followed |
+| `reauth` | Meridian ends the sign-in; reconnecting with a new code keeps the history unbroken |
+| `restart` | Reload, then restart: each first sync asks for the last 21 dates and nothing older, and no hour changes |
 
-Every journey also checks that its entry is loaded and its sensors have states; that each statistic has every hour, none zero, each the value the stand-in sent and each sum step equal to its hour; that every screen it met has its words (no raw keys); that the integration logged exactly the lines above debug level the journey expects; and that the stand-in refused nothing; the run checks that once more after Home Assistant has stopped. The run prints PASS or FAIL for each check and journey, writes a report with every check and every screen as the dialog shows it to the system's temporary directory, deletes the instance whatever happens, and exits non-zero if anything failed. It takes several minutes.
+Every journey also checks its entry and sensors; that each statistic has every hour, none zero, with the value sent and consistent sums; that every screen has its words; that the log above debug level is exactly as expected; and that the stand-in refused nothing. The run prints PASS or FAIL for each check, writes a report to the system's temporary directory, deletes the instance and exits non-zero if anything failed. It takes several minutes.
 
-Run the journeys before every beta and stable release, and in every pull request that changes sign-in, setup or the import; say in the pull request that they passed. They are not part of CI.
+Run the journeys before every beta and stable release, and in every pull request that changes sign-in, setup or the import; say in it that they passed. They are not part of CI.
 
 ## Pull requests
 
-- Add tests for every behavior change.
-- Preserve config-entry migration and reauthentication paths.
-- Treat API responses as untrusted input.
-- Never log request payloads, response payloads, headers or identifiers.
-- Update the README for user-visible changes.
-- Snapshot tests (`tests/snapshots/`) cover entity states and diagnostics. After an intended change, run `uv run pytest --snapshot-update` and review the `.ambr` diff.
+- Add tests for every behaviour change, and keep reauthentication working.
+- Treat Meridian's answers as untrusted input, and never log payloads, headers or identifiers.
+- Update the README for changes users see, in terms of what they see and do; `tests/test_repository_contracts.py` holds the docs to their word limits.
+- After an intended change to entity states or diagnostics, run `uv run pytest --snapshot-update` and review the `.ambr` diff.
 
-Pull requests must pass the Python, Hassfest, HACS, dependency-review and CodeQL checks, and the content checks: a secret scan, and a check against a private list of terms that must never be published (pull requests from forks and Dependabot skip it, because they get no repository secrets). The repository uses squash merges and automatically deletes merged branches.
+Pull requests must pass the Python, Hassfest, HACS, dependency-review and CodeQL checks, a secret scan, and a check for private terms (skipped for forks and Dependabot, which get no repository secrets). Merges are squashed.
 
-Developer notes are in [`docs/`](docs/README.md).
-
-## Release checklist
-
-1. Confirm `manifest.json`, `pyproject.toml` and the proposed `v…` tag contain the same version, and `CHANGELOG.md` has a `## X.Y.Z` section for it (`check_versions.py` enforces this). That section becomes the release notes.
-2. Run the full local commands above and the [journeys](#journeys), and review the branch-coverage report.
-3. Merge only through a protected pull request with all conversations resolved.
-4. Run the protected **Release** workflow from `main`; do not create or move release tags manually.
-5. Install the published release through HACS on a Home Assistant instance and confirm that it loads and completes a sync.
-6. If that finds a material defect, fix it through a new pull request and publish a new patch version; never replace an existing release in place.
+Developer notes, release steps included, are in [`docs/`](docs/README.md).

@@ -13,7 +13,28 @@ from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 
-from scripts import check_versions
+from scripts import check_versions, compat_results, journeys
+
+# Each document's word limit, counted as ``wc -w`` counts.
+WORD_LIMITS = {
+    "README.md": 1500,
+    "CLAUDE.md": 1000,
+    "CONTRIBUTING.md": 800,
+    "docs/architecture.md": 2000,
+    "docs/releasing.md": 700,
+}
+LINKED_DOCS = (
+    "README.md",
+    "CLAUDE.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "docs/README.md",
+    "docs/architecture.md",
+    "docs/releasing.md",
+)
+FENCE = re.compile(r"^```.*?^```", re.MULTILINE | re.DOTALL)
+LINK_TARGET = re.compile(r"\]\(([^)\s]+)\)")
+HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*$", re.MULTILINE)
 
 
 def test_release_workflow_publishes_only_the_verified_main_commit() -> None:
@@ -423,3 +444,81 @@ def test_repository_versions_and_changelog_agree(tmp_path: Path) -> None:
     )
     assert notes.read_text().endswith(section)
     assert section.strip()
+
+
+@pytest.mark.parametrize(("name", "limit"), WORD_LIMITS.items())
+def test_documents_stay_within_their_word_limits(name: str, limit: int) -> None:
+    """The docs stay short enough to be read whole."""
+    words = len(Path(name).read_text().split())
+    assert words <= limit, f"{name} has {words} words, over {limit}"
+
+
+def _anchors(path: Path) -> set[str]:
+    """Return the anchors GitHub gives the headings of a Markdown file."""
+    anchors: set[str] = set()
+    for heading in HEADING.findall(FENCE.sub("", path.read_text())):
+        text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", heading)
+        slug = re.sub(r"[^\w\- ]", "", text.lower()).replace(" ", "-")
+        anchor, count = slug, 0
+        while anchor in anchors:
+            count += 1
+            anchor = f"{slug}-{count}"
+        anchors.add(anchor)
+    return anchors
+
+
+def test_anchors_follow_github(tmp_path: Path) -> None:
+    page = tmp_path / "page.md"
+    page.write_text(
+        "# Title\n\n## Security, support and licence\n\n```bash\n# not a heading\n"
+        "```\n\n### `uv` and [links](x.md)\n\n## Title\n"
+    )
+    assert _anchors(page) == {
+        "title",
+        "security-support-and-licence",
+        "uv-and-links",
+        "title-1",
+    }
+
+
+@pytest.mark.parametrize("name", LINKED_DOCS)
+def test_document_links_resolve(name: str) -> None:
+    """Every relative link and anchor in the docs points at something that exists."""
+    source = Path(name)
+    broken = []
+    for target in LINK_TARGET.findall(FENCE.sub("", source.read_text())):
+        if re.match(r"[a-z]+:", target):
+            continue
+        path, _, anchor = target.partition("#")
+        linked = source.parent / path if path else source
+        if not linked.exists() or (
+            anchor and linked.suffix == ".md" and anchor not in _anchors(linked)
+        ):
+            broken.append(target)
+    assert not broken, f"{name}: {broken}"
+
+
+def test_contributing_lists_every_journey() -> None:
+    """The journeys table names each journey the runner has, in its order."""
+    text = Path("CONTRIBUTING.md").read_text()
+    section = text.split("\n## Journeys\n", 1)[1].split("\n## ", 1)[0]
+    listed = re.findall(r"^\| `(\w+)` \|", section, re.MULTILINE)
+    assert listed == list(journeys.JOURNEYS)
+
+
+def test_compat_result_schema_is_documented() -> None:
+    """compat_results.py's docstring names every field of a result."""
+    item = compat_results.result(
+        matrix=dict.fromkeys(
+            ("target", "tag", "ref", "channel", "homeassistant", "harness", "python"),
+            "",
+        ),
+        installed="",
+        manifest=None,
+        record=None,
+        retry_record=None,
+        deprecations=None,
+        run_url="",
+    )
+    documented = compat_results.__doc__ or ""
+    assert [key for key in item if f"``{key}``" not in documented] == []
