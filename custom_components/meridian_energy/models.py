@@ -104,34 +104,72 @@ class PropertySyncResult:
 
 
 @dataclass(frozen=True, slots=True)
-class AccountSyncResult:
-    """Non-sensitive billing and sync summary for one account."""
+class MeridianBill:
+    """A bill: when it was issued, and the period printed on it."""
 
-    account_key: str
-    billing_period: MeridianBillingPeriod | None
-    current_bill_usage: Decimal | None
-    current_bill_cost: Decimal | None
-    current_bill_export: Decimal | None
-    current_bill_credit: Decimal | None
-    has_feed_in: bool
-    usage_complete: bool
-    cost_complete: bool
-    export_complete: bool
-    credit_complete: bool
+    issued: date
+    start: date | None
+    end: date | None
 
 
 @dataclass(frozen=True, slots=True)
-class BillingPeriodTotals:
-    """Account totals derived from timestamped Home Assistant statistics."""
+class MeridianPayment:
+    """A payment: its amount in cents, its date and its status."""
 
-    usage: Decimal | None
-    cost: Decimal | None
-    export: Decimal | None
-    credit: Decimal | None
-    usage_complete: bool
-    cost_complete: bool
-    export_complete: bool
-    credit_complete: bool
+    amount_cents: int
+    paid_on: date
+    status: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class MeridianBalance:
+    """An account's balance in cents, negative when owed, its bills and payments."""
+
+    balance_cents: int
+    bills: tuple[MeridianBill, ...]
+    payments: tuple[MeridianPayment, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MeridianPrices:
+    """An all-day plan's name and prices, in NZD; None where unreadable."""
+
+    plan: str | None
+    daily_charge: Decimal | None
+    anytime: Decimal | None
+
+
+@dataclass(frozen=True, slots=True)
+class BillFigures:
+    """The current bill from Meridian's day totals, in kWh and NZD."""
+
+    usage: Decimal | None = None
+    cost: Decimal | None = None
+    export: Decimal | None = None
+    credit: Decimal | None = None
+    estimate: Decimal | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AccountSyncResult:
+    """
+    Non-sensitive figures for one account; None where unknown.
+
+    ``price_sensors`` says whether the account has price sensors, which
+    exist only for one property and one meter point on an all-day plan:
+    None until Meridian's answer has said.
+    """
+
+    account_key: str
+    billing_period: MeridianBillingPeriod | None
+    has_feed_in: bool
+    bill: BillFigures = BillFigures()
+    total_due: Decimal | None = None
+    credit: Decimal | None = None
+    last_bill: MeridianBill | None = None
+    last_payment: MeridianPayment | None = None
+    price_sensors: bool | None = False
+    prices: MeridianPrices | None = None
 
 
 @dataclass(frozen=True, slots=True)

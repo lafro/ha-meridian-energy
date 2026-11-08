@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, date, datetime, timedelta
+from decimal import Decimal
 from typing import Any
 
 import pytest
@@ -15,7 +16,9 @@ from custom_components.meridian_energy.const import (
     FIREBASE_CUSTOM_TOKEN_URL,
     FIREBASE_REFRESH_URL,
     GRAPHQL_URL,
+    READING_FREQUENCY_DAY,
 )
+from custom_components.meridian_energy.parsers import parse_measurement
 
 from .kraken_fake import FakeKraken, cursor
 from .meridian_http import (
@@ -181,3 +184,31 @@ def test_rows_follow_now_and_a_fixed_history_start() -> None:
     assert after
     assert kraken.history_start == start
     assert kraken.window_rows(date(2025, 12, 1), date(2025, 12, 7)) == []
+
+
+@pytest.mark.parametrize(
+    ("day", "hours"),
+    [(date(2026, 4, 5), 25), (date(2026, 7, 12), 24), (date(2025, 9, 28), 23)],
+)
+def test_a_day_answer_sums_the_new_zealand_dates_hours(day: date, hours: int) -> None:
+    """Each date's node runs from one New Zealand midnight to the next."""
+    kraken = FakeKraken(_NOW, days=400)
+    body = kraken.graphql(
+        _window(
+            ACCOUNT_NUMBER,
+            startOn=day.isoformat(),
+            endOn=day.isoformat(),
+            last=1,
+            readingFrequencyType=READING_FREQUENCY_DAY,
+        )
+    )
+
+    edges = body["data"]["account"]["property"]["measurements"]["edges"]
+    (node,) = (edge["node"] for edge in edges)
+    measurement = parse_measurement(node, "CONSUMPTION", READING_FREQUENCY_DAY)
+    assert measurement.end is not None
+    assert measurement.end - measurement.start == timedelta(hours=hours)
+    assert node["value"] == str(Decimal("0.5") * hours)
+    assert measurement.cost_cents == 15 * hours
+    assert measurement.quality == "ACTUAL"
+    assert kraken.requests[-1]["frequency"] == READING_FREQUENCY_DAY

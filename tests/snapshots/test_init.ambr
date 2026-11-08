@@ -1,4 +1,331 @@
 # serializer version: 1
+# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_anytime_price-entry]
+  EntityRegistryEntrySnapshot({
+    'aliases': list([
+      None,
+    ]),
+    'area_id': None,
+    'capabilities': None,
+    'config_entry_id': <ANY>,
+    'config_subentry_id': <ANY>,
+    'device_class': None,
+    'device_id': <ANY>,
+    'disabled_by': None,
+    'domain': 'sensor',
+    'entity_category': None,
+    'entity_id': 'sensor.meridian_energy_anytime_price',
+    'has_entity_name': True,
+    'hidden_by': None,
+    'icon': None,
+    'id': <ANY>,
+    'labels': set({
+    }),
+    'name': None,
+    'object_id_base': 'Anytime price',
+    'options': dict({
+    }),
+    'original_device_class': None,
+    'original_icon': None,
+    'original_name': 'Anytime price',
+    'platform': 'meridian_energy',
+    'previous_unique_id': None,
+    'suggested_object_id': None,
+    'supported_features': 0,
+    'translation_key': 'anytime_price',
+    'unique_id': '50a5ee17cb00_anytime_price',
+    'unit_of_measurement': 'NZD/kWh',
+  })
+# ---
+# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_anytime_price-state]
+  StateSnapshot({
+    'attributes': ReadOnlyDict({
+      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Meridian Energy Anytime price',
+      'plan': 'Synthetic Plan',
+      <EntityStateAttribute.UNIT_OF_MEASUREMENT: 'unit_of_measurement'>: 'NZD/kWh',
+    }),
+    'context': <ANY>,
+    'entity_id': 'sensor.meridian_energy_anytime_price',
+    'last_changed': <ANY>,
+    'last_reported': <ANY>,
+    'last_updated': <ANY>,
+    'state': '0.3',
+  })
+# ---
+# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_bill_cost_so_far-entry]
+  EntityRegistryEntrySnapshot({
+    'aliases': list([
+      None,
+    ]),
+    'area_id': None,
+    'capabilities': None,
+    'config_entry_id': <ANY>,
+    'config_subentry_id': <ANY>,
+    'device_class': None,
+    'device_id': <ANY>,
+    'disabled_by': None,
+    'domain': 'sensor',
+    'entity_category': None,
+    'entity_id': 'sensor.meridian_energy_bill_cost_so_far',
+    'has_entity_name': True,
+    'hidden_by': None,
+    'icon': None,
+    'id': <ANY>,
+    'labels': set({
+    }),
+    'name': None,
+    'object_id_base': 'Bill cost so far',
+    'options': dict({
+      'sensor': dict({
+        'suggested_display_precision': 2,
+      }),
+    }),
+    'original_device_class': <SensorDeviceClass.MONETARY: 'monetary'>,
+    'original_icon': None,
+    'original_name': 'Bill cost so far',
+    'platform': 'meridian_energy',
+    'previous_unique_id': None,
+    'suggested_object_id': None,
+    'supported_features': 0,
+    'translation_key': 'bill_cost',
+    'unique_id': '50a5ee17cb00_bill_cost',
+    'unit_of_measurement': 'NZD',
+  })
+# ---
+# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_bill_cost_so_far-state]
+  StateSnapshot({
+    'attributes': ReadOnlyDict({
+      <EntityStateAttribute.DEVICE_CLASS: 'device_class'>: 'monetary',
+      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Meridian Energy Bill cost so far',
+      <EntityStateAttribute.UNIT_OF_MEASUREMENT: 'unit_of_measurement'>: 'NZD',
+    }),
+    'context': <ANY>,
+    'entity_id': 'sensor.meridian_energy_bill_cost_so_far',
+    'last_changed': <ANY>,
+    'last_reported': <ANY>,
+    'last_updated': <ANY>,
+    'state': '0.25',
+  })
+# ---
+# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_bill_credit_so_far-entry]
+  EntityRegistryEntrySnapshot({
+    'aliases': list([
+      None,
+    ]),
+    'area_id': None,
+    'capabilities': None,
+    'config_entry_id': <ANY>,
+    'config_subentry_id': <ANY>,
+    'device_class': None,
+    'device_id': <ANY>,
+    'disabled_by': None,
+    'domain': 'sensor',
+    'entity_category': None,
+    'entity_id': 'sensor.meridian_energy_bill_credit_so_far',
+    'has_entity_name': True,
+    'hidden_by': None,
+    'icon': None,
+    'id': <ANY>,
+    'labels': set({
+    }),
+    'name': None,
+    'object_id_base': 'Bill credit so far',
+    'options': dict({
+      'sensor': dict({
+        'suggested_display_precision': 2,
+      }),
+    }),
+    'original_device_class': <SensorDeviceClass.MONETARY: 'monetary'>,
+    'original_icon': None,
+    'original_name': 'Bill credit so far',
+    'platform': 'meridian_energy',
+    'previous_unique_id': None,
+    'suggested_object_id': None,
+    'supported_features': 0,
+    'translation_key': 'bill_credit',
+    'unique_id': '50a5ee17cb00_bill_credit',
+    'unit_of_measurement': 'NZD',
+  })
+# ---
+# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_bill_credit_so_far-state]
+  StateSnapshot({
+    'attributes': ReadOnlyDict({
+      <EntityStateAttribute.DEVICE_CLASS: 'device_class'>: 'monetary',
+      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Meridian Energy Bill credit so far',
+      <EntityStateAttribute.UNIT_OF_MEASUREMENT: 'unit_of_measurement'>: 'NZD',
+    }),
+    'context': <ANY>,
+    'entity_id': 'sensor.meridian_energy_bill_credit_so_far',
+    'last_changed': <ANY>,
+    'last_reported': <ANY>,
+    'last_updated': <ANY>,
+    'state': '0.42',
+  })
+# ---
+# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_bill_estimate-entry]
+  EntityRegistryEntrySnapshot({
+    'aliases': list([
+      None,
+    ]),
+    'area_id': None,
+    'capabilities': None,
+    'config_entry_id': <ANY>,
+    'config_subentry_id': <ANY>,
+    'device_class': None,
+    'device_id': <ANY>,
+    'disabled_by': None,
+    'domain': 'sensor',
+    'entity_category': None,
+    'entity_id': 'sensor.meridian_energy_bill_estimate',
+    'has_entity_name': True,
+    'hidden_by': None,
+    'icon': None,
+    'id': <ANY>,
+    'labels': set({
+    }),
+    'name': None,
+    'object_id_base': 'Bill estimate',
+    'options': dict({
+      'sensor': dict({
+        'suggested_display_precision': 2,
+      }),
+    }),
+    'original_device_class': <SensorDeviceClass.MONETARY: 'monetary'>,
+    'original_icon': None,
+    'original_name': 'Bill estimate',
+    'platform': 'meridian_energy',
+    'previous_unique_id': None,
+    'suggested_object_id': None,
+    'supported_features': 0,
+    'translation_key': 'bill_estimate',
+    'unique_id': '50a5ee17cb00_bill_estimate',
+    'unit_of_measurement': 'NZD',
+  })
+# ---
+# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_bill_estimate-state]
+  StateSnapshot({
+    'attributes': ReadOnlyDict({
+      <EntityStateAttribute.DEVICE_CLASS: 'device_class'>: 'monetary',
+      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Meridian Energy Bill estimate',
+      <EntityStateAttribute.UNIT_OF_MEASUREMENT: 'unit_of_measurement'>: 'NZD',
+    }),
+    'context': <ANY>,
+    'entity_id': 'sensor.meridian_energy_bill_estimate',
+    'last_changed': <ANY>,
+    'last_reported': <ANY>,
+    'last_updated': <ANY>,
+    'state': '80.5',
+  })
+# ---
+# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_bill_export_so_far-entry]
+  EntityRegistryEntrySnapshot({
+    'aliases': list([
+      None,
+    ]),
+    'area_id': None,
+    'capabilities': None,
+    'config_entry_id': <ANY>,
+    'config_subentry_id': <ANY>,
+    'device_class': None,
+    'device_id': <ANY>,
+    'disabled_by': None,
+    'domain': 'sensor',
+    'entity_category': None,
+    'entity_id': 'sensor.meridian_energy_bill_export_so_far',
+    'has_entity_name': True,
+    'hidden_by': None,
+    'icon': None,
+    'id': <ANY>,
+    'labels': set({
+    }),
+    'name': None,
+    'object_id_base': 'Bill export so far',
+    'options': dict({
+      'sensor': dict({
+        'suggested_display_precision': 1,
+      }),
+    }),
+    'original_device_class': <SensorDeviceClass.ENERGY: 'energy'>,
+    'original_icon': None,
+    'original_name': 'Bill export so far',
+    'platform': 'meridian_energy',
+    'previous_unique_id': None,
+    'suggested_object_id': None,
+    'supported_features': 0,
+    'translation_key': 'bill_export',
+    'unique_id': '50a5ee17cb00_bill_export',
+    'unit_of_measurement': <UnitOfEnergy.KILO_WATT_HOUR: 'kWh'>,
+  })
+# ---
+# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_bill_export_so_far-state]
+  StateSnapshot({
+    'attributes': ReadOnlyDict({
+      <EntityStateAttribute.DEVICE_CLASS: 'device_class'>: 'energy',
+      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Meridian Energy Bill export so far',
+      <EntityStateAttribute.UNIT_OF_MEASUREMENT: 'unit_of_measurement'>: <UnitOfEnergy.KILO_WATT_HOUR: 'kWh'>,
+    }),
+    'context': <ANY>,
+    'entity_id': 'sensor.meridian_energy_bill_export_so_far',
+    'last_changed': <ANY>,
+    'last_reported': <ANY>,
+    'last_updated': <ANY>,
+    'state': '2.5',
+  })
+# ---
+# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_bill_usage_so_far-entry]
+  EntityRegistryEntrySnapshot({
+    'aliases': list([
+      None,
+    ]),
+    'area_id': None,
+    'capabilities': None,
+    'config_entry_id': <ANY>,
+    'config_subentry_id': <ANY>,
+    'device_class': None,
+    'device_id': <ANY>,
+    'disabled_by': None,
+    'domain': 'sensor',
+    'entity_category': None,
+    'entity_id': 'sensor.meridian_energy_bill_usage_so_far',
+    'has_entity_name': True,
+    'hidden_by': None,
+    'icon': None,
+    'id': <ANY>,
+    'labels': set({
+    }),
+    'name': None,
+    'object_id_base': 'Bill usage so far',
+    'options': dict({
+      'sensor': dict({
+        'suggested_display_precision': 1,
+      }),
+    }),
+    'original_device_class': <SensorDeviceClass.ENERGY: 'energy'>,
+    'original_icon': None,
+    'original_name': 'Bill usage so far',
+    'platform': 'meridian_energy',
+    'previous_unique_id': None,
+    'suggested_object_id': None,
+    'supported_features': 0,
+    'translation_key': 'bill_usage',
+    'unique_id': '50a5ee17cb00_bill_usage',
+    'unit_of_measurement': <UnitOfEnergy.KILO_WATT_HOUR: 'kWh'>,
+  })
+# ---
+# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_bill_usage_so_far-state]
+  StateSnapshot({
+    'attributes': ReadOnlyDict({
+      <EntityStateAttribute.DEVICE_CLASS: 'device_class'>: 'energy',
+      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Meridian Energy Bill usage so far',
+      <EntityStateAttribute.UNIT_OF_MEASUREMENT: 'unit_of_measurement'>: <UnitOfEnergy.KILO_WATT_HOUR: 'kWh'>,
+    }),
+    'context': <ANY>,
+    'entity_id': 'sensor.meridian_energy_bill_usage_so_far',
+    'last_changed': <ANY>,
+    'last_reported': <ANY>,
+    'last_updated': <ANY>,
+    'state': '1',
+  })
+# ---
 # name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_billing_period_end-entry]
   EntityRegistryEntrySnapshot({
     'aliases': list([
@@ -101,7 +428,7 @@
     'state': '2026-07-01',
   })
 # ---
-# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_current_bill_cost-entry]
+# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_daily_charge-entry]
   EntityRegistryEntrySnapshot({
     'aliases': list([
       None,
@@ -115,7 +442,7 @@
     'disabled_by': None,
     'domain': 'sensor',
     'entity_category': None,
-    'entity_id': 'sensor.meridian_energy_current_bill_cost',
+    'entity_id': 'sensor.meridian_energy_daily_charge',
     'has_entity_name': True,
     'hidden_by': None,
     'icon': None,
@@ -123,44 +450,37 @@
     'labels': set({
     }),
     'name': None,
-    'object_id_base': 'Current bill cost',
+    'object_id_base': 'Daily charge',
     'options': dict({
-      'sensor': dict({
-        'suggested_display_precision': 2,
-      }),
     }),
-    'original_device_class': <SensorDeviceClass.MONETARY: 'monetary'>,
+    'original_device_class': None,
     'original_icon': None,
-    'original_name': 'Current bill cost',
+    'original_name': 'Daily charge',
     'platform': 'meridian_energy',
     'previous_unique_id': None,
     'suggested_object_id': None,
     'supported_features': 0,
-    'translation_key': 'current_bill_cost',
-    'unique_id': '50a5ee17cb00_current_bill_cost',
-    'unit_of_measurement': 'NZD',
+    'translation_key': 'daily_charge',
+    'unique_id': '50a5ee17cb00_daily_charge',
+    'unit_of_measurement': 'NZD/day',
   })
 # ---
-# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_current_bill_cost-state]
+# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_daily_charge-state]
   StateSnapshot({
     'attributes': ReadOnlyDict({
-      'billing_period_end': HAFakeDate(2026, 7, 31),
-      'billing_period_start': HAFakeDate(2026, 7, 1),
-      'data_complete': True,
-      <EntityStateAttribute.DEVICE_CLASS: 'device_class'>: 'monetary',
-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Meridian Energy Current bill cost',
-      'next_billing_date': HAFakeDate(2026, 8, 1),
-      <EntityStateAttribute.UNIT_OF_MEASUREMENT: 'unit_of_measurement'>: 'NZD',
+      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Meridian Energy Daily charge',
+      'plan': 'Synthetic Plan',
+      <EntityStateAttribute.UNIT_OF_MEASUREMENT: 'unit_of_measurement'>: 'NZD/day',
     }),
     'context': <ANY>,
-    'entity_id': 'sensor.meridian_energy_current_bill_cost',
+    'entity_id': 'sensor.meridian_energy_daily_charge',
     'last_changed': <ANY>,
     'last_reported': <ANY>,
     'last_updated': <ANY>,
-    'state': '0.25',
+    'state': '2',
   })
 # ---
-# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_current_bill_export-entry]
+# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_last_bill-entry]
   EntityRegistryEntrySnapshot({
     'aliases': list([
       None,
@@ -174,7 +494,7 @@
     'disabled_by': None,
     'domain': 'sensor',
     'entity_category': None,
-    'entity_id': 'sensor.meridian_energy_current_bill_export',
+    'entity_id': 'sensor.meridian_energy_last_bill',
     'has_entity_name': True,
     'hidden_by': None,
     'icon': None,
@@ -182,159 +502,35 @@
     'labels': set({
     }),
     'name': None,
-    'object_id_base': 'Current bill export',
+    'object_id_base': 'Last bill',
     'options': dict({
-      'sensor': dict({
-        'suggested_display_precision': 1,
-      }),
     }),
-    'original_device_class': <SensorDeviceClass.ENERGY: 'energy'>,
+    'original_device_class': <SensorDeviceClass.DATE: 'date'>,
     'original_icon': None,
-    'original_name': 'Current bill export',
+    'original_name': 'Last bill',
     'platform': 'meridian_energy',
     'previous_unique_id': None,
     'suggested_object_id': None,
     'supported_features': 0,
-    'translation_key': 'current_bill_export',
-    'unique_id': '50a5ee17cb00_current_bill_export',
-    'unit_of_measurement': <UnitOfEnergy.KILO_WATT_HOUR: 'kWh'>,
+    'translation_key': 'last_bill',
+    'unique_id': '50a5ee17cb00_last_bill',
+    'unit_of_measurement': None,
   })
 # ---
-# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_current_bill_export-state]
+# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_last_bill-state]
   StateSnapshot({
     'attributes': ReadOnlyDict({
-      'billing_period_end': HAFakeDate(2026, 7, 31),
-      'billing_period_start': HAFakeDate(2026, 7, 1),
-      'data_complete': True,
-      <EntityStateAttribute.DEVICE_CLASS: 'device_class'>: 'energy',
-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Meridian Energy Current bill export',
-      'next_billing_date': HAFakeDate(2026, 8, 1),
-      <EntityStateAttribute.UNIT_OF_MEASUREMENT: 'unit_of_measurement'>: <UnitOfEnergy.KILO_WATT_HOUR: 'kWh'>,
+      <EntityStateAttribute.DEVICE_CLASS: 'device_class'>: 'date',
+      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Meridian Energy Last bill',
+      'period_end': HAFakeDate(2026, 6, 30),
+      'period_start': HAFakeDate(2026, 6, 1),
     }),
     'context': <ANY>,
-    'entity_id': 'sensor.meridian_energy_current_bill_export',
+    'entity_id': 'sensor.meridian_energy_last_bill',
     'last_changed': <ANY>,
     'last_reported': <ANY>,
     'last_updated': <ANY>,
-    'state': '2.5',
-  })
-# ---
-# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_current_bill_export_credit-entry]
-  EntityRegistryEntrySnapshot({
-    'aliases': list([
-      None,
-    ]),
-    'area_id': None,
-    'capabilities': None,
-    'config_entry_id': <ANY>,
-    'config_subentry_id': <ANY>,
-    'device_class': None,
-    'device_id': <ANY>,
-    'disabled_by': None,
-    'domain': 'sensor',
-    'entity_category': None,
-    'entity_id': 'sensor.meridian_energy_current_bill_export_credit',
-    'has_entity_name': True,
-    'hidden_by': None,
-    'icon': None,
-    'id': <ANY>,
-    'labels': set({
-    }),
-    'name': None,
-    'object_id_base': 'Current bill export credit',
-    'options': dict({
-      'sensor': dict({
-        'suggested_display_precision': 2,
-      }),
-    }),
-    'original_device_class': <SensorDeviceClass.MONETARY: 'monetary'>,
-    'original_icon': None,
-    'original_name': 'Current bill export credit',
-    'platform': 'meridian_energy',
-    'previous_unique_id': None,
-    'suggested_object_id': None,
-    'supported_features': 0,
-    'translation_key': 'current_bill_credit',
-    'unique_id': '50a5ee17cb00_current_bill_credit',
-    'unit_of_measurement': 'NZD',
-  })
-# ---
-# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_current_bill_export_credit-state]
-  StateSnapshot({
-    'attributes': ReadOnlyDict({
-      'billing_period_end': HAFakeDate(2026, 7, 31),
-      'billing_period_start': HAFakeDate(2026, 7, 1),
-      'data_complete': True,
-      <EntityStateAttribute.DEVICE_CLASS: 'device_class'>: 'monetary',
-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Meridian Energy Current bill export credit',
-      'next_billing_date': HAFakeDate(2026, 8, 1),
-      <EntityStateAttribute.UNIT_OF_MEASUREMENT: 'unit_of_measurement'>: 'NZD',
-    }),
-    'context': <ANY>,
-    'entity_id': 'sensor.meridian_energy_current_bill_export_credit',
-    'last_changed': <ANY>,
-    'last_reported': <ANY>,
-    'last_updated': <ANY>,
-    'state': '0.42',
-  })
-# ---
-# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_current_bill_usage-entry]
-  EntityRegistryEntrySnapshot({
-    'aliases': list([
-      None,
-    ]),
-    'area_id': None,
-    'capabilities': None,
-    'config_entry_id': <ANY>,
-    'config_subentry_id': <ANY>,
-    'device_class': None,
-    'device_id': <ANY>,
-    'disabled_by': None,
-    'domain': 'sensor',
-    'entity_category': None,
-    'entity_id': 'sensor.meridian_energy_current_bill_usage',
-    'has_entity_name': True,
-    'hidden_by': None,
-    'icon': None,
-    'id': <ANY>,
-    'labels': set({
-    }),
-    'name': None,
-    'object_id_base': 'Current bill usage',
-    'options': dict({
-      'sensor': dict({
-        'suggested_display_precision': 1,
-      }),
-    }),
-    'original_device_class': <SensorDeviceClass.ENERGY: 'energy'>,
-    'original_icon': None,
-    'original_name': 'Current bill usage',
-    'platform': 'meridian_energy',
-    'previous_unique_id': None,
-    'suggested_object_id': None,
-    'supported_features': 0,
-    'translation_key': 'current_bill_usage',
-    'unique_id': '50a5ee17cb00_current_bill_usage',
-    'unit_of_measurement': <UnitOfEnergy.KILO_WATT_HOUR: 'kWh'>,
-  })
-# ---
-# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_current_bill_usage-state]
-  StateSnapshot({
-    'attributes': ReadOnlyDict({
-      'billing_period_end': HAFakeDate(2026, 7, 31),
-      'billing_period_start': HAFakeDate(2026, 7, 1),
-      'data_complete': True,
-      <EntityStateAttribute.DEVICE_CLASS: 'device_class'>: 'energy',
-      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Meridian Energy Current bill usage',
-      'next_billing_date': HAFakeDate(2026, 8, 1),
-      <EntityStateAttribute.UNIT_OF_MEASUREMENT: 'unit_of_measurement'>: <UnitOfEnergy.KILO_WATT_HOUR: 'kWh'>,
-    }),
-    'context': <ANY>,
-    'entity_id': 'sensor.meridian_energy_current_bill_usage',
-    'last_changed': <ANY>,
-    'last_reported': <ANY>,
-    'last_updated': <ANY>,
-    'state': '1',
+    'state': '2026-07-03',
   })
 # ---
 # name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_last_data_update-entry]
@@ -386,6 +582,63 @@
     'last_reported': <ANY>,
     'last_updated': <ANY>,
     'state': '2026-07-15T01:00:00+00:00',
+  })
+# ---
+# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_last_payment-entry]
+  EntityRegistryEntrySnapshot({
+    'aliases': list([
+      None,
+    ]),
+    'area_id': None,
+    'capabilities': None,
+    'config_entry_id': <ANY>,
+    'config_subentry_id': <ANY>,
+    'device_class': None,
+    'device_id': <ANY>,
+    'disabled_by': None,
+    'domain': 'sensor',
+    'entity_category': None,
+    'entity_id': 'sensor.meridian_energy_last_payment',
+    'has_entity_name': True,
+    'hidden_by': None,
+    'icon': None,
+    'id': <ANY>,
+    'labels': set({
+    }),
+    'name': None,
+    'object_id_base': 'Last payment',
+    'options': dict({
+      'sensor': dict({
+        'suggested_display_precision': 2,
+      }),
+    }),
+    'original_device_class': <SensorDeviceClass.MONETARY: 'monetary'>,
+    'original_icon': None,
+    'original_name': 'Last payment',
+    'platform': 'meridian_energy',
+    'previous_unique_id': None,
+    'suggested_object_id': None,
+    'supported_features': 0,
+    'translation_key': 'last_payment',
+    'unique_id': '50a5ee17cb00_last_payment',
+    'unit_of_measurement': 'NZD',
+  })
+# ---
+# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_last_payment-state]
+  StateSnapshot({
+    'attributes': ReadOnlyDict({
+      'date': HAFakeDate(2026, 7, 5),
+      <EntityStateAttribute.DEVICE_CLASS: 'device_class'>: 'monetary',
+      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Meridian Energy Last payment',
+      'status': 'CLEARED',
+      <EntityStateAttribute.UNIT_OF_MEASUREMENT: 'unit_of_measurement'>: 'NZD',
+    }),
+    'context': <ANY>,
+    'entity_id': 'sensor.meridian_energy_last_payment',
+    'last_changed': <ANY>,
+    'last_reported': <ANY>,
+    'last_updated': <ANY>,
+    'state': '50',
   })
 # ---
 # name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_latest_usage_data-entry]
@@ -549,5 +802,61 @@
     'last_reported': <ANY>,
     'last_updated': <ANY>,
     'state': '0',
+  })
+# ---
+# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_total_due-entry]
+  EntityRegistryEntrySnapshot({
+    'aliases': list([
+      None,
+    ]),
+    'area_id': None,
+    'capabilities': None,
+    'config_entry_id': <ANY>,
+    'config_subentry_id': <ANY>,
+    'device_class': None,
+    'device_id': <ANY>,
+    'disabled_by': None,
+    'domain': 'sensor',
+    'entity_category': None,
+    'entity_id': 'sensor.meridian_energy_total_due',
+    'has_entity_name': True,
+    'hidden_by': None,
+    'icon': None,
+    'id': <ANY>,
+    'labels': set({
+    }),
+    'name': None,
+    'object_id_base': 'Total due',
+    'options': dict({
+      'sensor': dict({
+        'suggested_display_precision': 2,
+      }),
+    }),
+    'original_device_class': <SensorDeviceClass.MONETARY: 'monetary'>,
+    'original_icon': None,
+    'original_name': 'Total due',
+    'platform': 'meridian_energy',
+    'previous_unique_id': None,
+    'suggested_object_id': None,
+    'supported_features': 0,
+    'translation_key': 'total_due',
+    'unique_id': '50a5ee17cb00_total_due',
+    'unit_of_measurement': 'NZD',
+  })
+# ---
+# name: TestPublicConfigEntryLifecycle.test_entity_snapshot[sensor.meridian_energy_total_due-state]
+  StateSnapshot({
+    'attributes': ReadOnlyDict({
+      'credit': None,
+      <EntityStateAttribute.DEVICE_CLASS: 'device_class'>: 'monetary',
+      <EntityStateAttribute.FRIENDLY_NAME: 'friendly_name'>: 'Meridian Energy Total due',
+      <EntityStateAttribute.UNIT_OF_MEASUREMENT: 'unit_of_measurement'>: 'NZD',
+    }),
+    'context': <ANY>,
+    'entity_id': 'sensor.meridian_energy_total_due',
+    'last_changed': <ANY>,
+    'last_reported': <ANY>,
+    'last_updated': <ANY>,
+    'state': '40',
   })
 # ---

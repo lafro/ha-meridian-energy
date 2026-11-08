@@ -12,6 +12,8 @@ AUTH_GRAPHQL_CODES = frozenset(
     {"KT-CT-1111", "KT-CT-1112", "KT-CT-1120", "KT-CT-1124", "KT-CT-1143"}
 )
 _ERROR_CODE_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,64}")
+# The form of Kraken's own codes: only these are ever shown.
+_KRAKEN_CODE_PATTERN = re.compile(r"KT-[A-Z]{2}-\d{4}")
 # What an error without a stable code is named, a failure inside the service say.
 UNKNOWN_ERROR_CODE = "UNKNOWN"
 
@@ -25,6 +27,22 @@ def graphql_error_code(error: dict[str, Any]) -> str:
     if not isinstance(code, str) or _ERROR_CODE_PATTERN.fullmatch(code) is None:
         return UNKNOWN_ERROR_CODE
     return code
+
+
+def shown_codes(codes: Iterable[str]) -> list[str]:
+    """
+    Return codes as logs, messages and diagnostics show them, once each.
+
+    Only a code in Kraken's own form is shown; any other, which could carry
+    an identifier, reads "an error code". Codes without one are left out.
+    """
+    return list(
+        dict.fromkeys(
+            code if _KRAKEN_CODE_PATTERN.fullmatch(code) else "an error code"
+            for code in codes
+            if code != UNKNOWN_ERROR_CODE
+        )
+    )
 
 
 def is_service_failure(codes: Iterable[str]) -> bool:
@@ -75,15 +93,15 @@ RATE_LIMIT_CODE = "KT-CT-1199"
 QUERY_LIMIT_CODES = frozenset({"KT-CT-1188", "KT-CT-1189"})
 
 
-def measurements_operation(graphql_url: str) -> tuple[str, str]:
-    """
-    Return the measurements query's operation name and the URL it is sent to.
+def web_app_url(graphql_url: str, name: str) -> str:
+    """Return the URL the web app sends an operation to: ``?opName=<name>``."""
+    return f"{graphql_url}?opName={name}"
 
-    Meridian's web app names its usage query GetMeasurements and adds
-    ``?opName=GetMeasurements`` to the GraphQL URL; so does the integration.
-    """
+
+def measurements_operation(graphql_url: str) -> tuple[str, str]:
+    """Return the measurements query's web-app name and the URL it is sent to."""
     name = "GetMeasurements"
-    return name, f"{graphql_url}?opName={name}"
+    return name, web_app_url(graphql_url, name)
 
 
 def measurements_query(operation_name: str) -> str:
@@ -164,6 +182,43 @@ query billingPeriods($accountNumber: String!) {
       currentBillingPeriodEndDate
       nextBillingDate
       periodStartDay
+    }
+  }
+}
+"""
+
+
+# The web app's balance query, trimmed to what the sensors show: no bill
+# link, address or identifiers.
+BALANCE_NAME = "GetAccountBalance"
+BALANCE_QUERY = """
+query GetAccountBalance($accountNumber: String!) {
+  account(accountNumber: $accountNumber) {
+    payments(first: 20) { edges { node { amount paymentDate status } } }
+    bills(first: 1) { edges { node { fromDate toDate issuedDate } } }
+    balance(includeAllLedgers: true)
+  }
+}
+"""
+
+# The web app's plan query, trimmed to the current agreement's rates.
+PRICES_NAME = "GetAccountPropertyAgreements"
+PRICES_QUERY = """
+query GetAccountPropertyAgreements($accountNumber: String!, $propertyId: ID!) {
+  account(accountNumber: $accountNumber) {
+    property(id: $propertyId) {
+      meterPoints {
+        activeAgreement {
+          displayName
+          rates {
+            hasDiscount
+            formattedRateIncludingTax
+            formattedRateIncludingTaxIncludingDiscount
+            bandCategory
+            touBucketName
+          }
+        }
+      }
     }
   }
 }

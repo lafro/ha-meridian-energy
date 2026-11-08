@@ -4,17 +4,35 @@
       "estimated_readings": {
         "default": "mdi:progress-clock"
       },
-      "current_bill_usage": {
+      "bill_usage": {
         "default": "mdi:transmission-tower-import"
       },
-      "current_bill_cost": {
+      "bill_cost": {
         "default": "mdi:cash-clock"
       },
-      "current_bill_export": {
+      "bill_export": {
         "default": "mdi:transmission-tower-export"
       },
-      "current_bill_credit": {
+      "bill_credit": {
         "default": "mdi:cash-plus"
+      },
+      "bill_estimate": {
+        "default": "mdi:cash-fast"
+      },
+      "total_due": {
+        "default": "mdi:cash-register"
+      },
+      "last_bill": {
+        "default": "mdi:receipt-text"
+      },
+      "last_payment": {
+        "default": "mdi:cash-check"
+      },
+      "daily_charge": {
+        "default": "mdi:calendar-today"
+      },
+      "anytime_price": {
+        "default": "mdi:lightning-bolt"
       }
     }
   }

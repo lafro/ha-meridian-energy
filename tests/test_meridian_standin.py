@@ -25,6 +25,11 @@ from custom_components.meridian_energy.const import (
     FIREBASE_REFRESH_URL,
     GRAPHQL_URL,
 )
+from custom_components.meridian_energy.graphql import (
+    BALANCE_NAME,
+    PRICES_NAME,
+    web_app_url,
+)
 
 from . import meridian_standin
 from .meridian_http import MEASUREMENTS_NAME, MEASUREMENTS_URL, property_id
@@ -136,6 +141,8 @@ def test_a_scenario_round_trips_and_keeps_defaults() -> None:
     scenario = Scenario(
         accounts=("A-TEST-1", "A-TEST-2"),
         feed_in=("A-TEST-2",),
+        credit=("A-TEST-1",),
+        failing_figures=("billingPeriods", "days", "prices"),
         measurements_status=504,
         measurements_page="html",
         failing_directions=("GENERATION",),
@@ -146,6 +153,8 @@ def test_a_scenario_round_trips_and_keeps_defaults() -> None:
     assert Scenario.from_json({}) == Scenario()
     with pytest.raises(ValueError, match="json or html"):
         Scenario.from_json({"measurements_page": "xml"})
+    with pytest.raises(ValueError, match="failing_figures are among"):
+        Scenario.from_json({"failing_figures": ["balance"]})
 
 
 @pytest.mark.parametrize(
@@ -226,6 +235,111 @@ async def test_the_integrations_requests_are_answered_by_the_fake(
     assert all(record["status"] == 200 for record in journal)
     assert "person@example.com" not in (folder / meridian_standin.JOURNAL).read_text()
     assert _refused(folder) == []
+
+
+@pytest.mark.parametrize(
+    ("now", "month"),
+    [
+        # 11:30 pm on 31 July in New Zealand, then half past midnight on 1 August.
+        (datetime(2026, 7, 31, 11, 30, tzinfo=UTC), ("2026-07-01", "2026-07-31")),
+        (datetime(2026, 7, 31, 12, 30, tzinfo=UTC), ("2026-08-01", "2026-08-31")),
+        (datetime(2026, 12, 15, tzinfo=UTC), ("2026-12-01", "2026-12-31")),
+        (datetime(2028, 2, 10, tzinfo=UTC), ("2028-02-01", "2028-02-29")),
+    ],
+)
+def test_the_billing_period_is_the_new_zealand_month(
+    now: datetime, month: tuple[str, str]
+) -> None:
+    first, last = meridian_standin.billing_month(now)
+    assert (first.isoformat(), last.isoformat()) == month
+
+
+async def test_the_other_figures_are_answered_and_day_requests_journalled(
+    standin: StandIn, folder: Path
+) -> None:
+    del standin
+    _scenario(folder, Scenario())
+    billing = {"accountNumber": "A-TEST-1"}
+    status, body = await _post(GRAPHQL_URL, json=_graphql("billingPeriods", billing))
+    options = json.loads(body)["data"]["account"]["billingOptions"]
+    first, last = meridian_standin.billing_month(datetime.now(UTC))
+    assert status == 200
+    assert options["currentBillingPeriodStartDate"] == first.isoformat()
+    assert options["currentBillingPeriodEndDate"] == last.isoformat()
+    for name in (BALANCE_NAME, PRICES_NAME):
+        variables = {"accountNumber": "A-TEST-1", "propertyId": property_id("A-TEST-1")}
+        status, _body = await _post(
+            web_app_url(GRAPHQL_URL, name), json=_graphql(name, variables)
+        )
+        assert status == 200
+    days = _window("A-TEST-1") | {
+        "startOn": first.isoformat(),
+        "endOn": last.isoformat(),
+        "readingFrequencyType": "DAY_INTERVAL",
+        "last": 31,
+    }
+    status, _body = await _post(
+        MEASUREMENTS_URL, json=_graphql(MEASUREMENTS_NAME, days)
+    )
+    assert status == 200
+    journal = _journal(folder)
+    assert [record["operation"] for record in journal] == [
+        "billingPeriods",
+        BALANCE_NAME,
+        PRICES_NAME,
+        "measurements",
+    ]
+    assert journal[-1]["frequency"] == "DAY_INTERVAL"
+    assert _refused(folder) == []
+
+
+async def test_figures_fail_and_an_account_is_in_credit_as_the_scenario_says(
+    standin: StandIn, folder: Path
+) -> None:
+    del standin
+    _scenario(
+        folder,
+        Scenario(
+            accounts=("A-TEST-1", "A-TEST-2"),
+            credit=("A-TEST-2",),
+            failing_figures=("billingPeriods", "days", "prices"),
+        ),
+    )
+    first, last = meridian_standin.billing_month(datetime.now(UTC))
+    days = _window("A-TEST-1") | {
+        "startOn": first.isoformat(),
+        "endOn": last.isoformat(),
+        "readingFrequencyType": "DAY_INTERVAL",
+        "last": 31,
+    }
+    account = {"accountNumber": "A-TEST-1", "propertyId": property_id("A-TEST-1")}
+    for url, body in (
+        (GRAPHQL_URL, _graphql("billingPeriods", account)),
+        (MEASUREMENTS_URL, _graphql(MEASUREMENTS_NAME, days)),
+        (web_app_url(GRAPHQL_URL, PRICES_NAME), _graphql(PRICES_NAME, account)),
+    ):
+        status, answer = await _post(url, json=body)
+        assert status == 503
+        assert json.loads(answer)["errors"]
+    hours = _graphql(MEASUREMENTS_NAME, _window("A-TEST-1"))
+    assert (await _post(MEASUREMENTS_URL, json=hours))[0] == 200
+    balances = []
+    for number in ("A-TEST-1", "A-TEST-2"):
+        status, answer = await _post(
+            web_app_url(GRAPHQL_URL, BALANCE_NAME),
+            json=_graphql(BALANCE_NAME, {"accountNumber": number}),
+        )
+        assert status == 200
+        balances.append(json.loads(answer)["data"]["account"]["balance"])
+    assert balances == [-4000, 1250]
+    assert [record["status"] for record in _journal(folder)] == [
+        503,
+        503,
+        503,
+        200,
+        200,
+        200,
+    ]
 
 
 async def test_measurements_fail_as_the_scenario_says(

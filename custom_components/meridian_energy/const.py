@@ -37,6 +37,11 @@ MEASUREMENTS_TIMEOUT_SECONDS = 75
 UPDATE_INTERVAL = timedelta(hours=1)
 TOPOLOGY_CACHE_INTERVAL = timedelta(days=1)
 BILLING_CACHE_INTERVAL = timedelta(days=1)
+# How often each account's other figures are asked for: the bill's day
+# totals, the balance, and the prices.
+BILL_DAYS_INTERVAL = timedelta(hours=6)
+BALANCE_INTERVAL = timedelta(hours=6)
+PRICES_INTERVAL = timedelta(days=1)
 # Every measurements request asks for one window of whole New Zealand dates,
 # both ends included, at most this many dates long.
 WINDOW_DAYS = 7
@@ -80,6 +85,7 @@ STAT_GENERATION_CREDIT = "generation_credit"
 READING_CONSUMPTION = "CONSUMPTION"
 READING_GENERATION = "GENERATION"
 READING_FREQUENCY_HOUR = "HOUR_INTERVAL"
+READING_FREQUENCY_DAY = "DAY_INTERVAL"
 READING_QUALITY_COMBINED = "COMBINED"
 AGGREGATE_CHANNEL_ID = "aggregate"
 

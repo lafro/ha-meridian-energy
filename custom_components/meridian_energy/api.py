@@ -37,13 +37,19 @@ from .graphql import (
     AUTH_GRAPHQL_CODES as _AUTH_GRAPHQL_CODES,
 )
 from .graphql import (
-    BILLING_PERIODS_QUERY as _BILLING_PERIODS_QUERY,
-)
-from .graphql import (
+    BALANCE_NAME,
+    BALANCE_QUERY,
+    PRICES_NAME,
+    PRICES_QUERY,
     RATE_LIMIT_CODE,
     UNKNOWN_ERROR_CODE,
     measurements_operation,
     measurements_query,
+    shown_codes,
+    web_app_url,
+)
+from .graphql import (
+    BILLING_PERIODS_QUERY as _BILLING_PERIODS_QUERY,
 )
 from .graphql import (
     graphql_error_code as _graphql_error_code,
@@ -51,9 +57,11 @@ from .graphql import (
 from .models import (
     MeasurementPage,
     MeridianAccount,
+    MeridianBalance,
     MeridianBillingPeriod,
     MeridianMeasurement,
     MeridianMeterPoint,
+    MeridianPrices,
     MeridianProperty,
     MeridianTokenSet,
     require_list,
@@ -61,7 +69,9 @@ from .models import (
 )
 from .parsers import (
     TokenParseError,
+    parse_balance,
     parse_firebase_tokens,
+    parse_prices,
 )
 from .parsers import (
     optional_date as _optional_date,
@@ -207,8 +217,8 @@ class MeridianRejectedError(MeridianConnectionError):
 
     @property
     def detail(self) -> str:
-        """Describe the refusal without identifiers, as in ``HTTP 400, KT-CT-1``."""
-        return ", ".join((f"HTTP {self.status}", *self.codes))
+        """Describe the refusal without identifiers, as in ``HTTP 400, KT-CT-1234``."""
+        return ", ".join((f"HTTP {self.status}", *shown_codes(self.codes)))
 
 
 class MeridianAuthenticationError(MeridianError):
@@ -235,13 +245,14 @@ class MeridianGraphQLError(MeridianError):
     """
     Meridian returned a GraphQL error.
 
-    The message names the operation and its upstream error codes, which are
-    validated and carry no identifiers (``graphql_error_code``); the free-text
-    messages that came with them are never kept.
+    The message names the operation and its upstream error codes as
+    ``shown_codes`` shows them; the free-text messages that came with them
+    are never kept.
     """
 
     def __init__(self, operation: str, codes: tuple[str, ...]) -> None:
-        detail = f" ({', '.join(codes)})" if codes else ""
+        shown = shown_codes(codes)
+        detail = f" ({', '.join(shown)})" if shown else ""
         super().__init__(f"Meridian GraphQL operation {operation} failed{detail}")
         self.operation = operation
         self.codes = codes
@@ -486,10 +497,11 @@ class MeridianApiClient:
         end_on: date,
         last: int,
         before: str | None = None,
+        frequency: str = READING_FREQUENCY_HOUR,
         context: str = "",
     ) -> MeasurementPage:
         """
-        Return one backwards page of hourly measurements inside a window.
+        Return one backwards page of measurements, hours or days, in a window.
 
         The window is ``start_on`` to ``end_on``, New Zealand dates, both
         included. Every page of a window sends both bounds and ``last``; a
@@ -505,7 +517,7 @@ class MeridianApiClient:
             "last": last,
             "startOn": start_on.isoformat(),
             "endOn": end_on.isoformat(),
-            "readingFrequencyType": READING_FREQUENCY_HOUR,
+            "readingFrequencyType": frequency,
             "readingDirectionType": direction,
             "readingQualityType": READING_QUALITY_COMBINED,
         }
@@ -530,7 +542,7 @@ class MeridianApiClient:
         for edge_value in require_list(connection.get("edges"), "measurements.edges"):
             edge = require_mapping(edge_value, "measurement edge")
             node = require_mapping(edge.get("node"), "measurement node")
-            measurements.append(_parse_measurement(node, direction))
+            measurements.append(_parse_measurement(node, direction, frequency))
 
         return MeasurementPage(
             measurements=tuple(measurements),
@@ -547,6 +559,7 @@ class MeridianApiClient:
         start_on: date,
         end_on: date,
         last: int,
+        frequency: str = READING_FREQUENCY_HOUR,
         pace: Callable[[], Awaitable[None]] | None = None,
         context: str = "",
     ) -> tuple[MeridianMeasurement, ...]:
@@ -571,6 +584,7 @@ class MeridianApiClient:
                 end_on=end_on,
                 last=last,
                 before=before,
+                frequency=frequency,
                 context=f"{context} page={page_number}".strip(),
             )
             rows.extend(page.measurements)
@@ -623,6 +637,31 @@ class MeridianApiClient:
             next_billing_date=_optional_date(options.get("nextBillingDate")),
             period_start_day=start_day,
         )
+
+    async def async_get_balance(self, account_number: str) -> MeridianBalance:
+        """Return an account's balance, last bill and recent payments."""
+        data = await self._async_graphql(
+            "balance",
+            BALANCE_QUERY,
+            {"accountNumber": account_number},
+            operation_name=BALANCE_NAME,
+            url=web_app_url(GRAPHQL_URL, BALANCE_NAME),
+        )
+        return parse_balance(require_mapping(data.get("account"), "balance account"))
+
+    async def async_get_prices(
+        self, account_number: str, property_id: str
+    ) -> MeridianPrices | None:
+        """Return a property's all-day prices, or None for any other plan."""
+        data = await self._async_graphql(
+            "prices",
+            PRICES_QUERY,
+            {"accountNumber": account_number, "propertyId": property_id},
+            operation_name=PRICES_NAME,
+            url=web_app_url(GRAPHQL_URL, PRICES_NAME),
+        )
+        account = require_mapping(data.get("account"), "prices account")
+        return parse_prices(require_mapping(account.get("property"), "prices property"))
 
     async def _async_graphql(  # noqa: C901 - one branch per kind of answer
         self,
@@ -690,7 +729,7 @@ class MeridianApiClient:
                 _LOGGER.debug(
                     "Meridian GraphQL operation %s failed with codes %s",
                     operation,
-                    ",".join(codes),
+                    ",".join(shown_codes(codes)) or "none",
                 )
                 if RATE_LIMIT_CODE in codes:
                     raise MeridianRateLimitError(DEFAULT_RETRY_AFTER_SECONDS)

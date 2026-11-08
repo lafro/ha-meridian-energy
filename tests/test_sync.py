@@ -341,18 +341,23 @@ async def test_requests_are_paced_a_second_apart(
 
 
 @pytest.mark.parametrize(
-    "failure",
+    ("failure", "detail"),
     [
-        _GATEWAY_PAGE,
-        json_response({}, status=503),
-        json_response({}, status=524),
-        Response(b"", error=ClientConnectionError()),
-        Response(b"", error=TimeoutError()),
+        (_GATEWAY_PAGE, "HTTP 504"),
+        (json_response({}, status=503), "HTTP 503"),
+        (json_response({}, status=524), "HTTP 524"),
+        (Response(b"", error=ClientConnectionError()), "network error"),
+        (Response(b"", error=TimeoutError()), "timed out"),
     ],
 )
 async def test_a_passing_failure_is_resent_once_after_a_short_wait(
-    hass: HomeAssistant, waits: Any, failure: Response
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+    waits: Any,
+    failure: Response,
+    detail: str,
 ) -> None:
+    caplog.set_level(logging.DEBUG)
     session = FakeMeridianSession(NOW)
     failures = iter([failure])
     session.hook = lambda operation, _variables: (
@@ -366,6 +371,7 @@ async def test_a_passing_failure_is_resent_once_after_a_short_wait(
     resend = [call.args[0] for call in waits.await_args_list if call.args[0] > 1]
     assert len(resend) == 1
     assert 2 <= resend[0] <= 5
+    assert f"Resending a request that failed ({detail})" in caplog.messages
 
 
 @pytest.mark.parametrize("status", [500, 400])
@@ -1140,42 +1146,6 @@ async def test_the_sync_summary_counts_estimates_from_the_recent_qualities(
     assert result.newest_estimated == NOW - HOUR * 1.5
     assert result.latest_reading == NOW - HOUR / 2
     assert dict(result.quality_counts) == {"ACTUAL": 20 * 24 - 3, "ESTIMATE": 15}
-
-
-async def test_billing_failures_keep_the_cached_period_and_a_rate_limit_waits(
-    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
-) -> None:
-    caplog.set_level(logging.INFO)
-    session = FakeMeridianSession(NOW)
-    coordinator = coordinator_for(hass, session)
-    data = await sync(coordinator, NOW, session)
-    period = data.account_results[0].billing_period
-    assert period is not None
-
-    session.hook = lambda operation, _variables: (
-        json_response({}, status=503) if operation == "billingPeriods" else None
-    )
-    data = await sync(coordinator, NOW + DAY, session)
-    assert data.account_results[0].billing_period == period
-    assert coordinator.billing_metadata_unavailable_count == 1
-
-    session.hook = lambda operation, _variables: (
-        _rate_limit("10800") if operation == "billingPeriods" else None
-    )
-    data = await sync(coordinator, NOW + DAY + HOUR, session)
-    assert data.account_results[0].billing_period == period
-    assert coordinator.update_interval == timedelta(hours=3)
-
-    session.hook = lambda _operation, _variables: None
-    await sync(coordinator, NOW + DAY + 4 * HOUR, session)
-    assert coordinator.billing_metadata_unavailable_count == 0
-    assert _own(caplog, logging.INFO) == [
-        (
-            "Meridian Energy couldn't get the billing period; the billing sensors keep "
-            "what they have"
-        ),
-        "Meridian Energy is getting the billing period again",
-    ]
 
 
 async def test_an_expired_account_list_that_fails_is_kept_and_asked_for_again(

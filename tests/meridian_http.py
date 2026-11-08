@@ -22,7 +22,7 @@ import json
 import socket
 from collections.abc import AsyncIterator, Callable, Iterable
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Self
 
 from aiohttp import ClientSession, TCPConnector
@@ -35,13 +35,24 @@ from custom_components.meridian_energy.const import (
     FIREBASE_REFRESH_URL,
     GRAPHQL_URL,
 )
-from custom_components.meridian_energy.graphql import measurements_operation
+from custom_components.meridian_energy.graphql import (
+    BALANCE_NAME,
+    PRICES_NAME,
+    measurements_operation,
+    web_app_url,
+)
 
-from .kraken_fake import FakeKraken
+from .kraken_fake import NZ, FakeKraken
 
 # The measurements query's name and URL, as the integration sends them. Hooks
-# and the operation log name it "measurements", as the integration does.
+# and the operation log name it "measurements", as the integration does, and
+# the other web-app queries "balance" and "prices".
 MEASUREMENTS_NAME, MEASUREMENTS_URL = measurements_operation(GRAPHQL_URL)
+_WEB_APP = {
+    MEASUREMENTS_NAME: "measurements",
+    BALANCE_NAME: "balance",
+    PRICES_NAME: "prices",
+}
 
 ACCOUNT_NUMBER = "A-TEST-1"
 PROPERTY_ID = "synthetic-property"
@@ -176,6 +187,10 @@ class FakeMeridianSession:
     measurements come from the same ``kraken``. Both may be changed between
     requests. ``hook`` may replace a GraphQL answer, ``auth_hook`` the
     answer to a login or session request.
+
+    ``billing_period`` is the current period's first and last dates, None
+    for a period without dates; ``balance`` and ``prices`` are the answers'
+    ``account`` and ``property`` objects, an all-day plan by default.
     """
 
     def __init__(
@@ -194,6 +209,10 @@ class FakeMeridianSession:
         self.auth_hook: AuthHook = lambda _operation: None
         self.operations: list[str] = []
         self.posts: list[tuple[str, str]] = []
+        self.billing_period: tuple[date, date] | None = None
+        today = now.astimezone(NZ).date()
+        self.balance = balance_data(today)
+        self.prices = prices_data()
 
     @property
     def cursors(self) -> set[str]:
@@ -207,7 +226,7 @@ class FakeMeridianSession:
             if (override := self.auth_hook(operation)) is not None:
                 return override
             return json_response(_AUTH_ANSWERS[operation])
-        if url not in {GRAPHQL_URL, MEASUREMENTS_URL}:
+        if not url.startswith(GRAPHQL_URL):
             raise AssertionError("unexpected URL")
         return self._graphql(url, body, kwargs)
 
@@ -217,9 +236,9 @@ class FakeMeridianSession:
         self.posts.append((url, name))
         if f"query {name}(" not in str(body["query"]):
             raise AssertionError("operation name not in the query document")
-        if (name == MEASUREMENTS_NAME) != (url == MEASUREMENTS_URL):
-            raise AssertionError("measurements query name and URL do not match")
-        operation = "measurements" if name == MEASUREMENTS_NAME else name
+        if url != (web_app_url(GRAPHQL_URL, name) if name in _WEB_APP else GRAPHQL_URL):
+            raise AssertionError("the query's name and URL do not match")
+        operation = _WEB_APP.get(name, name)
         variables = dict(body["variables"])
         self.operations.append(operation)
         if isinstance(override := self.hook(operation, variables), StalledConnection):
@@ -246,12 +265,26 @@ class FakeMeridianSession:
                 raise AssertionError("an account the login does not have")
             return {"account": account_data(number, feed_in=number in self.feed_in)}
         if operation == "billingPeriods":
-            return {"account": billing_data()}
+            return {"account": billing_data(self.billing_period)}
+        if operation == "balance":
+            return {"account": self.balance}
+        if operation == "prices":
+            return {"account": {"property": self.prices}}
         raise AssertionError(f"unexpected operation {operation}")
 
     def payload_dates(self) -> set[str]:
-        """Return every calendar date in the history or the requests' bounds."""
-        return self.kraken.payload_dates()
+        """Return every calendar date in the history, the requests or the answers."""
+        dates = set(self.kraken.payload_dates())
+        for day in self.billing_period or ():
+            dates.update({day.isoformat(), (day + timedelta(days=1)).isoformat()})
+        for name in ("bills", "payments"):
+            for edge in self.balance.get(name, {}).get("edges", []):
+                dates.update(
+                    value
+                    for key, value in edge["node"].items()
+                    if key.endswith("Date") and value
+                )
+        return dates
 
 
 def property_id(number: str) -> str:
@@ -344,16 +377,88 @@ def auth_operation(url: str) -> str | None:
     return None
 
 
-def billing_data() -> dict[str, Any]:
-    """Return a synthetic monthly billing period."""
+def billing_data(period: tuple[date, date] | None = None) -> dict[str, Any]:
+    """Return a synthetic monthly billing period, its dates None without one."""
+    start, end = period or (None, None)
     return {
         "billingOptions": {
             "periodLength": "MONTHLY",
             "periodLengthMultiplier": 1,
             "isFixed": False,
-            "currentBillingPeriodStartDate": None,
-            "currentBillingPeriodEndDate": None,
-            "nextBillingDate": None,
+            "currentBillingPeriodStartDate": start and start.isoformat(),
+            "currentBillingPeriodEndDate": end and end.isoformat(),
+            "nextBillingDate": end and (end + timedelta(days=1)).isoformat(),
             "periodStartDay": 1,
         }
+    }
+
+
+def balance_data(today: date) -> dict[str, Any]:
+    """
+    Return a synthetic balance answer: $40 owed, a bill and two payments.
+
+    The bill was issued 12 days ago; one payment of $50 cleared 10 days ago,
+    and one of $60 is requested for 5 days ahead.
+    """
+
+    def ago(days: int) -> str:
+        return (today - timedelta(days=days)).isoformat()
+
+    return {
+        "payments": {
+            "edges": [
+                {
+                    "node": {
+                        "amount": 6000,
+                        "paymentDate": ago(-5),
+                        "status": "REQUESTED",
+                    }
+                },
+                {"node": {"amount": 5000, "paymentDate": ago(10), "status": "CLEARED"}},
+            ]
+        },
+        "bills": {
+            "edges": [
+                {
+                    "node": {
+                        "fromDate": ago(45),
+                        "toDate": ago(14),
+                        "issuedDate": ago(12),
+                    }
+                }
+            ]
+        },
+        "balance": -4000,
+    }
+
+
+def prices_data(
+    daily: str = "$2.000000 /day", anytime: str = "$0.300000 /kWh"
+) -> dict[str, Any]:
+    """Return a synthetic all-day plan: one daily charge and one price per kWh."""
+    return {
+        "meterPoints": [
+            {
+                "activeAgreement": {
+                    "displayName": "Synthetic Plan",
+                    "rates": [
+                        rate("STANDING_CHARGE", daily),
+                        rate("CONSUMPTION_CHARGE", anytime),
+                    ],
+                }
+            }
+        ]
+    }
+
+
+def rate(
+    band: str, text: str, *, bucket: str = "", discount: str | None = None
+) -> dict[str, Any]:
+    """Return one synthetic rate, its discounted text given only with a discount."""
+    return {
+        "hasDiscount": discount is not None,
+        "formattedRateIncludingTax": text,
+        "formattedRateIncludingTaxIncludingDiscount": discount or text,
+        "bandCategory": band,
+        "touBucketName": bucket,
     }
