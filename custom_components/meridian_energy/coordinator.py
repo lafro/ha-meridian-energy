@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import Counter
-from collections.abc import Awaitable, Callable, Collection, Iterable
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal
@@ -146,13 +146,15 @@ _EXTRA_LOST = {
     "sensors show unknown until it can",
     "days_all": "Meridian Energy couldn't get the bill's day totals; the bill "
     "sensors show unknown until it can",
+    "days_skipped": "Meridian Energy can't read one of the properties Meridian "
+    "lists on an account; that account's bill sensors show unknown until it can",
     "balance": "Meridian Energy couldn't get the balance; Total due, Last bill "
     "and Last payment show unknown until it can",
     "prices": "Meridian Energy couldn't get the prices; Daily charge and Anytime "
     "price show unknown until it can",
     "prices_unanswered": "Meridian Energy couldn't get the prices; it asks again later",
-    "prices_no_agreement": "Meridian lists no plan in force for the meter; Daily "
-    "charge and Anytime price show unknown until it does",
+    "prices_no_agreement": "Meridian lists no plan in force for the meter; "
+    "Meridian Energy asks again later",
     "estimate": "Meridian's day totals leave out a date of the billing period; "
     "Bill estimate shows unknown until they don't",
 }
@@ -171,11 +173,20 @@ _LOST_RANK = {
     "billing_bill": 2,
     "days": 0,
     "days_all": 1,
+    "days_skipped": 2,
     "balance": 0,
     "prices_unanswered": 0,
     "prices": 1,
     "prices_no_agreement": 1,
 }
+
+# Payments that are not a payment made: a FAILED one, which Meridian's app
+# shows as a failed auto-pay, never as paid, and, to be safe, PROMISE_BROKEN,
+# DELETED and PROMISED, a promise to pay.
+_NOT_PAID = frozenset({"FAILED", "PROMISE_BROKEN", "DELETED", "PROMISED"})
+# Each price's name in the log, and its sensor's, by the sensor's key.
+_PRICE_NAMES = {"daily_charge": "daily charge", "anytime_price": "anytime price"}
+_PRICE_SENSORS = {"daily_charge": "Daily charge", "anytime_price": "Anytime price"}
 
 type UnitKey = tuple[str, str]
 
@@ -352,6 +363,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         # The properties whose unread feed-in flag was logged, by whether
         # what was read before was kept.
         self._feed_in_noted: set[tuple[str, bool]] = set()
+        # The prices whose text couldn't be read, by sensor key and field.
+        self._prices_noted: set[tuple[str, str]] = set()
 
     @property
     def accounts(self) -> tuple[MeridianAccount, ...]:
@@ -446,7 +459,12 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             if self._removed:
                 # A refresh that outlived the entry's removal, as one
                 # update_entity asked for can, starts no reauthentication.
-                return self.data
+                return self._removed_failure(
+                    UpdateFailed(
+                        translation_domain=DOMAIN, translation_key="invalid_auth"
+                    ),
+                    err,
+                )
             raise ConfigEntryAuthFailed(
                 translation_domain=DOMAIN, translation_key="invalid_auth"
             ) from err
@@ -454,7 +472,14 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             if self._removed:
                 # Nor does it log a failure, raise a notice or count a rate
                 # limit: the entry is gone.
-                return self.data
+                return self._removed_failure(
+                    UpdateFailed(
+                        translation_domain=DOMAIN,
+                        translation_key=_error_key(err),
+                        translation_placeholders={"detail": _error_detail(err)},
+                    ),
+                    err,
+                )
             failure = UpdateFailed(
                 translation_domain=DOMAIN,
                 translation_key=_error_key(err),
@@ -470,6 +495,21 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         if self.config_entry is not None:
             ir.async_delete_issue(self.hass, DOMAIN, self._issue_id)
         return data
+
+    def _removed_failure(
+        self, failure: UpdateFailed, err: Exception
+    ) -> MeridianSyncData:
+        """
+        End a failed refresh of a removed entry as quietly as it can be.
+
+        A failure after a success is the one Home Assistant logs, so it is
+        not raised: the data is kept. After a failure it is raised, waiting
+        no longer and counted nowhere, so Home Assistant logs nothing, where
+        returning would have it log a recovery that never came.
+        """
+        if self.last_update_success:
+            return self.data
+        raise failure from err
 
     @property
     def _issue_id(self) -> str:
@@ -568,8 +608,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 unit.memory.failure = None
         self._settle(outcome)
         failed = {
-            (property_key(unit.account_number, unit.property_id), unit.direction)
-            for unit, _err in outcome.failed
+            (property_key(unit.account_number, unit.property_id), unit.direction): err
+            for unit, err in outcome.failed
         }
         account_results = await self._async_account_results(accounts, failed, now)
         if self._rate_limit is None:
@@ -1189,7 +1229,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
     async def _async_account_results(
         self,
         accounts: tuple[MeridianAccount, ...],
-        failed: set[UnitKey],
+        failed: Mapping[UnitKey, Exception],
         now: datetime,
     ) -> tuple[AccountSyncResult, ...]:
         """
@@ -1228,7 +1268,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
     async def _async_account_result(
         self,
         account: MeridianAccount,
-        failed: set[UnitKey],
+        failed: Mapping[UnitKey, Exception],
         now: datetime,
         lost: dict[str, str],
     ) -> AccountSyncResult:
@@ -1263,10 +1303,14 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         bill = await self._async_bill(account, period, failed, now, lost)
         billing.lost = period is None and (billing.failing or (ended and billing.lost))
         if billing.lost:
+            # An account with a property that can't be read has its own
+            # line for its bill.
             _lose(
                 lost,
                 "billing",
-                "billing_bill"
+                "billing"
+                if account.skipped_properties
+                else "billing_bill"
                 if bill == BillFigures()
                 else "billing_so_far"
                 if bill.usage is None
@@ -1282,7 +1326,9 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         result = AccountSyncResult(
             account_key=account_key(number),
             billing_period=period,
-            has_feed_in=_has_feed_in(account),
+            # Undecided while a property that can't be read may export.
+            has_feed_in=_has_feed_in(account)
+            or (None if account.skipped_properties else False),
             bill=bill,
             price_sensors=price_sensors,
             prices=prices,
@@ -1296,7 +1342,11 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             credit=Decimal(cents) / _CENTS_PER_DOLLAR if cents > 0 else None,
             last_bill=max(balance.bills, key=attrgetter("issued"), default=None),
             last_payment=max(
-                (payment for payment in balance.payments if payment.paid_on <= today),
+                (
+                    payment
+                    for payment in balance.payments
+                    if payment.paid_on <= today and payment.status not in _NOT_PAID
+                ),
                 key=attrgetter("paid_on"),
                 default=None,
             ),
@@ -1306,7 +1356,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         self,
         account: MeridianAccount,
         period: MeridianBillingPeriod | None,
-        failed: set[UnitKey],
+        failed: Mapping[UnitKey, Exception],
         now: datetime,
         lost: dict[str, str],
     ) -> BillFigures:
@@ -1323,6 +1373,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         """
         number = account.number
         if account.skipped_properties:
+            _lose(lost, "days", "days_skipped")
             return BillFigures()
         extra = self._extras.get(("days", number))
         if (
@@ -1366,7 +1417,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         account: MeridianAccount,
         start_on: date,
         end_on: date,
-        failed: set[UnitKey],
+        failed: Mapping[UnitKey, Exception],
     ) -> _Bill:
         """
         Return a bill's figures from every property's day totals.
@@ -1396,12 +1447,20 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         )
         if not _has_feed_in(account):
             return _Bill(start_on, end_on, figures, whole)
-        if any(
-            (property_key(number, item.id), READING_GENERATION) in failed
+        errors = [
+            failed[unit]
             for item in account.properties
-        ):
+            if (unit := (property_key(number, item.id), READING_GENERATION)) in failed
+        ]
+        if errors:
             _LOGGER.debug("Not asking for the bill's grid export: it failed")
-            return _Bill(start_on, end_on, figures, whole)
+            return _Bill(
+                start_on,
+                end_on,
+                figures,
+                whole,
+                retry=all(is_passing_failure(err) for err in errors),
+            )
         try:
             days, _whole = await self._async_days(
                 account, start_on, end_on, READING_GENERATION
@@ -1461,10 +1520,11 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
 
         Only an account with one property and one meter point is asked; the
         answer says whether its plan is all-day. Until an answer has come,
-        while the meter has no agreement in force, as on the day a plan
-        changes, or while one of the account's properties couldn't be read,
-        there is no saying (None): sensors already registered stay, showing
-        unknown.
+        while Meridian lists no agreement in force for the meter (when that
+        happens is not known), or while one of the account's properties
+        couldn't be read, there is no saying (None): sensors already
+        registered stay, showing unknown. A price whose text can't be read is
+        logged once.
         """
         properties = account.properties
         if account.skipped_properties:
@@ -1489,7 +1549,24 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         prices: MeridianPrices | None = extra.kept("prices", now)
         if extra.failing and prices is None:
             _lose(lost, "prices", "prices")
+        if prices is not None:
+            self._note_unreadable_prices(prices)
         return True, prices
+
+    def _note_unreadable_prices(self, prices: MeridianPrices) -> None:
+        """Log a WARNING for each price that can't be read, once per field."""
+        for item in prices.unreadable:
+            if (item.key, item.field) in self._prices_noted:
+                continue
+            self._prices_noted.add((item.key, item.field))
+            _LOGGER.warning(
+                "Meridian Energy can't read the %s in %s, which looks like %s; "
+                "%s shows unknown",
+                _PRICE_NAMES[item.key],
+                item.field,
+                repr(item.shape),
+                _PRICE_SENSORS[item.key],
+            )
 
 
 def _lose(lost: dict[str, str], kind: str, key: str) -> None:

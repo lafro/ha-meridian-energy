@@ -56,10 +56,12 @@ class MeridianHttpError(MeridianTransportError):
     """
     Meridian returned an unsuccessful HTTP status.
 
-    ``json_body`` says the body was JSON, as Meridian's own errors are; a
-    gateway's error page is not. ``error_class`` names the network library's
-    error when the body failed after the status had arrived.
-    ``retry_after_given`` says whether the answer carried Retry-After.
+    ``json_body`` says the body was JSON, as Meridian's own errors are
+    assumed to be; a gateway's error page is taken not to be. ``html_body``
+    says it was a web page, by its Content-Type or its first character.
+    ``error_class`` names the network library's error when the body failed
+    after the status had arrived. ``retry_after_given`` says whether the
+    answer carried Retry-After.
     """
 
     def __init__(
@@ -70,6 +72,7 @@ class MeridianHttpError(MeridianTransportError):
         *,
         error_class: str | None = None,
         json_body: bool = False,
+        html_body: bool = False,
         retry_after_given: bool = False,
     ) -> None:
         super().__init__(f"Meridian returned HTTP {status}", error_class=error_class)
@@ -77,6 +80,7 @@ class MeridianHttpError(MeridianTransportError):
         self.payload = payload
         self.retry_after = retry_after
         self.json_body = json_body
+        self.html_body = html_body
         self.retry_after_given = retry_after_given
 
 
@@ -185,6 +189,7 @@ class MeridianTransport:
                     status,
                     {},
                     head.retry_after,
+                    html_body=head.content == "html" or body.lstrip()[:1] == b"<",
                     retry_after_given=head.retry_after_given,
                 ) from None
             raise MeridianUnreadableResponseError(status, head.content) from err
@@ -194,6 +199,7 @@ class MeridianTransport:
                 payload if isinstance(payload, dict) else {},
                 head.retry_after,
                 json_body=payload is not None,
+                html_body=payload is None and head.content == "html",
                 retry_after_given=head.retry_after_given,
             )
         return require_mapping(payload, "HTTP response")
@@ -229,6 +235,7 @@ def _status_failure(head: _Head | None, err: Exception) -> MeridianHttpError | N
         {},
         head.retry_after,
         error_class=type(err).__name__,
+        html_body=head.content == "html",
         retry_after_given=head.retry_after_given,
     )
 

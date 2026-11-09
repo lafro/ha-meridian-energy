@@ -19,7 +19,10 @@ import pytest
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed
 
-from custom_components.meridian_energy.const import UPDATE_INTERVAL
+from custom_components.meridian_energy.const import (
+    BILL_DAYS_INTERVAL,
+    UPDATE_INTERVAL,
+)
 from custom_components.meridian_energy.models import (
     BillFigures,
     MeridianBill,
@@ -72,8 +75,11 @@ _PRICES_LOST = (
 _PRICES_UNANSWERED = "Meridian Energy couldn't get the prices; it asks again later"
 _PRICES_BACK = "Meridian Energy is getting the prices again"
 _NO_PLAN = (
-    "Meridian lists no plan in force for the meter; Daily charge and Anytime price "
-    "show unknown until it does"
+    "Meridian lists no plan in force for the meter; Meridian Energy asks again later"
+)
+_DAYS_SKIPPED = (
+    "Meridian Energy can't read one of the properties Meridian lists on an "
+    "account; that account's bill sensors show unknown until it can"
 )
 _ESTIMATE_LOST = (
     "Meridian's day totals leave out a date of the billing period; Bill estimate "
@@ -159,7 +165,7 @@ async def test_a_first_sync_gets_every_figure(
 async def test_the_last_payment_is_the_newest_made_by_today(
     hass: HomeAssistant, session: FakeMeridianSession
 ) -> None:
-    """Meridian's order of payments is not by date: the newest by today is chosen."""
+    """Whatever order Meridian lists payments in, the newest by today is chosen."""
 
     def payment(cents: int, days_ago: int, status: str) -> dict[str, Any]:
         paid_on = (TODAY - days_ago * DAY).isoformat()
@@ -183,6 +189,40 @@ async def test_the_last_payment_is_the_newest_made_by_today(
 
     assert data.account_results[0].last_payment == MeridianPayment(
         amount_cents=8000, paid_on=TODAY, status="CLEARED"
+    )
+
+
+@pytest.mark.parametrize("status", ["FAILED", "PROMISE_BROKEN", "DELETED", "PROMISED"])
+async def test_a_payment_not_made_is_never_the_last_payment(
+    hass: HomeAssistant, session: FakeMeridianSession, status: str
+) -> None:
+    """
+    A failed payment is not one made, though newer than the last that cleared.
+
+    Meridian's app shows a FAILED one as a failed auto-pay; the others are
+    left out to be safe.
+    """
+
+    def payment(cents: int, days_ago: int, status: str) -> dict[str, Any]:
+        paid_on = (TODAY - days_ago * DAY).isoformat()
+        return {"node": {"amount": cents, "paymentDate": paid_on, "status": status}}
+
+    session.balance = {
+        **session.balance,
+        "payments": {
+            "edges": [
+                payment(9000, 2, status),
+                payment(5000, 10, "CLEARED"),
+                payment(3000, 20, status),
+            ]
+        },
+    }
+    coordinator = coordinator_for(hass, session)
+
+    data = await sync(coordinator, NOW, session)
+
+    assert data.account_results[0].last_payment == MeridianPayment(
+        amount_cents=5000, paid_on=TODAY - 10 * DAY, status="CLEARED"
     )
 
 
@@ -1040,7 +1080,15 @@ def _prices_with(**changes: Any) -> Response:
         ({"balance"}, _balance_with("bills", issuedDate={}), None),
         ({"balance"}, _balance_with("payments", paymentDate=[]), None),
         ({"billingPeriods"}, _billing_with(currentBillingPeriodEndDate=["x"]), None),
-        (_FIGURES, json_response({}, status=401), ConfigEntryAuthFailed),
+        # A refused request is not sent again, nor ends the sign-in.
+        (_FIGURES, json_response({}, status=403), None),
+        (
+            _FIGURES,
+            json_response(
+                {"errors": [{"extensions": {"errorCode": "KT-CT-1124"}}]}, status=401
+            ),
+            ConfigEntryAuthFailed,
+        ),
     ],
 )
 async def test_failed_figures_never_fail_an_update_but_an_ended_sign_in_does(
@@ -1117,8 +1165,8 @@ _PAST_A_FLOAT = "9" * 400
 @pytest.mark.parametrize(
     ("daily", "anytime"),
     [
-        pytest.param(f"${_TOO_LARGE_DOLLARS} /day", "$0.300000 /kWh", id="dollars"),
-        pytest.param("$2.000000 /day", f"{_PAST_A_FLOAT} c/kWh", id="cents"),
+        pytest.param(f"${_TOO_LARGE_DOLLARS}", "$0.300000", id="daily"),
+        pytest.param("$2.000000", f"${_PAST_A_FLOAT}", id="anytime"),
     ],
 )
 async def test_a_price_too_large_shows_unknown_and_nothing_fails(
@@ -1140,7 +1188,7 @@ async def test_a_price_too_large_shows_unknown_and_nothing_fails(
     prices = coordinator.data.account_results[0].prices
     assert prices is not None
     assert (prices.daily_charge, prices.anytime) == (
-        (None, Decimal("0.3")) if daily != "$2.000000 /day" else (Decimal(2), None)
+        (None, Decimal("0.3")) if daily != "$2.000000" else (Decimal(2), None)
     )
     assert session.operations.count("prices") == 1
     assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
@@ -1265,6 +1313,59 @@ async def test_a_grid_export_day_failure_that_may_pass_is_asked_again_next(
     assert (bill.export, bill.credit) == (Decimal(180), Decimal(54))
 
 
+def _failing_export_hours(answer: Response, count: int) -> Any:
+    """Fail the grid export's hours so many times, then answer them."""
+    failures = iter([answer] * count)
+    return lambda operation, variables: (
+        next(failures, None)
+        if operation == "measurements"
+        and variables["readingDirectionType"] == "GENERATION"
+        and variables["readingFrequencyType"] != "DAY_INTERVAL"
+        else None
+    )
+
+
+async def test_a_grid_export_unit_failure_that_may_pass_asks_for_its_days_next(
+    hass: HomeAssistant,
+) -> None:
+    """
+    The export's days wait for its hours; a failure that may pass, one update.
+
+    Until then, only the export and credit so far show unknown.
+    """
+    session = FakeMeridianSession(NOW, feed_in=(ACCOUNT_NUMBER,))
+    session.billing_period = _PERIOD
+    # Sent, then resent once, as a 503 is.
+    session.hook = _failing_export_hours(json_response({}, status=503), 2)
+    coordinator = coordinator_for(hass, session)
+
+    data = await sync(coordinator, NOW, session)
+    bill = data.account_results[0].bill
+    assert (bill.usage, bill.export, bill.credit) == (Decimal(180), None, None)
+
+    data = await sync(coordinator, NOW + HOUR, session)
+    bill = data.account_results[0].bill
+    assert (bill.export, bill.credit) == (Decimal(180), Decimal(54))
+
+
+async def test_a_grid_export_unit_refused_waits_for_its_days_interval(
+    hass: HomeAssistant,
+) -> None:
+    """A refusal won't pass by itself: its days are asked for when next due."""
+    session = FakeMeridianSession(NOW, feed_in=(ACCOUNT_NUMBER,))
+    session.billing_period = _PERIOD
+    session.hook = _failing_export_hours(json_response({}, status=400), 1)
+    coordinator = coordinator_for(hass, session)
+
+    for update in range(2):
+        data = await sync(coordinator, NOW + update * HOUR, session)
+        bill = data.account_results[0].bill
+        assert (bill.usage, bill.export, bill.credit) == (Decimal(180), None, None)
+
+    data = await sync(coordinator, NOW + BILL_DAYS_INTERVAL, session)
+    assert data.account_results[0].bill.export is not None
+
+
 async def test_a_rate_limit_on_the_grid_export_days_waits_like_any_other(
     hass: HomeAssistant,
     caplog: pytest.LogCaptureFixture,
@@ -1296,7 +1397,9 @@ async def test_an_ended_sign_in_on_the_grid_export_days_stops_the_sync(
     session = FakeMeridianSession(NOW, feed_in=(ACCOUNT_NUMBER,))
     session.billing_period = _PERIOD
     session.hook = lambda operation, variables: (
-        json_response({}, status=401)
+        json_response(
+            {"errors": [{"extensions": {"errorCode": "KT-CT-1124"}}]}, status=401
+        )
         if operation == "measurements"
         and variables["readingDirectionType"] == "GENERATION"
         and variables["readingFrequencyType"] == "DAY_INTERVAL"
@@ -1344,6 +1447,73 @@ async def test_only_a_property_with_feed_in_is_asked_for_its_export_days(
     assert bill.export is not None
 
 
+_UNREADABLE_ANYTIME = (
+    "Meridian Energy can't read the anytime price in formattedRateIncludingTax, "
+    "which looks like '$N.NN /AAA'; Anytime price shows unknown"
+)
+_UNREADABLE_DISCOUNT = (
+    "Meridian Energy can't read the daily charge in "
+    "formattedRateIncludingTaxIncludingDiscount, which looks like '$N.NN AAA'; "
+    "Daily charge shows unknown"
+)
+
+
+async def test_an_unreadable_price_is_warned_once_by_its_shape(
+    hass: HomeAssistant,
+    session: FakeMeridianSession,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Only that price is unknown; one WARNING names its field and its shape.
+
+    Each price's field is warned of once for the entry, however often it
+    is asked for or read in between; its text is never logged.
+    """
+    caplog.set_level(logging.DEBUG)
+    session.prices = prices_data(anytime="$0.30 /kWh")
+    coordinator = coordinator_for(hass, session)
+
+    for day in range(3):
+        data = await sync(coordinator, NOW + day * DAY, session)
+        prices = data.account_results[0].prices
+        assert prices is not None
+        assert (prices.daily_charge, prices.anytime) == (Decimal(2), None)
+    session.prices = prices_data()
+    await sync(coordinator, NOW + 3 * DAY, session)
+    session.prices = prices_data(anytime="$0.30 /kWh")
+    await sync(coordinator, NOW + 4 * DAY, session)
+
+    assert session.operations.count("prices") == 5
+    assert _own(caplog, logging.WARNING) == [_UNREADABLE_ANYTIME]
+    assert "$0.30" not in caplog.text
+
+    # A discounted price is read from its own field, warned of apart.
+    session.prices = _plan_of(
+        rate("STANDING_CHARGE", "$2.000000", discount="$1.80 off"),
+        rate("CONSUMPTION_CHARGE", "$0.300000"),
+    )
+    data = await sync(coordinator, NOW + 5 * DAY, session)
+    prices = data.account_results[0].prices
+    assert prices is not None
+    assert (prices.daily_charge, prices.anytime) == (None, Decimal("0.3"))
+    assert _own(caplog, logging.WARNING) == [_UNREADABLE_ANYTIME, _UNREADABLE_DISCOUNT]
+    assert "$1.80" not in caplog.text
+
+
+def _plan_of(*rates: dict[str, Any]) -> dict[str, Any]:
+    plan = prices_data()
+    plan["meterPoints"][0]["activeAgreement"]["rates"] = list(rates)
+    return plan
+
+
+# A time-of-use plan: no price sensors.
+_TIME_OF_USE = _plan_of(
+    rate("STANDING_CHARGE", "$2.000000"),
+    rate("CONSUMPTION_CHARGE", "$0.300000"),
+    rate("CONSUMPTION_CHARGE", "$0.200000", bucket="Night"),
+)
+
+
 def _account_with(**changes: Any) -> Response:
     account = account_data()
     account["properties"][0].update(changes)
@@ -1354,27 +1524,7 @@ def _account_with(**changes: Any) -> Response:
     ("account", "prices"),
     [
         # A time-of-use plan: the price sensors are not offered.
-        (
-            None,
-            {
-                "meterPoints": [
-                    {
-                        "activeAgreement": {
-                            "displayName": "Synthetic Plan",
-                            "rates": [
-                                rate("STANDING_CHARGE", "$2.000000 /day"),
-                                rate("CONSUMPTION_CHARGE", "$0.300000 /kWh"),
-                                rate(
-                                    "CONSUMPTION_CHARGE",
-                                    "$0.200000 /kWh",
-                                    bucket="Night",
-                                ),
-                            ],
-                        }
-                    }
-                ]
-            },
-        ),
+        (None, _TIME_OF_USE),
         # Two meter points: not asked for at all.
         (
             _account_with(
@@ -1471,34 +1621,105 @@ async def test_a_property_that_cannot_be_read_at_a_refresh_keeps_list_and_bill(
 
 
 async def test_a_property_that_cannot_be_read_at_a_first_sync_leaves_the_bill_unknown(
-    hass: HomeAssistant, session: FakeMeridianSession
+    hass: HomeAssistant,
+    session: FakeMeridianSession,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     With no list before it, the one property read is followed.
 
     The bill and prices would leave the other out, so neither is asked for,
-    and the list is asked for again at the next update.
+    and the list is asked for again at the next update. One line says the
+    bill shows unknown, and one when it is back.
     """
+    caplog.set_level(logging.INFO)
     answer = {"account": _two_properties(second_id=None)}
     session.hook = lambda operation, _variables: (
         json_response({"data": answer}) if operation == "account" else None
     )
     coordinator = coordinator_for(hass, session)
 
-    data = await sync(coordinator, NOW, session)
-
-    (result,) = data.account_results
-    assert data.property_count == 1
-    assert result.bill == BillFigures()
-    assert result.price_sensors is None
+    for update in range(2):
+        data = await sync(coordinator, NOW + update * HOUR, session)
+        (result,) = data.account_results
+        assert data.property_count == 1
+        assert result.bill == BillFigures()
+        assert result.price_sensors is None
     assert _day_requests(session) == []
     assert "prices" not in session.operations
+    # Said once, and the bill's own line, not the billing period's.
+    assert [line for line in _own(caplog, logging.INFO) if "bill" in line] == [
+        _DAYS_SKIPPED
+    ]
 
     answer["account"] = _two_properties(second_id="synthetic-property-2")
-    data = await sync(coordinator, NOW + HOUR, session)
-    assert session.operations.count("accountsList") == 2
+    data = await sync(coordinator, NOW + 2 * HOUR, session)
+    assert session.operations.count("accountsList") == 3
     assert data.property_count == 2
-    assert data.account_results[0].bill.usage == Decimal(360)
+    assert data.account_results[0].bill == BillFigures(
+        usage=Decimal(360), cost=Decimal(108), estimate=Decimal("223.2")
+    )
+    assert [line for line in _own(caplog, logging.INFO) if "bill" in line] == [
+        _DAYS_SKIPPED,
+        _DAYS_BACK,
+    ]
+
+
+async def test_a_property_that_cannot_be_read_never_blames_the_billing_period(
+    hass: HomeAssistant,
+    session: FakeMeridianSession,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """With the billing period failing too, each line says only its own part."""
+    caplog.set_level(logging.INFO)
+    answer = json_response({"data": {"account": _two_properties(second_id=None)}})
+    session.hook = lambda operation, _variables: (
+        answer
+        if operation == "account"
+        else _FAILED
+        if operation == "billingPeriods"
+        else None
+    )
+    coordinator = coordinator_for(hass, session)
+
+    await sync(coordinator, NOW, session)
+
+    assert sorted(_own(caplog, logging.INFO)) == sorted([_BILLING_LOST, _DAYS_SKIPPED])
+
+
+def _exporter(*, readable: bool) -> dict[str, Any]:
+    """Return a property with a feed-in register, its ID missing if unreadable."""
+    exporter = copy.deepcopy(account_data(feed_in=True)["properties"][0])
+    exporter["id"] = "synthetic-property-2" if readable else None
+    return exporter
+
+
+@pytest.mark.parametrize(
+    ("first_feed_in", "expected"),
+    [
+        # The property that can't be read may be the one that exports.
+        (False, None),
+        # A readable one exports: that decides it.
+        (True, True),
+    ],
+)
+async def test_feed_in_is_undecided_only_while_an_exporter_may_be_unreadable(
+    hass: HomeAssistant, first_feed_in: bool, expected: bool | None
+) -> None:
+    session = FakeMeridianSession(NOW, feed_in=(ACCOUNT_NUMBER,))
+    session.billing_period = _PERIOD
+    account = copy.deepcopy(account_data(feed_in=first_feed_in))
+    account["properties"].append(_exporter(readable=False))
+    session.hook = lambda operation, _variables: (
+        json_response({"data": {"account": account}})
+        if operation == "account"
+        else None
+    )
+    coordinator = coordinator_for(hass, session)
+
+    data = await sync(coordinator, NOW, session)
+
+    assert data.account_results[0].has_feed_in is expected
 
 
 @pytest.mark.parametrize(("cents", "credit"), [(1250, Decimal("12.5")), (0, None)])
@@ -1690,7 +1911,7 @@ async def test_a_day_with_no_agreement_in_force_keeps_the_price_sensors_unknown(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
-    As on the day a plan changes: Meridian has no agreement in force.
+    Meridian lists no agreement in force for the meter (when that happens is not known).
 
     That says nothing of the plan, so the price sensors stay, showing
     unknown, until a later answer says. One INFO line says why, and one
@@ -1733,6 +1954,61 @@ async def test_prices_that_failed_then_name_no_plan_are_not_back(
 
     assert data.account_results[0].price_sensors is None
     assert _own(caplog, logging.INFO) == [_PRICES_UNANSWERED, _NO_PLAN]
+
+
+async def test_no_plan_in_force_on_a_time_of_use_account_names_no_price_sensor(
+    hass: HomeAssistant,
+    session: FakeMeridianSession,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The account has no price sensors, before or after: the line names none."""
+    caplog.set_level(logging.INFO)
+    session.prices = _TIME_OF_USE
+    coordinator = coordinator_for(hass, session)
+    data = await sync(coordinator, NOW, session)
+    assert data.account_results[0].price_sensors is False
+
+    session.prices = {"meterPoints": [{"activeAgreement": None}]}
+    await sync(coordinator, NOW + DAY, session)
+    session.prices = _TIME_OF_USE
+    data = await sync(coordinator, NOW + 2 * DAY, session)
+
+    assert data.account_results[0].price_sensors is False
+    lines = _own(caplog, logging.INFO)
+    assert _NO_PLAN in lines
+    for line in lines:
+        assert "Daily charge" not in line
+        assert "Anytime price" not in line
+
+
+@pytest.mark.parametrize("options", ["null", "missing"])
+async def test_an_account_without_billing_options_has_no_period_and_nothing_fails(
+    hass: HomeAssistant,
+    session: FakeMeridianSession,
+    caplog: pytest.LogCaptureFixture,
+    options: str,
+) -> None:
+    """Meridian may leave them out: no period, so no bill, and no failure."""
+    caplog.set_level(logging.INFO)
+    account = {"billingOptions": None} if options == "null" else {}
+    session.hook = lambda operation, _variables: (
+        json_response({"data": {"account": account}})
+        if operation == "billingPeriods"
+        else None
+    )
+    coordinator = coordinator_for(hass, session)
+
+    for update in range(2):
+        data = await sync(coordinator, NOW + update * HOUR, session)
+
+    (result,) = data.account_results
+    assert result.billing_period is None
+    assert result.bill == BillFigures()
+    assert result.total_due == Decimal(40)
+    assert _day_requests(session) == []
+    assert session.operations.count("billingPeriods") == 1
+    assert coordinator.extras_diagnostics()["billing"]["failing"] == 0
+    assert _own(caplog, logging.INFO) == []
 
 
 @pytest.mark.parametrize(

@@ -67,6 +67,14 @@ def _coded(*codes: str | None) -> Response:
     )
 
 
+def _ended(status: int = 401, code: str = "KT-CT-1124") -> Response:
+    """Return an answer whose body says the session has ended."""
+    return json_response(
+        {"errors": [{"message": "Synthetic", "extensions": {"errorCode": code}}]},
+        status=status,
+    )
+
+
 def _measurements(answer: Any) -> Any:
     return lambda operation, _variables: answer if operation == "measurements" else None
 
@@ -173,11 +181,14 @@ async def test_an_hour_too_large_to_add_is_unusable_data(
     assert failure.value.translation_placeholders == {"detail": "unexpected data"}
 
 
-async def test_a_json_rejection_after_a_fresh_session_ends_the_sign_in(
-    hass: HomeAssistant,
+@pytest.mark.parametrize(
+    "code", ["KT-CT-1111", "KT-CT-1120", "KT-CT-1124", "KT-CT-1143"]
+)
+async def test_a_session_code_in_a_401_after_a_renewal_ends_the_sign_in(
+    hass: HomeAssistant, code: str
 ) -> None:
     session = FakeMeridianSession(NOW)
-    session.hook = _measurements(json_response({"error": "Synthetic"}, status=401))
+    session.hook = _measurements(_ended(code=code))
     coordinator = coordinator_for(hass, session)
 
     with pytest.raises(ConfigEntryAuthFailed) as failure:
@@ -186,6 +197,40 @@ async def test_a_json_rejection_after_a_fresh_session_ends_the_sign_in(
     assert failure.value.translation_key == "invalid_auth"
     # The session was renewed once before.
     assert session.operations.count("measurements") == 2
+
+
+@pytest.mark.parametrize(
+    ("answer", "detail"),
+    [
+        (json_response({"error": "Synthetic"}, status=401), "HTTP 401"),
+        (_ended(code="KT-CT-1112"), "HTTP 401, KT-CT-1112"),
+        (_ended(status=403), "HTTP 403, KT-CT-1124"),
+        (json_response({"error": "Synthetic"}, status=403), "HTTP 403"),
+    ],
+    ids=["401", "401 KT-CT-1112", "403 KT-CT-1124", "403"],
+)
+async def test_a_refused_request_is_no_ended_sign_in(
+    hass: HomeAssistant, answer: Response, detail: str
+) -> None:
+    """
+    A 403, or a 401 without a code that ends the session, is a refusal.
+
+    A 401 is sent once more with a renewed session; a 403 is not sent again.
+    The update fails, worded as Meridian refusing the request, and no
+    reauthentication starts.
+    """
+    session = FakeMeridianSession(NOW)
+    session.hook = _measurements(answer)
+    coordinator = coordinator_for(hass, session)
+
+    with pytest.raises(UpdateFailed) as failure:
+        await sync(coordinator, NOW, session)
+
+    assert failure.value.translation_key == "invalid_data"
+    assert failure.value.translation_placeholders == {"detail": detail}
+    assert session.operations.count("measurements") == (
+        2 if answer.status == 401 else 1
+    )
 
 
 async def test_a_gateway_page_refusing_a_fresh_session_is_a_refusal(
@@ -593,7 +638,7 @@ async def test_a_first_sync_whose_only_property_cannot_be_read_tries_again(
 async def test_an_ended_sign_in_never_raises_the_notice(hass: HomeAssistant) -> None:
     entry = _entry(hass)
     session = FakeMeridianSession(NOW)
-    session.hook = _measurements(json_response({}, status=401))
+    session.hook = _measurements(_ended())
     coordinator = coordinator_for(hass, session, config_entry=entry)
 
     for update in range(4):
@@ -610,7 +655,11 @@ async def test_an_ended_sign_in_never_raises_the_notice(hass: HomeAssistant) -> 
     ("answer", "accounts", "error", "key"),
     [
         (None, (), ConfigEntryNotReady, "no_accounts"),
-        (json_response({}, status=401), None, ConfigEntryAuthFailed, "invalid_auth"),
+        (_ended(), None, ConfigEntryAuthFailed, "invalid_auth"),
+        (_coded("KT-CT-1120"), None, ConfigEntryAuthFailed, "invalid_auth"),
+        (json_response({}, status=401), None, ConfigEntryNotReady, "invalid_data"),
+        (json_response({}, status=403), None, ConfigEntryNotReady, "invalid_data"),
+        (_coded("KT-CT-1112"), None, ConfigEntryNotReady, "invalid_data"),
         (Response(b"", status=429), None, ConfigEntryNotReady, "rate_limited"),
         (json_response({}, status=504), None, ConfigEntryNotReady, "cannot_connect"),
         (_coded("KT-CT-4321"), None, ConfigEntryNotReady, "invalid_data"),

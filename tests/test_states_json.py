@@ -148,6 +148,39 @@ async def test_every_state_of_the_entry_is_json(
     assert _warnings(caplog) == []
 
 
+async def test_a_fresh_install_with_no_plan_in_force_names_no_price_sensor(
+    hass: HomeAssistant,
+    meridian: FakeMeridianSession,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No price sensor is made, and the one line about it names none."""
+    caplog.set_level(logging.INFO)
+    meridian.prices = {"meterPoints": [{"activeAgreement": None}]}
+
+    entry_id = await _set_up(hass, caplog)
+
+    registry = er.async_get(hass)
+    assert not [
+        item.entity_id
+        for item in er.async_entries_for_config_entry(registry, entry_id)
+        if item.unique_id.endswith(("_daily_charge", "_anytime_price"))
+    ]
+    for entity_id in _PRICE_SENSORS:
+        assert hass.states.get(entity_id) is None
+    lines = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name.startswith("custom_components.meridian_energy")
+        and "plan" in record.getMessage()
+    ]
+    assert lines == [
+        (
+            "Meridian lists no plan in force for the meter; Meridian Energy asks "
+            "again later"
+        )
+    ]
+
+
 async def test_price_sensors_stay_unknown_when_prices_fail_after_a_reload(
     hass: HomeAssistant,
     meridian: FakeMeridianSession,

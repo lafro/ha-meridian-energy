@@ -140,7 +140,11 @@ __all__ = [
 
 _LAST_DAY_OF_LONG_MONTH = 31
 _MAX_CAUSE_DEPTH = 10
+_HTTP_SUCCESS = range(200, 300)
 _HTTP_CLIENT_ERROR = 400
+_HTTP_UNAUTHORIZED = 401
+_HTTP_FORBIDDEN = 403
+_HTTP_NOT_FOUND = 404
 _HTTP_REQUEST_TIMEOUT = 408
 _HTTP_TOO_MANY_REQUESTS = 429
 _HTTP_SERVER_ERROR = 500
@@ -459,9 +463,10 @@ class MeridianApiClient:
         """
         Ask Meridian to email a one-time login code.
 
-        Meridian's refusals are assumed to be JSON: only an answer in JSON
-        refuses the email. A page from something in between makes no claim
-        about it, and is no answer.
+        As in Meridian's app, the status decides: any 2xx answer counts as
+        sent, whatever its body; HTTP 404 refuses the email, as does 403, a
+        login of another brand, unless it is a web page, which is taken to
+        come from something in between. Any other status is no answer.
         """
         payload = {
             "email": email,
@@ -471,7 +476,7 @@ class MeridianApiClient:
             "otpEnabled": True,
         }
         try:
-            response = await self._async_json_request(
+            await self._async_json_request(
                 AUTH_EMAIL_URL,
                 operation="send_code",
                 json=payload,
@@ -481,15 +486,20 @@ class MeridianApiClient:
         except _MeridianHttpError as err:
             if err.status == _HTTP_TOO_MANY_REQUESTS:
                 raise _rate_limit(err) from err
-            if _no_refusal(err):
-                raise _connection_error(err) from err
-            raise MeridianAuthenticationError(
-                "Meridian did not accept the login request"
-            ) from err
-        if response.get("success") is not True:
-            raise MeridianAuthenticationError(
-                "Meridian did not accept the login request"
-            )
+            if err.status == _HTTP_NOT_FOUND or (
+                err.status == _HTTP_FORBIDDEN and not err.html_body
+            ):
+                raise MeridianAuthenticationError(
+                    "Meridian did not accept the login request"
+                ) from err
+            raise _connection_error(err) from err
+        except ValueError:
+            # A 2xx answer whose body is empty, or JSON but not an object.
+            return
+        except MeridianConnectionError as err:
+            # A 2xx answer that is not JSON is sent all the same.
+            if not is_unreadable(err) or http_status(err) not in _HTTP_SUCCESS:
+                raise
 
     async def async_validate_otp(
         self, email: str, otp: str, journey_id: str
@@ -562,8 +572,9 @@ class MeridianApiClient:
         """
         Refresh the Firebase ID token when it is close to expiry.
 
-        Only a refusal in JSON (HTTP 400, 401 or 403) ends the sign-in. An
-        answer that can't be read is the sign-in service's
+        Google's refusals are assumed to be JSON, so only a refusal in JSON
+        (HTTP 400, 401 or 403) ends the sign-in. An answer that can't be
+        read is the sign-in service's
         (``MeridianSignInServiceUnreadableError``): invalid data, which a
         later update tries again.
         """
@@ -684,8 +695,8 @@ class MeridianApiClient:
                 self._log_once(
                     ("property", *place),
                     logging.WARNING,
-                    "Meridian Energy skipped property %d of %d on account %d, as "
-                    "Meridian lists them: it can't read Meridian's answer for it",
+                    "Meridian Energy can't read Meridian's answer for property %d "
+                    "of %d on account %d, as Meridian lists them",
                     place,
                 )
         return MeridianAccount(
@@ -818,15 +829,16 @@ class MeridianApiClient:
 
     async def async_get_billing_period(
         self, account_number: str
-    ) -> MeridianBillingPeriod:
+    ) -> MeridianBillingPeriod | None:
         """
         Return the retailer-defined current billing period for an account.
 
-        The start and end are read strictly, and a period that ends before it
-        starts is refused (``InvertedPeriodError``). The other fields, the
-        next billing date among them, are read leniently: each is None when
-        absent or unreadable, logging the field's name once at DEBUG, never
-        its value.
+        None when the account has no billing options, which Meridian may
+        leave out: no period, and no failure. The start and end are read
+        strictly, and a period that ends before it starts is refused
+        (``InvertedPeriodError``). The other fields, the next billing date
+        among them, are read leniently: each is None when absent or
+        unreadable, logging the field's name once at DEBUG, never its value.
         """
         data = await self._async_graphql(
             "billingPeriods",
@@ -834,6 +846,8 @@ class MeridianApiClient:
             {"accountNumber": account_number},
         )
         account = require_mapping(data.get("account"), "billing account")
+        if account.get("billingOptions") is None:
+            return None
         options = require_mapping(account.get("billingOptions"), "billing options")
         start = _optional_date(options.get("currentBillingPeriodStartDate"))
         end = _optional_date(options.get("currentBillingPeriodEndDate"))
@@ -965,9 +979,12 @@ class MeridianApiClient:
         ``operation`` labels the query in logs and errors; ``operation_name``,
         when given, is the name the document and the request carry instead.
         Kraken's rate limit (KT-CT-1199) arrives as a GraphQL error and is
-        raised as a rate limit with an hour's delay. A 401 or 403 after a
-        fresh session ends the sign-in only when its body is JSON, as
-        Meridian's own answers are; a gateway's page refuses the request.
+        raised as a rate limit with an hour's delay. A 401 is sent once more
+        with a renewed session, as Meridian's app does. The sign-in ends only
+        when a code that says the session has ended (KT-CT-1111, 1120, 1124
+        or 1143) comes back after that renewal, in a GraphQL answer or in a
+        401's body. Any other 401 after renewal, and any 403, is Meridian
+        refusing the request.
         """
         for attempt in range(2):
             tokens = await self.async_refresh_tokens(force=attempt == 1)
@@ -990,15 +1007,17 @@ class MeridianApiClient:
             except _MeridianHttpError as err:
                 if err.status == _HTTP_TOO_MANY_REQUESTS:
                     raise _rate_limit(err) from err
-                if err.status in {401, 403} and attempt == 1:
-                    if not err.json_body:
-                        raise _connection_error(err) from err
-                    raise MeridianAuthenticationError(
-                        "Meridian rejected the authenticated session"
-                    ) from err
-                if err.status not in {401, 403}:
-                    raise _connection_error(err) from err
-                continue
+                if err.status == _HTTP_UNAUTHORIZED:
+                    if attempt == 0:
+                        continue
+                    if any(
+                        code in _AUTH_GRAPHQL_CODES
+                        for code in _error_codes(err.payload)
+                    ):
+                        raise MeridianAuthenticationError(
+                            "Meridian rejected the authenticated session"
+                        ) from err
+                raise _connection_error(err) from err
 
             errors = response.get("errors")
             if errors:
@@ -1140,12 +1159,12 @@ def is_passing_failure(err: BaseException) -> bool:
 
 def _no_refusal(err: _MeridianHttpError) -> bool:
     """
-    Return whether a sign-in step's unsuccessful answer is no refusal.
+    Return whether the code check's or the session sign-in's answer is no refusal.
 
     A timeout (408) or a server error is a failure of the service. Meridian's
-    and Google's refusals are assumed to be JSON, so any other status
-    refuses only in JSON; a page from something in between makes no claim
-    about the email, code or session, and is no answer.
+    and Google's refusals are assumed to be JSON, so any other status is
+    taken to refuse only in JSON; a page from something in between makes no
+    claim about the code or session, and is no answer.
     """
     return (
         err.status == _HTTP_REQUEST_TIMEOUT

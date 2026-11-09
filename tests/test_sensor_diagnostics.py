@@ -41,6 +41,7 @@ from custom_components.meridian_energy.models import (
     MeridianProperty,
     MeridianSyncData,
     PropertySyncResult,
+    UnreadablePrice,
 )
 from custom_components.meridian_energy.sensor import (
     DESCRIPTIONS,
@@ -745,6 +746,81 @@ async def test_registered_sensors_before_first_sync(
         set() if has_feed_in else {"sensor.bill_export", "sensor.bill_credit"}
     )
     await entry._async_process_on_unload(hass)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("readable_exporter", "registered", "expected"),
+    [
+        # The property that can't be read may export: sensors registered stay.
+        (False, True, {*_ALWAYS, *_FEED_IN, *_PRICES}),
+        # None is made for it on a fresh setup.
+        (False, False, set(_ALWAYS)),
+        # A readable property that exports decides it.
+        (True, False, {*_ALWAYS, *_FEED_IN}),
+    ],
+)
+async def test_an_unreadable_property_leaves_the_feed_in_sensors_undecided(
+    hass,
+    entity_registry,
+    *,
+    readable_exporter: bool,
+    registered: bool,
+    expected: set[str],
+) -> None:
+    """Before the first sync and after it, while a property can't be read."""
+    account = _account()
+    meter = replace(
+        account.properties[0].meter_points[0], has_feed_in=readable_exporter
+    )
+    account = replace(
+        account,
+        properties=(replace(account.properties[0], meter_points=(meter,)),),
+        skipped_properties=1,
+    )
+    if not registered:
+        entity_registry.async_get_entity_id.side_effect = None
+        entity_registry.async_get_entity_id.return_value = None
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    coordinator._topology = (account,)
+    entry = _entry(coordinator)
+    entities = []
+
+    with patch(
+        "custom_components.meridian_energy.sensor.er.async_get",
+        return_value=entity_registry,
+    ):
+        await async_setup_entry(hass, entry, entities.extend)
+        assert set(_by_key(entities)) == expected
+        assert _removed(entity_registry) == set()
+
+        coordinator.async_set_updated_data(
+            _data(_result(has_feed_in=True if readable_exporter else None))
+        )
+        assert _removed(entity_registry) == set()
+        # The prices are now known; the feed-in sensors are as they were.
+        assert set(_by_key(entities)) == expected | set(_PRICES)
+    await entry._async_process_on_unload(hass)
+
+
+@pytest.mark.asyncio
+async def test_diagnostics_give_an_unreadable_price_by_its_shape(hass) -> None:
+    """The shape of a price's text, never the text, by the sensor it is for."""
+    prices = MeridianPrices(
+        plan="Synthetic Plan",
+        daily_charge=Decimal("2.11"),
+        anytime=None,
+        unreadable=(
+            UnreadablePrice("anytime_price", "formattedRateIncludingTax", "$N.NN /AAA"),
+        ),
+    )
+    coordinator = _coordinator_mock(_data(_result(prices=prices)))
+
+    diagnostics = await async_get_config_entry_diagnostics(hass, _entry(coordinator))
+
+    (result,) = diagnostics["coordinator"]["account_results"]
+    assert result["unreadable_prices"] == {"anytime_price": "$N.NN /AAA"}
+    assert result["known"]["anytime_price"] is False
 
 
 @pytest.mark.asyncio

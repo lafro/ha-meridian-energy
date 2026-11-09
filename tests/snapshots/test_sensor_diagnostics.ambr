@@ -26,6 +26,8 @@
             'total_due': True,
           }),
           'price_sensors': True,
+          'unreadable_prices': dict({
+          }),
         }),
       ]),
       'extras': dict({

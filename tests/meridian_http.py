@@ -432,9 +432,7 @@ def balance_data(today: date) -> dict[str, Any]:
     }
 
 
-def prices_data(
-    daily: str = "$2.000000 /day", anytime: str = "$0.300000 /kWh"
-) -> dict[str, Any]:
+def prices_data(daily: str = "$2.000000", anytime: str = "$0.300000") -> dict[str, Any]:
     """Return a synthetic all-day plan: one daily charge and one price per kWh."""
     return {
         "meterPoints": [

@@ -294,11 +294,16 @@ def _conditions(
     Return whether an account meets each sensor condition, None if unknown.
 
     Before the first sync, the feed-in register comes from the cached
-    accounts, and the plan is unknown. None when the sync's results lack
-    the account.
+    accounts, and the plan is unknown; so is the feed-in register while one
+    of the account's properties can't be read and no readable one has it.
+    None when the sync's results lack the account.
     """
     if data is None:
-        return {_FEED_IN: _account_has_feed_in(account), _PRICES: None}
+        return {
+            _FEED_IN: _account_has_feed_in(account)
+            or (None if account.skipped_properties else False),
+            _PRICES: None,
+        }
     result = _account_result(data, key)
     if result is None:
         return None

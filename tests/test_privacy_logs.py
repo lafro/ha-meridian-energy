@@ -43,6 +43,7 @@ from .meridian_http import (
     FakeMeridianSession,
     Response,
     json_response,
+    prices_data,
 )
 
 _NOW = datetime(2026, 7, 16, 12, 30, tzinfo=UTC)
@@ -77,7 +78,10 @@ _PRIVATE = (
     *ID_TOKEN.split("."),
     "synthetic-user-0123",
     "Synthetic Plan",
-    "/day",
+    # The prices' amounts, and the words of one that can't be read.
+    "2.000000",
+    "0.300000",
+    "Synthetic rate",
     "<html",
     # Any URL, and the key the session requests carry in theirs.
     "://",
@@ -279,6 +283,35 @@ async def test_setup_and_first_sync_logs_carry_no_private_values(
         _assert_failed_privately(failure, scenario)
     _assert_request_lines(_integration_records(caplog), synced=scenario.synced)
     _assert_private(_integration_records(caplog), meridian)
+
+
+@pytest.mark.asyncio
+async def test_a_price_that_cannot_be_read_is_logged_by_its_shape_alone(
+    hass: HomeAssistant,
+    meridian: FakeMeridianSession,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Its WARNING says how the text looks, never what it says."""
+    caplog.set_level(logging.DEBUG, logger=_INTEGRATION)
+    meridian.prices = prices_data(anytime=f"$0.300000 Synthetic rate {ACCOUNT_NUMBER}")
+
+    result = await _sign_in(hass)
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert await hass.config_entries.async_unload(result["result"].entry_id)
+    await hass.async_block_till_done()
+
+    records = _integration_records(caplog)
+    assert [
+        record.getMessage() for record in records if record.levelno == logging.WARNING
+    ] == [
+        (
+            "Meridian Energy can't read the anytime price in "
+            "formattedRateIncludingTax, which looks like '$N.NNNNNN AAAAAAAAA "
+            "AAA…'; Anytime price shows unknown"
+        )
+    ]
+    _assert_private(records, meridian)
 
 
 @pytest.mark.asyncio

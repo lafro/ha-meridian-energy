@@ -30,6 +30,7 @@ from .api import (
     MeridianOtpError,
     MeridianRateLimitError,
     MeridianRejectedError,
+    MeridianSignInServiceError,
     MeridianSignInServiceUnreadableError,
     http_status,
     is_unreadable,
@@ -116,8 +117,6 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
             error = _connection_error_key(err)
         except MeridianAuthenticationError:
             error = "email_not_found"
-        except ValueError:
-            error = _unreadable_answer()
         else:
             return await self.async_step_otp()
         return self._show_user_form({"base": error})
@@ -159,7 +158,13 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
     async def _async_check_code(
         self, user_input: dict[str, Any], email: str, journey_id: str
     ) -> ConfigFlowResult:
-        """Check the emailed code, then renew the entry's sign-in or find accounts."""
+        """
+        Check the emailed code, then renew the entry's sign-in or find accounts.
+
+        Once Meridian has answered that the code is right, it may not take
+        it again, so a later failure says to start again for a new code
+        rather than to send this one again.
+        """
         otp = str(user_input["otp"]).strip()
         if len(otp) != OTP_LENGTH or not otp.isascii() or not otp.isdigit():
             return self._show_otp_form({"base": "otp_invalid"})
@@ -167,12 +172,22 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
             tokens = await self._client.async_validate_otp(email, otp, journey_id)
         except MeridianOtpError as err:
             error = _otp_error_key(err.code)
+        except MeridianSignInServiceError as err:
+            error = _after_code_error_key(err)
+        except MeridianRateLimitError as err:
+            error = (
+                _after_code_error_key(err)
+                if err.sign_in_service
+                else _connection_error_key(err)
+            )
         except MeridianConnectionError as err:
             error = _connection_error_key(err)
         except MeridianAuthenticationError:
             error = "invalid_auth"
         except ValueError:
-            error = _unreadable_answer()
+            # The code check, or the sign-in after it, answered in a way that
+            # can't be read.
+            error = _unreadable_answer(code_answered=True)
         else:
             data = {
                 CONF_EMAIL: email,
@@ -355,8 +370,6 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
         except MeridianAuthenticationError:
             # There is no email to correct here: the entry's is the one sent.
             error = "reauth_email_refused"
-        except ValueError:
-            error = _unreadable_answer()
         else:
             return await self.async_step_otp()
         return self._show_reauth_confirm_form({"base": error})
@@ -376,12 +389,18 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 def _otp_error_key(code: str) -> str:
+    """
+    Return the form error for a refused code.
+
+    A refusal named otherwise keeps the form, as a wrong code does: Meridian's
+    app lets the code be tried again with the same sign-in.
+    """
     return {
         "OTP_EXPIRED": "otp_expired",
         "OTP_INVALID": "otp_invalid",
         "OTP_TOO_MANY_ATTEMPTS": "otp_too_many_attempts",
         "OTP_NOT_FOUND": "otp_not_found",
-    }.get(code, "invalid_auth")
+    }.get(code, "otp_invalid")
 
 
 def _connection_error_key(err: MeridianConnectionError) -> str:
@@ -400,10 +419,31 @@ def _connection_error_key(err: MeridianConnectionError) -> str:
     return "cannot_connect"
 
 
-def _unreadable_answer() -> str:
-    """Log a sign-in answer that can't be read, and return its form error."""
-    _LOGGER.debug("A sign-in answer couldn't be read; the form asks to try again")
-    return "sign_in_unreadable"
+def _after_code_error_key(err: MeridianConnectionError) -> str:
+    """
+    Return the form error for the sign-in service failing after the code.
+
+    Meridian took the code, so each says to start again for a new one.
+    """
+    if isinstance(err, MeridianRateLimitError):
+        log_rate_limit(err, "the form asks to start again")
+        return "sign_in_rate_limited_code"
+    if isinstance(err, MeridianSignInServiceUnreadableError) and not is_unreadable(err):
+        return _unreadable_answer(code_answered=True)
+    return "sign_in_cannot_connect_code"
+
+
+def _unreadable_answer(*, code_answered: bool = False) -> str:
+    """
+    Log a sign-in answer that can't be read, and return its form error.
+
+    Once the code has been answered, the form asks for a new code.
+    """
+    _LOGGER.debug(
+        "A sign-in answer couldn't be read; the form asks to %s",
+        "start again" if code_answered else "try again",
+    )
+    return "sign_in_unreadable_code" if code_answered else "sign_in_unreadable"
 
 
 def _log_discovery_failure(err: Exception) -> None:

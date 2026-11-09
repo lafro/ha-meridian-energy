@@ -46,7 +46,7 @@ from __future__ import annotations
 import base64
 from collections.abc import Callable, Iterable
 from datetime import UTC, date, datetime, time, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from unittest.mock import MagicMock
 from zoneinfo import ZoneInfo
@@ -65,6 +65,8 @@ from custom_components.meridian_energy.models import (
 )
 
 NZ = ZoneInfo("Pacific/Auckland")
+# The part of an amount the fake sends as the standing charge.
+_STANDING_SHARE = Decimal("0.2")
 HOUR = timedelta(hours=1)
 PREFIX = "arrayconnection:"
 PROPERTY_ID = "synthetic-property"
@@ -263,10 +265,9 @@ class FakeKraken:
             if end <= self.read_until and not self.estimated.intersection(hours)
             else "ESTIMATE"
         )
-        node["metaData"]["statistics"][0]["costInclTax"] = (
-            None
-            if None in costs
-            else {"estimatedAmount": str(sum(Decimal(str(cost)) for cost in costs))}
+        node["metaData"]["statistics"] = _cost_statistics(
+            None if None in costs else str(sum(Decimal(str(cost)) for cost in costs)),
+            direction,
         )
         node["value"] = str(sum(Decimal(self.value(hour, channel)) for hour in hours))
         node["readAt"] = node["endAt"] = end.astimezone(NZ).isoformat()
@@ -275,10 +276,6 @@ class FakeKraken:
     def node(self, start: datetime, channel: int, direction: str) -> dict[str, Any]:
         """Return one measurement node, as Kraken sends it."""
         end = start + HOUR
-        amount = self.cost(start, channel)
-        cost_type = (
-            "GENERATION_VALUE" if direction == "GENERATION" else ("CONSUMPTION_COST")
-        )
         return {
             "source": "SYNTHETIC",
             "value": self.value(start, channel),
@@ -301,14 +298,7 @@ class FakeKraken:
                         else "ESTIMATE"
                     ),
                 },
-                "statistics": [
-                    {
-                        "type": cost_type,
-                        "costInclTax": (
-                            None if amount is None else {"estimatedAmount": amount}
-                        ),
-                    }
-                ],
+                "statistics": _cost_statistics(self.cost(start, channel), direction),
             },
         }
 
@@ -468,3 +458,35 @@ def _errors(code: str) -> dict[str, Any]:
             }
         ],
     }
+
+
+def _cost_statistics(amount: Any, direction: str) -> list[dict[str, Any]]:
+    """
+    Return a node's cost statistics, as Kraken sends them: none without a cost.
+
+    A cost comes as two types, its standing charge (a fifth here) and its
+    consumption cost, which add up to the amount; an export credit as one.
+    An amount that is not a number is sent as it is, as the consumption cost.
+    """
+
+    def statistic(cost_type: str, value: Any) -> dict[str, Any]:
+        return {"type": cost_type, "costInclTax": {"estimatedAmount": value}}
+
+    if amount is None:
+        return []
+    if direction == "GENERATION":
+        return [statistic("GENERATION_VALUE", amount)]
+    try:
+        total = Decimal(amount) if isinstance(amount, str) else None
+    except InvalidOperation:
+        total = None
+    if total is None or not total.is_finite():
+        return [
+            statistic("STANDING_CHARGE_COST", "0"),
+            statistic("CONSUMPTION_COST", amount),
+        ]
+    standing = total * _STANDING_SHARE
+    return [
+        statistic("STANDING_CHARGE_COST", str(standing)),
+        statistic("CONSUMPTION_COST", str(total - standing)),
+    ]

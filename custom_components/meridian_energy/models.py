@@ -153,12 +153,31 @@ class MeridianBalance:
 
 
 @dataclass(frozen=True, slots=True)
+class UnreadablePrice:
+    """
+    A price whose text couldn't be read: its sensor's key, field and shape.
+
+    The shape is the text masked, digits as N and letters as A, and cut
+    short, so it says how the text looked without what it said.
+    """
+
+    key: str
+    field: str
+    shape: str
+
+
+@dataclass(frozen=True, slots=True)
 class MeridianPrices:
-    """An all-day plan's name and prices, in NZD; None where unreadable."""
+    """
+    An all-day plan's name and prices, in NZD; None where unreadable.
+
+    ``unreadable`` holds each price that couldn't be read.
+    """
 
     plan: str | None
     daily_charge: Decimal | None
     anytime: Decimal | None
+    unreadable: tuple[UnreadablePrice, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,12 +203,14 @@ class AccountSyncResult:
 
     ``price_sensors`` says whether the account has price sensors, which
     exist only for one property and one meter point on an all-day plan:
-    None until Meridian's answer has said.
+    None until Meridian's answer has said. ``has_feed_in`` is None while
+    one of the account's properties can't be read and no readable one
+    sends power to the grid.
     """
 
     account_key: str
     billing_period: MeridianBillingPeriod | None
-    has_feed_in: bool
+    has_feed_in: bool | None
     bill: BillFigures = BillFigures()
     total_due: Decimal | None = None
     credit: Decimal | None = None

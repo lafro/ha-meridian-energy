@@ -27,6 +27,7 @@ from homeassistant.exceptions import (
 )
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.translation import async_get_translations
 from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
@@ -495,6 +496,10 @@ class TestPublicConfigEntryLifecycle:
 
         assert entry.state is ConfigEntryState.MIGRATION_ERROR
         assert entry.error_reason_translation_key == "entry_too_old"
+        # The reason the card shows says how to keep the statistics.
+        reasons = await async_get_translations(hass, "en", "exceptions", [DOMAIN])
+        reason = reasons[f"component.{DOMAIN}.exceptions.entry_too_old.message"]
+        assert "(choose Keep if asked)" in reason
         assert entry.version == 3
         assert dict(entry.data) == _VERSION_3_DATA
         after = await instance.async_add_executor_job(
@@ -765,7 +770,14 @@ class TestPublicConfigEntryLifecycle:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "release",
-        ["first_failure", "third_failure", "refused_session", "ended_session"],
+        [
+            "first_failure",
+            "second_failure",
+            "third_failure",
+            "refused_session",
+            "ended_session",
+            "ended_after_failures",
+        ],
     )
     async def test_an_update_entity_sync_that_outlives_its_entry_ends_quietly(
         self, recorder_mock, hass, caplog, release: str
@@ -777,12 +789,13 @@ class TestPublicConfigEntryLifecycle:
         as a first failed update, it logs no error saying it tries again;
         released as the third in a row, it raises no repair notice; released
         as a refused session, whose renewal rotates the refresh token, it
-        stores nothing in the removed entry; released as a session refused
-        again after its renewal, it starts no reauthentication. Either way
-        nothing is logged as an error. It may still write the hours it
-        fetched, as statistics outlive the entry.
+        stores nothing in the removed entry; released as a session ended
+        after its renewal, it starts no reauthentication. Either way nothing
+        is logged as an error, nor a recovery that never came. It may still
+        write the hours it fetched, as statistics outlive the entry.
         """
         del recorder_mock
+        caplog.set_level(logging.INFO)
         session = FakeMeridianSession(NOW)
         entry = _entry()
         entry.add_to_hass(hass)
@@ -815,22 +828,28 @@ class TestPublicConfigEntryLifecycle:
             assert coordinator.last_update_success
             unavailable = json_response({}, status=503)
             gate = asyncio.Event()
-            if release == "third_failure":
-                session.hook = lambda operation, _variables: (
-                    unavailable if operation == "measurements" else None
-                )
+            failed_before = {
+                "second_failure": 1,
+                "third_failure": 2,
+                "ended_after_failures": 2,
+            }.get(release, 0)
+            session.hook = lambda operation, _variables: (
+                unavailable if operation == "measurements" else None
+            )
+            for _failure in range(failed_before):
                 await coordinator.async_refresh()
-                await coordinator.async_refresh()
-            failed_before = {"first_failure": 0, "third_failure": 2}
-            if release in failed_before:
-                assert coordinator._failed_updates == failed_before[release]
+            assert coordinator._failed_updates == failed_before
+            if release.endswith("_failure"):
                 held = iter([Response(b"{}", status=503, gate=gate)])
                 after: Response | None = unavailable
             else:
                 held = iter([Response(b"{}", status=401, gate=gate)])
                 after = (
-                    json_response({}, status=401)
-                    if release == "ended_session"
+                    json_response(
+                        {"errors": [{"extensions": {"errorCode": "KT-CT-1124"}}]},
+                        status=401,
+                    )
+                    if release.startswith("ended")
                     else None
                 )
                 session.auth_hook = renew
@@ -870,11 +889,17 @@ class TestPublicConfigEntryLifecycle:
             ir.async_get(hass).async_get_issue(DOMAIN, f"sync_failing_{entry.entry_id}")
             is None
         )
-        if release in {"refused_session", "ended_session"}:
+        if not release.endswith("_failure"):
             assert renewals
         assert hass.config_entries.flow.async_progress_by_handler(DOMAIN) == []
         assert [
             record.getMessage()
             for record in caplog.records
             if record.levelno >= logging.ERROR
+        ] == []
+        # Home Assistant logs a recovery after a failure: there was none.
+        assert [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno >= logging.INFO and "recovered" in record.getMessage()
         ] == []

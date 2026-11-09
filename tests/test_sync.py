@@ -62,6 +62,10 @@ from .syncs import (
 
 _INTEGRATION = "custom_components.meridian_energy"
 KEY = property_key(ACCOUNT_NUMBER, property_id(ACCOUNT_NUMBER))
+# A 401 whose body says the session has ended.
+_ENDED = json_response(
+    {"errors": [{"extensions": {"errorCode": "KT-CT-1124"}}]}, status=401
+)
 ENERGY_ID, COST_ID = consumption_ids(KEY)
 EXPORT_ID, CREDIT_ID = generation_ids(KEY)
 _HTML = {"Content-Type": "text/html"}
@@ -1216,8 +1220,9 @@ async def test_a_failing_sign_in_service_is_named_as_such(
     """
     Google's service holds the session; its failures are not Meridian's.
 
-    Only its own refusal, in JSON, ends the sign-in: a page, even a 400 or
-    403, is something in between failing, so no new login code is asked for.
+    Google's refusals are assumed to be JSON, so only a refusal in JSON ends
+    the sign-in; a page, even a 400 or 403, makes no claim about the session
+    and is no answer, so no new login code is asked for.
     """
     session = FakeMeridianSession(NOW)
     coordinator = coordinator_for(hass, session)
@@ -1316,7 +1321,7 @@ async def test_an_unreadable_session_renewal_is_invalid_data_not_an_ended_sign_i
     ("answer", "error"),
     [
         (_GATEWAY_PAGE, UpdateFailed),
-        (json_response({"error": "Synthetic"}, status=401), ConfigEntryAuthFailed),
+        (_ENDED, ConfigEntryAuthFailed),
     ],
 )
 async def test_what_came_before_a_failure_or_an_ended_sign_in_is_written(
@@ -1660,8 +1665,8 @@ async def test_an_account_list_whose_property_cannot_be_read_keeps_the_one_it_ha
     assert session.operations.count("accountsList") == 3
     assert _own(caplog, logging.INFO) == [
         (
-            "Meridian Energy skipped property 1 of 1 on account 1, as Meridian lists "
-            "them: it can't read Meridian's answer for it"
+            "Meridian Energy can't read Meridian's answer for property 1 of 1 on "
+            "account 1, as Meridian lists them"
         ),
         (
             "Meridian Energy couldn't refresh the list of accounts; it keeps using the "
@@ -1669,6 +1674,39 @@ async def test_an_account_list_whose_property_cannot_be_read_keeps_the_one_it_ha
         ),
         "Meridian Energy has refreshed the list of accounts again",
     ]
+
+
+async def test_a_login_of_two_accounts_keeps_its_list_when_one_cannot_be_read(
+    hass: HomeAssistant,
+) -> None:
+    """
+    One account's only property can't be read: the list it had is kept.
+
+    The other account's answer can be read; the list is kept all the same,
+    with the unit and memory of the account that can't be, until it reads.
+    """
+    session = FakeMeridianSession(NOW, accounts=(ACCOUNT_NUMBER, "A-TEST-2"))
+    coordinator = coordinator_for(hass, session)
+    await sync(coordinator, NOW, session)
+    second = property_key("A-TEST-2", property_id("A-TEST-2"))
+    memory = coordinator._memory[(second, "CONSUMPTION")]
+    unreadable = account_data("A-TEST-2")
+    unreadable["properties"][0]["id"] = None
+    session.hook = lambda operation, variables: (
+        json_response({"data": {"account": unreadable}})
+        if operation == "account" and variables["accountNumber"] == "A-TEST-2"
+        else None
+    )
+
+    data = await sync(coordinator, NOW + DAY, session)
+
+    assert data.property_count == 2
+    assert len(coordinator.unit_diagnostics()) == 2
+    assert coordinator._memory[(second, "CONSUMPTION")] is memory
+    assert session.operations.count("accountsList") == 2
+    session.hook = lambda _operation, _variables: None
+    await sync(coordinator, NOW + DAY + HOUR, session)
+    assert session.operations.count("accountsList") == 3
 
 
 def _feed_in_account(**register: Any) -> Response:
@@ -1781,7 +1819,7 @@ async def test_an_expired_account_list_that_fails_is_kept_and_asked_for_again(
     ("answer", "key"),
     [
         (_rate_limit(), "rate_limited"),
-        (json_response({}, status=401), None),
+        (_ENDED, None),
     ],
 )
 async def test_a_rate_limit_or_an_ended_sign_in_on_the_accounts_still_stops_it(

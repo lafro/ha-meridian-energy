@@ -467,6 +467,18 @@ def test_the_0_3_0_notes_are_short_and_say_how_much_history_comes_back() -> None
     assert words <= NOTES_WORD_LIMIT, f"0.3.0 notes have {words} words"
 
 
+def test_the_readme_names_the_stored_user_id_and_the_app_figures_matched() -> None:
+    """README says what the entry holds, and which app figures two sensors match."""
+    readme = Path("README.md").read_text()
+    assert "your email, your sign-in's user ID and a renewable sign-in" in readme
+    # Meridian's own estimate of its readings' lag is given as Meridian's.
+    assert "Meridian says its readings usually arrive" in readme
+    total_due = next(line for line in readme.splitlines() if "| Total due |" in line)
+    assert "**Billing → Transactions** **Balance**" in total_due
+    cost = next(line for line in readme.splitlines() if "| Bill cost so far |" in line)
+    assert "**Total cost so far**" in cost
+
+
 def test_starting_again_says_how_much_history_comes_back() -> None:
     """README's clean start says that only the last days' history is fetched again."""
     readme = Path("README.md").read_text()

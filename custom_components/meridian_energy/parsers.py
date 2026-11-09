@@ -26,6 +26,7 @@ from .models import (
     MeridianPayment,
     MeridianPrices,
     MeridianTokenSet,
+    UnreadablePrice,
     require_list,
     require_mapping,
 )
@@ -50,14 +51,15 @@ _UNNAMED_COST_TYPE = "UNNAMED"
 # of every window would carry one, so each is logged once.
 _logged_cost_types: set[str] = set()
 _NZ = ZoneInfo("Pacific/Auckland")
-# A price as the web app formats it, in dollars or in cents, per day or kWh.
-_DOLLAR_RATE = re.compile(r"\$\s?(\d+(?:\.\d+)?)\s?/\s?(day|kWh)")
-_CENT_RATE = re.compile(r"(\d+(?:\.\d+)?)\s?c\s?/\s?(day|kWh)")
+# A price as Meridian sends it and its app shows it: a dollar amount alone,
+# including GST and the levy. Its unit is not in the text: the app shows it
+# apart, by the rate's band.
+_AMOUNT = re.compile(r"\$([0-9]+(?:\.[0-9]+)?)")
 _STANDING, _CONSUMPTION = "STANDING_CHARGE", "CONSUMPTION_CHARGE"
-_PRICE_NAMES = {_STANDING: "daily charge", _CONSUMPTION: "anytime price"}
-# Each price's field already logged as unreadable, by band and field: each
-# price's field is logged once.
-_logged_rates: set[tuple[str, str]] = set()
+# Each band's price sensor.
+_PRICE_KEYS = {_STANDING: "daily_charge", _CONSUMPTION: "anytime_price"}
+# The longest shape an unreadable price is shown in, so no worded text is.
+_SHAPE_LENGTH = 24
 
 
 def parse_firebase_tokens(payload: dict[str, Any]) -> MeridianTokenSet:
@@ -114,17 +116,20 @@ def parse_measurement(
     """
     Parse one electricity measurement: an hour, or a New Zealand date.
 
-    A date runs from its midnight to the next, so it has 23, 24 or 25 hours.
+    A date's total is filed under the date its start is the midnight of,
+    as Meridian's app files it; its end is not read, and is taken as the
+    next midnight, so the date has 23, 24 or 25 hours.
     """
     start = parse_datetime(node.get("startAt"), "measurement start")
-    end = parse_datetime(node.get("endAt"), "measurement end")
     if frequency == READING_FREQUENCY_HOUR:
+        end = parse_datetime(node.get("endAt"), "measurement end")
         if end.astimezone(UTC) - start.astimezone(UTC) != timedelta(hours=1):
             raise ValueError("Measurement interval is not exactly one hour")
     else:
         day = start.astimezone(_NZ).date()
-        if (start, end) != (_nz_midnight(day), _nz_midnight(day + timedelta(days=1))):
-            raise ValueError("Measurement interval is not one New Zealand date")
+        if start != _nz_midnight(day):
+            raise ValueError("Measurement does not start at a New Zealand midnight")
+        end = _nz_midnight(day + timedelta(days=1))
     if required_string(node, "unit").casefold() != "kwh":
         raise ValueError("Unexpected measurement unit")
     value = _finite_decimal(node.get("value"), "measurement value")
@@ -212,11 +217,12 @@ def parse_prices(
 
     All-day: one meter point, whose current agreement has one daily charge
     and one price per kWh, and no rate tied to a time of day. Each price is
-    read strictly, its discounted form when it has a discount; one that does
-    not read as dollars or cents per day or kWh, as its band says, or is out
-    of range, is None, and the name of each price's field is logged once.
-    A meter point with no agreement in force says nothing of the plan
-    (``MeridianNoAgreement``).
+    read as Meridian's app shows it: its discounted text when it has a
+    discount, else its text, which must be a dollar amount alone. The band
+    gives the unit: NZD per day for the daily charge, per kWh for the
+    anytime price. Any other text, or an amount out of range, is None, and
+    is listed in ``unreadable`` with its masked shape. A meter point with
+    no agreement in force says nothing of the plan (``MeridianNoAgreement``).
     """
     meters = require_list(property_data.get("meterPoints"), "meter points")
     if len(meters) != 1:
@@ -231,43 +237,72 @@ def parse_prices(
     ]
     bands = {
         band: [rate for rate in rates if rate.get("bandCategory") == band]
-        for band in _PRICE_NAMES
+        for band in _PRICE_KEYS
     }
     if any(len(found) != 1 for found in bands.values()) or any(
         rate.get("touBucketName") not in (None, "") for rate in rates
     ):
         return None
+    unreadable: list[UnreadablePrice] = []
+    daily = _price(bands[_STANDING][0], _STANDING, unreadable)
+    anytime = _price(bands[_CONSUMPTION][0], _CONSUMPTION, unreadable)
     return MeridianPrices(
         plan=optional_string(agreement.get("displayName")),
-        daily_charge=_price(bands[_STANDING][0], _STANDING, "day"),
-        anytime=_price(bands[_CONSUMPTION][0], _CONSUMPTION, "kWh"),
+        daily_charge=daily,
+        anytime=anytime,
+        unreadable=tuple(unreadable),
     )
 
 
-def _price(rate: dict[str, Any], band: str, unit: str) -> Decimal | None:
-    """Return a rate's price in NZD; None unless it reads as its band's, in range."""
+def _price(
+    rate: dict[str, Any], band: str, unreadable: list[UnreadablePrice]
+) -> Decimal | None:
+    """Return a rate's price in NZD, or None, noted in ``unreadable``."""
     field = (
         "formattedRateIncludingTaxIncludingDiscount"
         if rate.get("hasDiscount") is True
         else "formattedRateIncludingTax"
     )
     text = rate.get(field)
-    text = text.strip() if isinstance(text, str) else ""
-    for pattern, dollars in ((_DOLLAR_RATE, Decimal(1)), (_CENT_RATE, Decimal(100))):
-        match = pattern.fullmatch(text)
-        if match is not None and match[2] == unit:
+    if isinstance(text, str):
+        match = _AMOUNT.fullmatch(text.strip())
+        if match is not None:
             amount = Decimal(match[1])
             if amount.adjusted() <= _LARGEST_EXPONENT:
-                return amount / dollars
-            break
-    if (band, field) not in _logged_rates:
-        _logged_rates.add((band, field))
-        _LOGGER.info(
-            "Meridian Energy can't read the %s in %s; it shows unknown",
-            _PRICE_NAMES[band],
-            field,
-        )
+                return amount
+    unreadable.append(UnreadablePrice(_PRICE_KEYS[band], field, price_shape(text)))
     return None
+
+
+def price_shape(text: Any) -> str:
+    """
+    Return how a price's text looks, without what it says.
+
+    Digits are N and letters A; other characters are kept, any space as
+    one space and anything unprintable as ``?``. A shape longer than
+    ``_SHAPE_LENGTH`` is cut short, ending in an ellipsis.
+    """
+    if text is None:
+        return "missing"
+    if not isinstance(text, str):
+        return "not text"
+    shape = "".join(
+        "N"
+        if char.isdigit()
+        else "A"
+        if char.isalpha()
+        else " "
+        if char.isspace()
+        else char
+        if char.isprintable()
+        else "?"
+        for char in text.strip()
+    )
+    if not shape:
+        return "empty"
+    if len(shape) > _SHAPE_LENGTH:
+        return shape[: _SHAPE_LENGTH - 1] + "…"
+    return shape
 
 
 def _measurement_channel_id(filters: dict[str, Any]) -> str:

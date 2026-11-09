@@ -8,9 +8,10 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-AUTH_GRAPHQL_CODES = frozenset(
-    {"KT-CT-1111", "KT-CT-1112", "KT-CT-1120", "KT-CT-1124", "KT-CT-1143"}
-)
+# The codes that say the session has ended. KT-CT-1112, a missing
+# Authorization header, is not one: it says nothing of the session, so it is
+# a refused request.
+AUTH_GRAPHQL_CODES = frozenset({"KT-CT-1111", "KT-CT-1120", "KT-CT-1124", "KT-CT-1143"})
 _ERROR_CODE_PATTERN = re.compile(r"[A-Za-z0-9_.-]{1,64}")
 # The form of Kraken's own codes: only these are ever shown.
 _KRAKEN_CODE_PATTERN = re.compile(r"KT-[A-Z]{2}-\d{4}")

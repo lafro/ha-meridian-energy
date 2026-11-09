@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import probatio
 import pytest
+from aiohttp import ClientPayloadError
 from homeassistant.config_entries import (
     SOURCE_IGNORE,
     SOURCE_REAUTH,
@@ -34,6 +35,7 @@ from custom_components.meridian_energy.api import (
     MeridianOtpError,
     MeridianRateLimitError,
     MeridianRejectedError,
+    MeridianSignInServiceError,
     MeridianSignInServiceUnreadableError,
     MeridianUpstreamError,
 )
@@ -391,10 +393,9 @@ async def test_an_ignored_entry_never_blocks_adding_the_login(
     meridian.async_send_otp.assert_awaited_once()
 
 
-# Errors from a sign-in request that got no usable answer, as each form names
-# them: a rate limit names the service that asked to wait, an answer that
-# can't be read says so, and everything else is the message about getting an
-# answer from Meridian.
+# Errors from a request to send a code that got no usable answer, as each
+# form names them: a rate limit says to wait, and everything else is the
+# message about getting an answer from Meridian.
 _CONNECTION_ERRORS = [
     (MeridianConnectionError(), "cannot_connect"),
     (MeridianUpstreamError(504), "cannot_connect"),
@@ -402,10 +403,23 @@ _CONNECTION_ERRORS = [
     (MeridianUpstreamError(503), "cannot_connect"),
     (MeridianRejectedError(400), "cannot_connect"),
     (MeridianRateLimitError(120), "rate_limited"),
-    (MeridianRateLimitError(120, sign_in_service=True), "sign_in_rate_limited"),
-    # An answer that can't be read, which says nothing of the sign-in.
-    (ValueError("unreadable"), "sign_in_unreadable"),
-    (MeridianSignInServiceUnreadableError("unexpected data"), "sign_in_unreadable"),
+]
+# Errors from the code step. Meridian's own failures to answer the code say
+# to try again; once Meridian has taken the code, a failure of the sign-in
+# after it, or an answer that can't be read, says to start again for a new
+# code.
+_CODE_STEP_ERRORS = [
+    *_CONNECTION_ERRORS,
+    (MeridianRateLimitError(120, sign_in_service=True), "sign_in_rate_limited_code"),
+    (MeridianSignInServiceError(503), "sign_in_cannot_connect_code"),
+    (MeridianSignInServiceError(None, timed_out=True), "sign_in_cannot_connect_code"),
+    (MeridianSignInServiceError(None), "sign_in_cannot_connect_code"),
+    (ValueError("unreadable"), "sign_in_unreadable_code"),
+    (
+        MeridianSignInServiceUnreadableError("unexpected data"),
+        "sign_in_unreadable_code",
+    ),
+    (MeridianAuthenticationError(), "invalid_auth"),
 ]
 
 
@@ -442,7 +456,8 @@ async def test_user_flow_send_errors(hass, error: Exception, expected: str) -> N
         ("OTP_INVALID", "otp_invalid"),
         ("OTP_TOO_MANY_ATTEMPTS", "otp_too_many_attempts"),
         ("OTP_NOT_FOUND", "otp_not_found"),
-        ("OTHER", "invalid_auth"),
+        # A refusal named otherwise keeps the form, as a wrong code does.
+        ("OTHER", "otp_invalid"),
     ],
 )
 @pytest.mark.asyncio
@@ -458,10 +473,7 @@ async def test_otp_errors(
     assert result["errors"] == {"base": expected}
 
 
-@pytest.mark.parametrize(
-    ("error", "expected"),
-    [*_CONNECTION_ERRORS, (MeridianAuthenticationError(), "invalid_auth")],
-)
+@pytest.mark.parametrize(("error", "expected"), _CODE_STEP_ERRORS)
 @pytest.mark.asyncio
 async def test_otp_service_errors(
     hass, meridian: _FakeMeridian, error: Exception, expected: str
@@ -596,8 +608,9 @@ async def test_reauth_send_errors(hass, error: Exception, expected: str) -> None
     """
     Reauthentication names its failures as setup does, but for the email.
 
-    Its form has no email to correct, so a refused email says to set
-    Meridian Energy up again with the one now used for MyMeridian.
+    Its form has no email to correct, so a refused email says code sign-in
+    may not be open to the login yet, or to set Meridian Energy up again
+    with the email now used for MyMeridian.
     """
     entry = _configured_entry(hass)
     client = MagicMock()
@@ -615,6 +628,37 @@ async def test_reauth_send_errors(hass, error: Exception, expected: str) -> None
 
     assert result["step_id"] == "reauth_confirm"
     assert result["errors"] == {"base": expected}
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (
+            MeridianRateLimitError(120, sign_in_service=True),
+            "sign_in_rate_limited_code",
+        ),
+        (MeridianSignInServiceError(503), "sign_in_cannot_connect_code"),
+        (ValueError("unreadable"), "sign_in_unreadable_code"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_reauth_code_taken_then_failing_asks_for_a_new_code(
+    hass: HomeAssistant, meridian: _FakeMeridian, error: Exception, expected: str
+) -> None:
+    """Reauthentication, too, never says to send a code Meridian has taken."""
+    entry = _configured_entry(hass)
+    meridian.async_validate_otp.side_effect = error
+    result = await entry.start_reauth_flow(hass)
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+    assert result["step_id"] == "otp"
+
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"], {"otp": "123456"}
+    )
+
+    assert result["step_id"] == "otp"
+    assert result["errors"] == {"base": expected}
+    assert entry.data[CONF_REFRESH_TOKEN] == "old-refresh"
 
 
 @pytest.mark.asyncio
@@ -867,6 +911,29 @@ async def test_account_discovery_failures_are_named_and_logged(
         assert text not in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (MeridianSignInServiceUnreadableError("unexpected data"), "sign_in_unreadable"),
+        (MeridianSignInServiceError(503), "cannot_connect"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_session_renewal_failing_while_finding_the_accounts_keeps_the_code(
+    hass: HomeAssistant, meridian: _FakeMeridian, error: Exception, expected: str
+) -> None:
+    """The sign-in is kept, so Submit tries again with no new code."""
+    meridian.async_get_accounts.side_effect = [error, (_account(),)]
+
+    result = await _submit_login(hass)
+
+    assert result["step_id"] == "discovery_retry"
+    assert result["errors"] == {"base": expected}
+    result = await hass.config_entries.flow.async_configure(result["flow_id"], {})
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert meridian.async_validate_otp.await_count == 1
+
+
 @pytest.mark.asyncio
 async def test_account_discovery_auth_failure_requires_new_login(
     hass: HomeAssistant, meridian: _FakeMeridian
@@ -931,51 +998,191 @@ async def _answer_sign_in_step(
     return result
 
 
-@pytest.mark.parametrize("step", ["send_code", "check_code", "session_sign_in"])
+def _page(status: int = 200, content_type: str = "") -> Response:
+    """Return a web page, its Content-Type saying so or not."""
+    return Response(
+        b"<html>Synthetic page</html>",
+        status=status,
+        headers={"Content-Type": content_type},
+    )
+
+
+def _unreadable(kind: str) -> Response:
+    if kind == "JSON not an object":
+        return json_response(["not", "an", "object"])
+    return Response(b"", headers={"Content-Type": "application/json"})
+
+
 @pytest.mark.parametrize(
-    ("answer", "expected"),
+    ("step", "answer", "expected"),
     [
+        # Meridian's code check: a page is Meridian not answering, the code
+        # still unanswered; an answer that can't be read may have taken it.
+        ("check_code", _page(403), "cannot_connect"),
+        ("check_code", _page(404), "cannot_connect"),
+        ("check_code", _page(content_type="text/html"), "cannot_connect"),
+        ("check_code", _unreadable("JSON not an object"), "sign_in_unreadable_code"),
+        ("check_code", _unreadable("empty"), "sign_in_unreadable_code"),
+        # The session sign-in after it: Meridian has taken the code.
+        ("session_sign_in", _page(403), "sign_in_cannot_connect_code"),
+        ("session_sign_in", _page(404), "sign_in_cannot_connect_code"),
         (
-            Response(
-                b"<html>Forbidden</html>", status=403, headers={"Content-Type": ""}
-            ),
-            "cannot_connect",
+            "session_sign_in",
+            _page(content_type="text/html"),
+            "sign_in_cannot_connect_code",
         ),
         (
-            Response(
-                b"<html>Not found</html>", status=404, headers={"Content-Type": ""}
-            ),
-            "cannot_connect",
+            "session_sign_in",
+            _unreadable("JSON not an object"),
+            "sign_in_unreadable_code",
         ),
-        (
-            Response(b"<html>Signed in</html>", headers={"Content-Type": "text/html"}),
-            "cannot_connect",
-        ),
-        (json_response(["not", "an", "object"]), "sign_in_unreadable"),
-        (
-            Response(b"", headers={"Content-Type": "application/json"}),
-            "sign_in_unreadable",
-        ),
+        ("session_sign_in", _unreadable("empty"), "sign_in_unreadable_code"),
     ],
-    ids=["403 page", "404 page", "a web page", "JSON not an object", "empty"],
+    ids=[
+        f"{step}-{kind}"
+        for step in ("check_code", "session_sign_in")
+        for kind in (
+            "403 page",
+            "404 page",
+            "a web page",
+            "JSON not an object",
+            "empty",
+        )
+    ],
 )
 @pytest.mark.asyncio
-async def test_an_answer_that_refuses_nothing_is_no_answer_at_either_step(
+async def test_an_answer_that_refuses_nothing_is_no_answer_at_the_code_step(
     hass: HomeAssistant, step: str, answer: Response, expected: str
 ) -> None:
     """
     Meridian's and Google's refusals are assumed to be JSON.
 
     A page from something in between, or an answer that can't be read,
-    makes no claim about the email, code or session. A page is the service
-    not answering; an answer in JSON that can't be read says so. Either
-    way the form says what happened, and Submit tries again.
+    makes no claim about the code or session. A page is the service not
+    answering; an answer in JSON that can't be read says so. Once Meridian
+    may have taken the code, the form asks to start again for a new one.
     """
     result = await _answer_sign_in_step(hass, step, answer)
 
     assert result["type"] is FlowResultType.FORM
-    assert result["step_id"] == ("user" if step == "send_code" else "otp")
+    assert result["step_id"] == "otp"
     assert result["errors"] == {"base": expected}
+
+
+@pytest.mark.parametrize(
+    ("answer", "expected"),
+    [
+        # Refused: 404 whatever its body, and 403 unless it is a web page.
+        (json_response({"error": "Not Found"}, status=404), "email_not_found"),
+        (_page(404, "text/html"), "email_not_found"),
+        (Response(b"", status=404, headers={}), "email_not_found"),
+        (json_response({"error": "Denied"}, status=403), "email_not_found"),
+        (
+            Response(b"Denied", status=403, headers={"Content-Type": "text/plain"}),
+            "email_not_found",
+        ),
+        (Response(b"", status=403, headers={}), "email_not_found"),
+        (_page(403), "cannot_connect"),
+        (_page(403, "text/html"), "cannot_connect"),
+        (
+            Response(b"Denied", status=403, headers={"Content-Type": "text/html"}),
+            "cannot_connect",
+        ),
+        (
+            Response(b"", status=403, headers={"Content-Type": "text/html"}),
+            "cannot_connect",
+        ),
+        # A 403 whose body broke off is a web page by its type alone.
+        (
+            Response(
+                b"",
+                status=403,
+                headers={"Content-Type": "text/html"},
+                read_error=ClientPayloadError("Response payload is not completed"),
+            ),
+            "cannot_connect",
+        ),
+        (
+            Response(
+                b"",
+                status=403,
+                headers={"Content-Type": "application/json"},
+                read_error=ClientPayloadError("Response payload is not completed"),
+            ),
+            "email_not_found",
+        ),
+        # Any other client or server error is no answer.
+        (json_response({"error": "Bad Request"}, status=400), "cannot_connect"),
+        (json_response({}, status=401), "cannot_connect"),
+        (json_response({"error": "Unprocessable"}, status=422), "cannot_connect"),
+        (json_response({}, status=500), "cannot_connect"),
+        (_page(502, "text/html"), "cannot_connect"),
+    ],
+    ids=[
+        "404 JSON",
+        "404 page",
+        "404 empty",
+        "403 JSON",
+        "403 text",
+        "403 empty",
+        "403 page",
+        "403 HTML",
+        "403 typed HTML",
+        "403 empty HTML",
+        "403 HTML cut off",
+        "403 JSON cut off",
+        "400 JSON",
+        "401 JSON",
+        "422 JSON",
+        "500 JSON",
+        "502 page",
+    ],
+)
+@pytest.mark.asyncio
+async def test_the_send_code_step_is_decided_by_its_status(
+    hass: HomeAssistant, answer: Response, expected: str
+) -> None:
+    """As in Meridian's app, the status alone says whether the email is refused."""
+    result = await _answer_sign_in_step(hass, "send_code", answer)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "user"
+    assert result["errors"] == {"base": expected}
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        json_response({"success": True}),
+        json_response({"success": False}),
+        json_response({}),
+        json_response(["not", "an", "object"]),
+        Response(b"", headers={"Content-Type": "application/json"}),
+        _page(content_type="text/html"),
+        Response(b"", status=204, headers={}),
+        json_response({"sent": True}, status=202),
+    ],
+    ids=[
+        "success",
+        "success false",
+        "empty object",
+        "not an object",
+        "empty",
+        "a web page",
+        "204",
+        "202",
+    ],
+)
+@pytest.mark.asyncio
+async def test_any_success_status_from_the_send_code_step_counts_as_sent(
+    hass: HomeAssistant, answer: Response
+) -> None:
+    """Meridian's app reads no body from a sent code: the form asks for it."""
+    result = await _answer_sign_in_step(hass, "send_code", answer)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "otp"
+    assert not result.get("errors")
 
 
 @pytest.mark.parametrize(
@@ -987,7 +1194,7 @@ async def test_an_answer_that_refuses_nothing_is_no_answer_at_either_step(
 async def test_a_session_whose_expiry_cannot_be_read_is_an_unreadable_answer(
     hass: HomeAssistant, expires: str | None
 ) -> None:
-    """Not a refused sign-in: the code was accepted, so no new code helps."""
+    """Not a refused sign-in, but the code may now be used: a new one is asked for."""
     session: dict[str, Any] = {
         "idToken": "synthetic-id",
         "refreshToken": "synthetic-refresh",
@@ -1000,7 +1207,7 @@ async def test_a_session_whose_expiry_cannot_be_read_is_an_unreadable_answer(
 
     assert result["type"] is FlowResultType.FORM
     assert result["step_id"] == "otp"
-    assert result["errors"] == {"base": "sign_in_unreadable"}
+    assert result["errors"] == {"base": "sign_in_unreadable_code"}
 
 
 _WAIT_ASKED = "asked Meridian Energy to wait"
@@ -1027,7 +1234,7 @@ _WAIT_ASKED = "asked Meridian Energy to wait"
         ),
         (
             "session_sign_in",
-            "sign_in_rate_limited",
+            "sign_in_rate_limited_code",
             (
                 "The sign-in service asked Meridian Energy to wait (HTTP 429, no "
                 "code, with Retry-After)"
@@ -1055,8 +1262,9 @@ async def test_a_rate_limit_at_a_sign_in_step_is_named_by_its_service(
 
     assert result["type"] is FlowResultType.FORM
     assert result["errors"] == {"base": expected}
+    asks = "start again" if step == "session_sign_in" else "wait"
     assert [m for m in caplog.messages if _WAIT_ASKED in m] == [
-        f"{said}; the form asks to wait"
+        f"{said}; the form asks to {asks}"
     ]
 
 

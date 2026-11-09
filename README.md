@@ -56,10 +56,10 @@ Each account has one device, **Meridian Energy**. Amounts are in NZD.
 | Sensor | Shows |
 |---|---|
 | Bill usage so far | Grid import in the current billing period, actual readings only, as the app's **Usage → Trends** shows |
-| Bill cost so far | The cost of that usage, as Trends shows; the app's Home screen can show more |
+| Bill cost so far | The cost of that usage, as Trends shows; Home's **Total cost so far** adds today's estimate, usually about a day's cost more |
 | Bill export so far, Bill credit so far | Grid export in the period, and its credit (feed-in register only) |
 | Bill estimate | Meridian's estimate of the whole period's cost |
-| Total due | What you owe, 0 when in credit; its credit attribute holds any credit |
+| Total due | What you owe (0 in credit), as the app's **Billing → Transactions** **Balance**; its Home and Billing card can differ while you owe. Its credit attribute holds any credit |
 | Last bill | When your latest bill was issued, with the period it covers |
 | Last payment | Your latest payment's amount, with its date and status |
 | Daily charge, Anytime price | Your plan's prices, including GST (only for one property with one meter on an all-day plan) |
@@ -71,7 +71,7 @@ Each account has one device, **Meridian Energy**. Amounts are in NZD.
 ## How data updates
 
 - Meridian Energy asks Meridian for new data every hour.
-- Meridian's readings usually arrive 2–3 days late, as estimates until then, and gaps usually fill in within a week or two. Each update asks again for the last three days, and once a day (and after each restart or reload) for the last three weeks, so readings replace the estimates.
+- Meridian says its readings usually arrive 2–3 days late, as estimates until then, and gaps usually fill in within a week or two. Each update asks again for the last three days, and once a day (and after each restart or reload) for the last three weeks, so readings replace the estimates.
 - Hours missing in the last 90 days, as after an outage, are filled in by the next updates; earlier history stays.
 - The **so far** sensors count actual readings only, so they can read lower than the Energy dashboard.
 - Each hour's cost includes its share of the daily charge, which Meridian spreads over the day.
@@ -113,7 +113,7 @@ Solar export, time-of-use plans and several accounts or properties are tested on
 
 ## Security, support and licence
 
-Meridian Energy never asks for or stores your Meridian password: its entry holds only your email and a renewable sign-in.
+Meridian Energy never asks for or stores your Meridian password: its entry holds only your email, your sign-in's user ID and a renewable sign-in.
 
 Use [GitHub Issues](https://github.com/lafro/ha-meridian-energy/issues) for support and [private vulnerability reporting](SECURITY.md) for security problems. Development notes are in [CONTRIBUTING.md](CONTRIBUTING.md) and [docs/](docs/README.md).
 

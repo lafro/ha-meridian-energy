@@ -172,13 +172,14 @@ async def test_send_otp() -> None:
     assert client.tokens is None
 
 
+@pytest.mark.parametrize("answer", [{"success": False}, {}, {"sent": "yes"}])
 @pytest.mark.asyncio
-async def test_send_otp_rejected() -> None:
+async def test_any_success_status_counts_as_a_sent_code(answer: dict) -> None:
+    """The body of a sent code's answer is not read, as in Meridian's app."""
     client = MeridianApiClient(MagicMock())
-    client._async_json_request = AsyncMock(return_value={"success": False})
+    client._async_json_request = AsyncMock(return_value=answer)
 
-    with pytest.raises(MeridianAuthenticationError):
-        await client.async_send_otp("person@example.com", "journey")
+    await client.async_send_otp("person@example.com", "journey")
 
 
 @pytest.mark.asyncio
@@ -206,20 +207,31 @@ async def test_send_otp_maps_request_timeout_to_connection_failure() -> None:
 
 
 @pytest.mark.parametrize(
-    ("status", "error_type"),
+    ("status", "html_body", "error_type"),
     [
-        (400, MeridianAuthenticationError),
-        (429, MeridianRateLimitError),
+        (404, False, MeridianAuthenticationError),
+        (404, True, MeridianAuthenticationError),
+        (403, False, MeridianAuthenticationError),
+        (403, True, MeridianRejectedError),
+        (400, False, MeridianRejectedError),
+        (401, False, MeridianRejectedError),
+        (422, False, MeridianRejectedError),
+        (429, False, MeridianRateLimitError),
     ],
 )
 @pytest.mark.asyncio
 async def test_send_otp_maps_client_errors(
-    status: int, error_type: type[Exception]
+    status: int, *, html_body: bool, error_type: type[Exception]
 ) -> None:
+    """Only 404, or 403 unless a web page, refuses the email."""
     client = MeridianApiClient(MagicMock())
     client._async_json_request = AsyncMock(
         side_effect=_MeridianHttpError(
-            status, {"secret": "must-not-leak"}, 123, json_body=True
+            status,
+            {"secret": "must-not-leak"},
+            123,
+            json_body=not html_body,
+            html_body=html_body,
         )
     )
 
@@ -837,8 +849,8 @@ async def test_a_property_that_cannot_be_read_is_skipped_and_logged_by_place(
         (
             logging.WARNING,
             (
-                f"Meridian Energy skipped property {number} of 4 on account 1, as "
-                "Meridian lists them: it can't read Meridian's answer for it"
+                "Meridian Energy can't read Meridian's answer for property "
+                f"{number} of 4 on account 1, as Meridian lists them"
             ),
         )
         for number in (2, 3, 4)
@@ -1564,25 +1576,91 @@ async def test_graphql_retries_once_after_unauthorized() -> None:
     }
 
 
+def _coded(code: str) -> dict[str, Any]:
+    return {"errors": [{"message": "A-TEST-1", "extensions": {"errorCode": code}}]}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("json_body", "error"),
-    [(True, MeridianAuthenticationError), (False, MeridianRejectedError)],
+    ("payload", "json_body", "error"),
+    [
+        # A code that says the session has ended, after a renewal.
+        (_coded("KT-CT-1111"), True, MeridianAuthenticationError),
+        (_coded("KT-CT-1120"), True, MeridianAuthenticationError),
+        (_coded("KT-CT-1124"), True, MeridianAuthenticationError),
+        (_coded("KT-CT-1143"), True, MeridianAuthenticationError),
+        # Any other 401 after renewal is Meridian refusing the request.
+        ({}, True, MeridianRejectedError),
+        (_coded("KT-CT-1112"), True, MeridianRejectedError),
+        (_coded("KT-CT-4321"), True, MeridianRejectedError),
+        ({}, False, MeridianRejectedError),
+    ],
+    ids=[
+        "KT-CT-1111",
+        "KT-CT-1120",
+        "KT-CT-1124",
+        "KT-CT-1143",
+        "no code",
+        "KT-CT-1112",
+        "another code",
+        "a page",
+    ],
 )
-async def test_graphql_second_unauthorized_requires_reauth(
-    json_body: bool, error: type[Exception]
+async def test_a_401_after_renewal_ends_the_sign_in_only_with_a_session_code(
+    payload: dict[str, Any], *, json_body: bool, error: type[Exception]
 ) -> None:
-    """Only Meridian's own JSON refusal of a fresh session ends the sign-in."""
+    """A 401 is sent once more with a renewed session, as Meridian's app does."""
     client = MeridianApiClient(MagicMock(), tokens=_tokens())
     client.async_refresh_tokens = AsyncMock(return_value=_tokens())
     client._async_json_request = AsyncMock(
         side_effect=[
             _MeridianHttpError(401, {}, json_body=True),
-            _MeridianHttpError(403, {}, json_body=json_body),
+            _MeridianHttpError(401, payload, json_body=json_body),
         ]
     )
-    with pytest.raises(error):
+    with pytest.raises(error) as raised:
         await client._async_graphql("operation", "query", {})
+
+    assert client.async_refresh_tokens.await_args_list[1].kwargs == {"force": True}
+    assert "A-TEST-1" not in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{}, _coded("KT-CT-1124")],
+    ids=["no code", "a session code"],
+)
+@pytest.mark.asyncio
+async def test_a_403_is_a_refused_request_never_sent_again(
+    payload: dict[str, Any],
+) -> None:
+    """Meridian's app sends no request again after a 403, nor ends the sign-in."""
+    client = MeridianApiClient(MagicMock(), tokens=_tokens())
+    client.async_refresh_tokens = AsyncMock(return_value=_tokens())
+    client._async_json_request = AsyncMock(
+        side_effect=_MeridianHttpError(403, payload, json_body=True)
+    )
+    with pytest.raises(MeridianRejectedError) as raised:
+        await client._async_graphql("operation", "query", {})
+
+    assert raised.value.status == 403
+    client._async_json_request.assert_awaited_once()
+    client.async_refresh_tokens.assert_awaited_once_with(force=False)
+
+
+@pytest.mark.asyncio
+async def test_a_missing_authorization_header_code_is_a_refused_request() -> None:
+    """KT-CT-1112 does not end the sign-in: it is not sent again, nor renewed."""
+    client = MeridianApiClient(MagicMock(), tokens=_tokens())
+    client.async_refresh_tokens = AsyncMock(return_value=_tokens())
+    client._async_json_request = AsyncMock(return_value=_coded("KT-CT-1112"))
+
+    with pytest.raises(MeridianGraphQLError) as raised:
+        await client._async_graphql("operation", "query", {})
+
+    assert raised.value.codes == ("KT-CT-1112",)
+    client._async_json_request.assert_awaited_once()
+    client.async_refresh_tokens.assert_awaited_once_with(force=False)
 
 
 @pytest.mark.asyncio
@@ -1647,12 +1725,15 @@ async def test_query_limit_codes_stay_graphql_errors_naming_the_code(
     client._async_json_request.assert_awaited_once()
 
 
+@pytest.mark.parametrize(
+    "code", ["KT-CT-1111", "KT-CT-1120", "KT-CT-1124", "KT-CT-1143"]
+)
 @pytest.mark.asyncio
-async def test_graphql_auth_code_requires_reauth() -> None:
+async def test_graphql_auth_code_requires_reauth(code: str) -> None:
     client = MeridianApiClient(MagicMock(), tokens=_tokens())
     client.async_refresh_tokens = AsyncMock(return_value=_tokens())
     client._async_json_request = AsyncMock(
-        return_value={"errors": [{"extensions": {"errorCode": "KT-CT-1111"}}]}
+        return_value={"errors": [{"extensions": {"errorCode": code}}]}
     )
     with pytest.raises(MeridianAuthenticationError):
         await client._async_graphql("operation", "query", {})
