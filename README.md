@@ -24,13 +24,13 @@ You need Home Assistant 2026.10 or newer and a GitHub account: HACS needs one, a
 2. If setup didn't open, go to **Settings → Devices & services → Add integration → Meridian Energy**.
 3. Enter the email you use for MyMeridian, then the code Meridian sends to it.
 
-Setup finishes once the code is accepted. Meridian Energy then fetches your last 90 days in the background, which can take several minutes; until then its sensors show as unavailable. The sign-in renews itself.
+Setup finishes once the code is accepted and your account is found. Meridian Energy then fetches your last 90 days in the background, which can take several minutes; until then its sensors show as unavailable. The sign-in renews itself.
 
 Updates appear under **Settings → Updates**: install one there, then restart Home Assistant when asked.
 
 Beta versions are GitHub pre-releases, offered only if you opt in: in the Marketplace, **Meridian Energy → ⋮ → Include pre-releases** (before **Install**, to start on a beta); in HACS on 2026.10, enable and turn on the **Pre-release** switch on Meridian Energy's device under **Settings → Devices & services → HACS**.
 
-If an entry says it was set up by an earlier version, remove it and add Meridian Energy again, ideally with a [clean start](#starting-again).
+If an entry says it was set up by an earlier version, remove it and add it again, ideally with a [clean start](#starting-again).
 
 ## Energy dashboard
 
@@ -71,7 +71,7 @@ Each account has one device, **Meridian Energy**.
 Example (default names): notify when this bill passes a budget.
 
 ```yaml
-alias: Electricity bill over budget
+alias: Bill over budget
 triggers:
   - trigger: numeric_state
     entity_id: sensor.meridian_energy_bill_cost_so_far
@@ -98,16 +98,16 @@ actions:
 
 ## Troubleshooting
 
-- **Reconnect requested:** Meridian ended the sign-in. Under **Settings → Devices & services**, select **Reconfigure**, then **Submit**, and enter the new code Meridian emails you.
-- **"Meridian Energy isn't updating":** this repair notice appears after three failed updates in a row, or at once when Meridian stops listing any active or dormant account for the login. It gives the reason, for example:
+- **"Authentication expired for Meridian Energy":** Meridian ended the sign-in. Under **Settings → Devices & services**, select **Reconfigure** on the Meridian Energy card, then **Submit**, and enter the code Meridian emails you.
+- **"Meridian Energy isn't updating":** this repair notice appears after three failed updates in a row, or at once when Meridian stops listing any active or dormant account. It gives the reason, for example:
 
   > Couldn't get an answer from Meridian (HTTP 504). Meridian Energy tries again automatically.
   >
   > This notice goes away by itself once an update works.
 
   An ended sign-in asks you to reconnect instead.
-- **Asked to wait:** at setup, try again later; afterwards, Meridian Energy waits as asked, then carries on.
-- **A warning that Meridian Energy couldn't update grid import or export:** the rest kept updating, so the update still counts as working; the next update tries that part again.
+- **Asked to wait:** at setup, try again later; afterwards, Meridian Energy waits as asked.
+- **A warning that Meridian Energy couldn't update grid import or export:** the rest kept updating, so the update counts as working; the next tries that part again.
 - **An answer Meridian Energy can't read:** it tries again; if this keeps happening, check for an update to Meridian Energy.
 - **Reporting a problem:** in the integration's ⋮ menu, select **Enable debug logging**, reproduce the problem, then **Disable debug logging** to download the log. Download diagnostics from the same menu. Both leave out your email, account and meter numbers, address, tokens, usage and amounts, but check them before sharing.
 
