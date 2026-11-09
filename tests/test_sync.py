@@ -24,7 +24,10 @@ from homeassistant.helpers import translation
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from sqlalchemy.exc import OperationalError
 
-from custom_components.meridian_energy.api import MeridianSignInServiceError
+from custom_components.meridian_energy.api import (
+    MeridianSignInServiceError,
+    MeridianSignInServiceUnreadableError,
+)
 from custom_components.meridian_energy.const import DOMAIN, UPDATE_INTERVAL
 from custom_components.meridian_energy.coordinator import _error_phrase, _Memory
 from custom_components.meridian_energy.statistics import (
@@ -1039,6 +1042,34 @@ async def test_the_first_rate_limit_of_a_run_is_noted_once(
     assert coordinator.rate_limits_met == 3
 
 
+async def test_an_update_that_fails_for_another_reason_ends_a_run_of_limits(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A limit, an update that fails otherwise, then a limit: two runs.
+
+    So the second limit is noted too, and waits what its answer asked,
+    not twice as long.
+    """
+    caplog.set_level(logging.INFO)
+    session = FakeMeridianSession(NOW)
+    coordinator = coordinator_for(hass, session)
+    await sync(coordinator, NOW, session)
+    waits = []
+    for update, answer in enumerate(
+        [_rate_limit(), json_response({}, status=500), _rate_limit()], start=1
+    ):
+        session.hook = lambda operation, _variables, answer=answer: (
+            answer if operation == "measurements" else None
+        )
+        with pytest.raises(UpdateFailed) as failure:
+            await sync(coordinator, NOW + update * HOUR, session)
+        waits.append(failure.value.retry_after)
+
+    assert len(_limit_noted(caplog)) == 2
+    assert waits == [120, None, 120]
+
+
 def _sign_in_limited(session: FakeMeridianSession, coordinator: Any) -> None:
     _renew_at_next_request(coordinator)
     session.auth_hook = lambda operation: (
@@ -1066,21 +1097,21 @@ _LIMIT_ERRORS = json.dumps(
         (
             _measurements_answer(_rate_limit()),
             (
-                "Meridian asked Meridian Energy to wait (HTTP 429, code none, with "
+                "Meridian asked Meridian Energy to wait (HTTP 429, no code, with "
                 "Retry-After)"
             ),
         ),
         (
             _measurements_answer(Response(b"", status=429)),
             (
-                "Meridian asked Meridian Energy to wait (HTTP 429, code none, without "
+                "Meridian asked Meridian Energy to wait (HTTP 429, no code, without "
                 "Retry-After)"
             ),
         ),
         (
             _measurements_answer(_coded("KT-CT-1199")),
             (
-                "Meridian asked Meridian Energy to wait (HTTP 200, code KT-CT-1199, "
+                "Meridian asked Meridian Energy to wait (HTTP 200, KT-CT-1199, "
                 "without Retry-After)"
             ),
         ),
@@ -1092,22 +1123,22 @@ _LIMIT_ERRORS = json.dumps(
                 )
             ),
             (
-                "Meridian asked Meridian Energy to wait (HTTP 200, code KT-CT-1199, "
+                "Meridian asked Meridian Energy to wait (HTTP 200, KT-CT-1199, "
                 "with Retry-After)"
             ),
         ),
         (
             _measurements_answer(Response(_LIMIT_ERRORS, status=429)),
             (
-                "Meridian asked Meridian Energy to wait (HTTP 429, code KT-CT-1199, "
+                "Meridian asked Meridian Energy to wait (HTTP 429, KT-CT-1199, "
                 "without Retry-After)"
             ),
         ),
         (
             _sign_in_limited,
             (
-                "The sign-in service asked Meridian Energy to wait (HTTP 429, code "
-                "none, without Retry-After)"
+                "The sign-in service asked Meridian Energy to wait (HTTP 429, no "
+                "code, without Retry-After)"
             ),
         ),
     ],
@@ -1130,6 +1161,7 @@ async def test_a_rate_limit_is_noted_with_what_its_answer_said(
     Its status, its code and whether it said how long: never its text.
 
     A rate limit is never resent: one request met it, and none went after.
+    The failure names the service that asked to wait.
     """
     session = FakeMeridianSession(NOW)
     coordinator = coordinator_for(hass, session)
@@ -1141,7 +1173,17 @@ async def test_a_rate_limit_is_noted_with_what_its_answer_said(
     with pytest.raises(UpdateFailed) as failure:
         await sync(coordinator, NOW + HOUR, session)
 
-    assert failure.value.translation_key == "rate_limited"
+    if limit is _sign_in_limited:
+        assert failure.value.translation_key == "sign_in_rate_limited"
+        assert str(failure.value) == (
+            "Meridian's sign-in service asked Meridian Energy to wait. It tries "
+            "again automatically"
+        )
+    else:
+        assert failure.value.translation_key == "rate_limited"
+        assert str(failure.value) == (
+            "Meridian asked Meridian Energy to wait. It tries again automatically"
+        )
     assert _limit_noted(caplog) == [f"{said}; it waits before its next update"]
     # The session's renewal comes before any GraphQL request is sent.
     expected = [] if limit is _sign_in_limited else ["measurements"]
@@ -1203,6 +1245,17 @@ async def test_a_failing_sign_in_service_is_named_as_such(
             MeridianSignInServiceError(None, timed_out=True),
             "no answer from the sign-in service: timed out",
         ),
+        (
+            MeridianSignInServiceUnreadableError("not JSON"),
+            "the sign-in service sent an answer Meridian Energy can't read: not JSON",
+        ),
+        (
+            MeridianSignInServiceUnreadableError("unexpected data"),
+            (
+                "the sign-in service sent an answer Meridian Energy can't read: "
+                "unexpected data"
+            ),
+        ),
     ],
 )
 def test_a_unit_s_warning_never_calls_the_sign_in_service_meridian(
@@ -1223,9 +1276,12 @@ def test_a_unit_s_warning_never_calls_the_sign_in_service_meridian(
                     "expires_in": "soon",
                 }
             ),
-            "unexpected data",
+            "sign-in service: unexpected data",
         ),
-        (Response(b"<html>sign in</html>", headers=_HTML), "not JSON"),
+        (
+            Response(b"<html>sign in</html>", headers=_HTML),
+            "sign-in service: not JSON",
+        ),
     ],
     ids=["unreadable session", "a web page"],
 )
@@ -1236,7 +1292,8 @@ async def test_an_unreadable_session_renewal_is_invalid_data_not_an_ended_sign_i
     An answer that can't be read says nothing of the sign-in.
 
     So it is tried again at the next update, rather than asking for a new
-    login code; it isn't resent at once, as a failure that may pass is.
+    login code; it isn't resent at once, as a failure that may pass is. Its
+    detail names the sign-in service, whose answer it was.
     """
     session = FakeMeridianSession(NOW)
     coordinator = coordinator_for(hass, session)
@@ -1557,6 +1614,140 @@ async def test_latest_usage_data_moves_on_when_meridian_reads_a_date(
     assert read_now.estimated_rows == waiting.estimated_rows - 24 + 1
 
 
+async def test_latest_usage_data_is_unknown_when_nothing_was_read_in_3_weeks(
+    hass: HomeAssistant,
+) -> None:
+    """It looks back as far as Provisional data intervals: the last 21 days."""
+    kraken = FakeKraken(NOW, days=100, read_delay=timedelta(days=22))
+    session = FakeMeridianSession(NOW, kraken=kraken)
+    coordinator = coordinator_for(hass, session)
+
+    (result,) = (await sync(coordinator, NOW, session)).results
+
+    assert result.latest_reading is None
+    assert dict(result.quality_counts) == {"ESTIMATE": 20 * 24 + 12}
+
+
+async def test_an_account_list_whose_property_cannot_be_read_keeps_the_one_it_has(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    At the daily refresh: no notice of no property, and the units go on.
+
+    The list is asked for again at the next update, and its unit's memory
+    is kept.
+    """
+    caplog.set_level(logging.INFO)
+    session = FakeMeridianSession(NOW)
+    coordinator = coordinator_for(hass, session)
+    await sync(coordinator, NOW, session)
+    memory = coordinator._memory[(KEY, "CONSUMPTION")]
+    account = account_data()
+    account["properties"][0]["meterPoints"] = "synthetic-meter"
+    session.hook = lambda operation, _variables: (
+        json_response({"data": {"account": account}})
+        if operation == "account"
+        else None
+    )
+
+    data = await sync(coordinator, NOW + DAY, session)
+
+    assert data.property_count == 1
+    assert coordinator._memory[(KEY, "CONSUMPTION")] is memory
+    assert session.operations.count("accountsList") == 2
+    session.hook = lambda _operation, _variables: None
+    await sync(coordinator, NOW + DAY + HOUR, session)
+    assert session.operations.count("accountsList") == 3
+    assert _own(caplog, logging.INFO) == [
+        (
+            "Meridian Energy skipped property 1 of 1 on account 1, as Meridian lists "
+            "them: it can't read Meridian's answer for it"
+        ),
+        (
+            "Meridian Energy couldn't refresh the list of accounts; it keeps using the "
+            "one it has"
+        ),
+        "Meridian Energy has refreshed the list of accounts again",
+    ]
+
+
+def _feed_in_account(**register: Any) -> Response:
+    """Return the feed-in account, its feed-in register changed so."""
+    account = account_data(feed_in=True)
+    account["properties"][0]["meterPoints"][0]["registers"][1].update(register)
+    return json_response({"data": {"account": account}})
+
+
+_SENDS_POWER = "sends power to the grid"
+
+
+async def test_an_unreadable_feed_in_flag_keeps_a_known_exporter_exporting(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A refresh whose feed-in flag can't be read keeps what was read before.
+
+    So its grid export unit, and the account's export and credit so far,
+    stay; the line says so once.
+    """
+    caplog.set_level(logging.INFO)
+    session = FakeMeridianSession(NOW, feed_in=(ACCOUNT_NUMBER,))
+    coordinator = coordinator_for(hass, session)
+    await sync(coordinator, NOW, session)
+
+    for day, answer in enumerate(
+        [_feed_in_account(isFeedIn=None), _feed_in_account(activeFrom="not a date")],
+        start=1,
+    ):
+        session.hook = lambda operation, _variables, answer=answer: (
+            answer if operation == "account" else None
+        )
+        data = await sync(coordinator, NOW + day * DAY, session)
+        assert data.account_results[0].has_feed_in is True
+        assert [unit["direction"] for unit in coordinator.unit_diagnostics()] == [
+            "consumption",
+            "generation",
+        ]
+
+    assert session.operations.count("account") == 3
+    assert [m for m in _own(caplog, logging.INFO) if _SENDS_POWER in m] == [
+        (
+            "Meridian Energy can't read whether the property sends power to the grid; "
+            "it keeps what it read before"
+        )
+    ]
+
+
+async def test_an_unreadable_feed_in_flag_with_none_known_is_taken_as_none(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
+) -> None:
+    """With nothing read before, it is taken as not exporting, named as units are."""
+    caplog.set_level(logging.INFO)
+    session = FakeMeridianSession(NOW, accounts=(ACCOUNT_NUMBER, "A-TEST-2"))
+    unread = account_data("A-TEST-2", feed_in=True)
+    unread["properties"][0]["meterPoints"][0]["registers"][1]["isFeedIn"] = "yes"
+    session.hook = lambda operation, variables: (
+        json_response({"data": {"account": unread}})
+        if operation == "account" and variables["accountNumber"] == "A-TEST-2"
+        else None
+    )
+    coordinator = coordinator_for(hass, session)
+
+    for update in range(2):
+        data = await sync(coordinator, NOW + update * DAY, session)
+        assert [result.has_feed_in for result in data.account_results] == [
+            False,
+            False,
+        ]
+
+    assert [m for m in _own(caplog, logging.INFO) if _SENDS_POWER in m] == [
+        (
+            "Meridian Energy can't read whether property 2 of 2 sends power to the "
+            "grid; it takes it as not"
+        )
+    ]
+
+
 async def test_an_expired_account_list_that_fails_is_kept_and_asked_for_again(
     hass: HomeAssistant, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -1633,9 +1824,9 @@ async def test_no_account_or_property_to_follow_fails_as_no_accounts(
     hass: HomeAssistant, properties: list[Any] | None, key: str
 ) -> None:
     """
-    An account Meridian lists with no property yet has its own message.
+    An account Meridian lists with no property has its own message.
 
-    As when a supply has yet to start; it is checked again as no account is.
+    It is checked again as no account is.
     """
     session = FakeMeridianSession(NOW)
     if properties is None:

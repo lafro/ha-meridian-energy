@@ -55,8 +55,8 @@ Each account has one device, **Meridian Energy**. Amounts are in NZD.
 
 | Sensor | Shows |
 |---|---|
-| Bill usage so far | Grid import in the current billing period, actual readings only: the app's **Usage → Trends** total, not its Home figure, which adds today's estimate |
-| Bill cost so far | The cost of that usage |
+| Bill usage so far | Grid import in the current billing period, actual readings only, as the app's **Usage → Trends** shows |
+| Bill cost so far | The cost of that usage, as Trends shows; the app's Home screen can show more |
 | Bill export so far, Bill credit so far | Grid export in the period, and its credit (feed-in register only) |
 | Bill estimate | Meridian's estimate of the whole period's cost |
 | Total due | What you owe, 0 when in credit; its credit attribute holds any credit |
@@ -64,7 +64,7 @@ Each account has one device, **Meridian Energy**. Amounts are in NZD.
 | Last payment | Your latest payment's amount, with its date and status |
 | Daily charge, Anytime price | Your plan's prices, including GST (only for one property with one meter on an all-day plan) |
 | Last data update | When the last update succeeded (diagnostic) |
-| Latest usage data | The end of the newest hour Meridian has read, not estimated (diagnostic) |
+| Latest usage data | The end of the newest hour in the last three weeks that Meridian has read, not estimated (diagnostic) |
 | Provisional data intervals | Hours of grid import in the last three weeks that are still estimates (diagnostic) |
 | Billing period start, Billing period end, Next billing date | The current billing period, and the first day of the next (diagnostic, disabled by default) |
 

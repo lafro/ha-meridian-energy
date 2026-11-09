@@ -764,20 +764,23 @@ class TestPublicConfigEntryLifecycle:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "release", ["third_failure", "refused_session", "ended_session"]
+        "release",
+        ["first_failure", "third_failure", "refused_session", "ended_session"],
     )
-    async def test_an_update_entity_sync_that_outlives_its_entry_leaves_nothing(
+    async def test_an_update_entity_sync_that_outlives_its_entry_ends_quietly(
         self, recorder_mock, hass, caplog, release: str
     ) -> None:
         """
         A refresh update_entity asked for, which removal doesn't stop, ends quietly.
 
         Its measurements answer is held while the entry is removed. Released
-        as the third failed update in a row, it raises no repair notice;
-        released as a refused session, whose renewal rotates the refresh
-        token, it stores nothing in the removed entry; released as a session
-        refused again after its renewal, it starts no reauthentication.
-        Either way nothing is logged as an error.
+        as a first failed update, it logs no error saying it tries again;
+        released as the third in a row, it raises no repair notice; released
+        as a refused session, whose renewal rotates the refresh token, it
+        stores nothing in the removed entry; released as a session refused
+        again after its renewal, it starts no reauthentication. Either way
+        nothing is logged as an error. It may still write the hours it
+        fetched, as statistics outlive the entry.
         """
         del recorder_mock
         session = FakeMeridianSession(NOW)
@@ -818,7 +821,9 @@ class TestPublicConfigEntryLifecycle:
                 )
                 await coordinator.async_refresh()
                 await coordinator.async_refresh()
-                assert coordinator._failed_updates == 2
+            failed_before = {"first_failure": 0, "third_failure": 2}
+            if release in failed_before:
+                assert coordinator._failed_updates == failed_before[release]
                 held = iter([Response(b"{}", status=503, gate=gate)])
                 after: Response | None = unavailable
             else:
@@ -865,7 +870,7 @@ class TestPublicConfigEntryLifecycle:
             ir.async_get(hass).async_get_issue(DOMAIN, f"sync_failing_{entry.entry_id}")
             is None
         )
-        if release != "third_failure":
+        if release in {"refused_session", "ended_session"}:
             assert renewals
         assert hass.config_entries.flow.async_progress_by_handler(DOMAIN) == []
         assert [

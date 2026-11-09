@@ -33,7 +33,6 @@ from custom_components.meridian_energy.api import (
     _MeridianHttpError,
     _optional_string,
     _parse_datetime,
-    _parse_firebase_tokens,
     _parse_measurement,
     _parse_retry_after,
     _required_string,
@@ -55,8 +54,10 @@ from custom_components.meridian_energy.models import (
     require_mapping,
 )
 from custom_components.meridian_energy.parsers import (
+    TokenParseError,
     optional_date,
     optional_local_date,
+    parse_firebase_tokens,
 )
 
 from .kraken_fake import NZ
@@ -184,7 +185,7 @@ async def test_send_otp_rejected() -> None:
 async def test_send_otp_maps_server_error_without_leaking_payload() -> None:
     client = MeridianApiClient(MagicMock())
     client._async_json_request = AsyncMock(
-        side_effect=_MeridianHttpError(503, {"secret": "must-not-leak"})
+        side_effect=_MeridianHttpError(503, {"secret": "must-not-leak"}, json_body=True)
     )
 
     with pytest.raises(MeridianConnectionError) as raised:
@@ -197,7 +198,7 @@ async def test_send_otp_maps_server_error_without_leaking_payload() -> None:
 async def test_send_otp_maps_request_timeout_to_connection_failure() -> None:
     client = MeridianApiClient(MagicMock())
     client._async_json_request = AsyncMock(
-        side_effect=_MeridianHttpError(408, {"error": "redacted"})
+        side_effect=_MeridianHttpError(408, {"error": "redacted"}, json_body=True)
     )
 
     with pytest.raises(MeridianConnectionError):
@@ -271,7 +272,7 @@ async def test_validate_otp_maps_error_without_leaking_payload() -> None:
 async def test_validate_otp_maps_server_error_to_connection_failure() -> None:
     client = MeridianApiClient(MagicMock())
     client._async_json_request = AsyncMock(
-        side_effect=_MeridianHttpError(500, {"error": "redacted"})
+        side_effect=_MeridianHttpError(500, {"error": "redacted"}, json_body=True)
     )
 
     with pytest.raises(MeridianConnectionError):
@@ -282,7 +283,7 @@ async def test_validate_otp_maps_server_error_to_connection_failure() -> None:
 async def test_validate_otp_maps_request_timeout_to_connection_failure() -> None:
     client = MeridianApiClient(MagicMock())
     client._async_json_request = AsyncMock(
-        side_effect=_MeridianHttpError(408, {"error": "redacted"})
+        side_effect=_MeridianHttpError(408, {"error": "redacted"}, json_body=True)
     )
 
     with pytest.raises(MeridianConnectionError):
@@ -366,6 +367,7 @@ async def test_validate_otp_names_an_unknown_refusal_by_its_code() -> None:
         (400, MeridianAuthenticationError),
         (408, MeridianConnectionError),
         (429, MeridianRateLimitError),
+        (500, MeridianConnectionError),
         (503, MeridianConnectionError),
     ],
 )
@@ -829,13 +831,14 @@ async def test_a_property_that_cannot_be_read_is_skipped_and_logged_by_place(
     for _update in range(2):
         (account,) = await client.async_get_accounts()
         assert [prop.id for prop in account.properties] == ["synthetic-property"]
+        assert account.skipped_properties == client.skipped_properties == 3
 
     assert [(r.levelno, r.getMessage()) for r in caplog.records] == [
         (
             logging.WARNING,
             (
-                f"Meridian Energy skipped property {number} of 4 on account 1: it "
-                "can't read Meridian's answer for it"
+                f"Meridian Energy skipped property {number} of 4 on account 1, as "
+                "Meridian lists them: it can't read Meridian's answer for it"
             ),
         )
         for number in (2, 3, 4)
@@ -844,11 +847,77 @@ async def test_a_property_that_cannot_be_read_is_skipped_and_logged_by_place(
         assert text not in caplog.text
 
 
+@pytest.mark.parametrize(
+    "unreadable",
+    [_property(id=None), _property(meterPoints="synthetic-meter")],
+    ids=["no id", "meter points not a list"],
+)
+@pytest.mark.asyncio
+async def test_a_login_whose_only_property_cannot_be_read_is_unreadable_data(
+    unreadable: dict[str, object],
+) -> None:
+    """
+    Not a login with no property: nothing says Meridian lists none.
+
+    So the flow asks again, and a sync keeps the list it has.
+    """
+    client = MeridianApiClient(MagicMock(), tokens=_tokens())
+    client._async_graphql = _answering(
+        [{"number": "A-TEST-1", "status": "ACTIVE", "id": "account"}], [unreadable]
+    )
+
+    with pytest.raises(ValueError, match="can't read any property"):
+        await client.async_get_accounts()
+
+
+@pytest.mark.asyncio
+async def test_an_account_whose_only_property_cannot_be_read_is_still_listed() -> None:
+    """Another account's property is followed; the count says one was skipped."""
+    client = MeridianApiClient(MagicMock(), tokens=_tokens())
+
+    async def answer(
+        operation: str, _query: str, variables: dict[str, Any], **_kwargs: Any
+    ) -> dict[str, Any]:
+        if operation == "accountsList":
+            return {
+                "viewer": {
+                    "accounts": [
+                        {"number": "A-TEST-1", "status": "ACTIVE", "id": "1"},
+                        {"number": "A-TEST-2", "status": "ACTIVE", "id": "2"},
+                    ]
+                }
+            }
+        number = variables["accountNumber"]
+        prop = _property() if number == "A-TEST-1" else _property(id=None)
+        return {"account": {"number": number, "properties": [prop]}}
+
+    client._async_graphql = AsyncMock(side_effect=answer)
+
+    first, second = await client.async_get_accounts()
+
+    assert (first.number, len(first.properties), first.skipped_properties) == (
+        "A-TEST-1",
+        1,
+        0,
+    )
+    assert (second.number, second.properties, second.skipped_properties) == (
+        "A-TEST-2",
+        (),
+        1,
+    )
+    assert client.skipped_properties == 1
+
+
 @pytest.mark.parametrize("flag", ["yes", None, 1], ids=["text", "null", "a number"])
 @pytest.mark.asyncio
-async def test_a_feed_in_flag_that_cannot_be_read_counts_as_none_and_is_logged(
+async def test_a_feed_in_flag_that_cannot_be_read_counts_as_none_and_is_noted(
     caplog: pytest.LogCaptureFixture, flag: object
 ) -> None:
+    """
+    The property says so, and the client logs nothing.
+
+    The coordinator logs it, as it alone knows what was read before.
+    """
     caplog.set_level(logging.INFO, logger="custom_components.meridian_energy")
     client = MeridianApiClient(MagicMock(), tokens=_tokens())
     meter = {"id": "synthetic-meter", "registers": [_register(is_feed_in=flag)]}
@@ -865,12 +934,12 @@ async def test_a_feed_in_flag_that_cannot_be_read_counts_as_none_and_is_logged(
         assert [
             account.properties[0].meter_points[0].has_feed_in for account in accounts
         ] == [False, False]
+        assert [account.properties[0].feed_in_unread for account in accounts] == [
+            True,
+            True,
+        ]
 
-    assert caplog.messages == [
-        f"Meridian Energy can't read whether property 1 of 1 on account {place} "
-        "sends power to the grid; it takes it as not"
-        for place in (1, 2)
-    ]
+    assert caplog.messages == []
 
 
 @pytest.mark.asyncio
@@ -892,6 +961,7 @@ async def test_a_readable_feed_in_register_outweighs_an_unreadable_one(
     (account,) = await client.async_get_accounts()
 
     assert account.properties[0].meter_points[0].has_feed_in is True
+    assert account.properties[0].feed_in_unread is False
     assert caplog.messages == []
 
 
@@ -902,8 +972,9 @@ async def test_accounts_with_other_statuses_are_skipped_counted_and_logged_once(
     """
     Active and dormant accounts are followed; any other is counted.
 
-    Each status is logged once, by name only when it is a plain upper-case
-    name, so a status that carries text can't put it in the log.
+    Each status is logged once, named only when it looks like an enum name,
+    with no digits, so a status that carries text or a number can't put it
+    in the log.
     """
     caplog.set_level(logging.INFO, logger="custom_components.meridian_energy")
     client = MeridianApiClient(MagicMock(), tokens=_tokens())
@@ -914,6 +985,8 @@ async def test_accounts_with_other_statuses_are_skipped_counted_and_logged_once(
             {"number": "A-TEST-3", "status": "CLOSED", "id": "3"},
             {"number": "A-TEST-4", "status": "on hold for A-TEST-4", "id": "4"},
             {"number": "A-TEST-5", "status": "DORMANT", "id": "5"},
+            {"number": "A-TEST-6", "status": "CLOSED for A-TEST-6", "id": "6"},
+            {"number": "A-TEST-7", "status": "A12345678", "id": "7"},
         ],
         [_property()],
     )
@@ -921,16 +994,18 @@ async def test_accounts_with_other_statuses_are_skipped_counted_and_logged_once(
     for _update in range(2):
         accounts = await client.async_get_accounts()
         assert [account.number for account in accounts] == ["A-TEST-1", "A-TEST-5"]
-        assert client.skipped_accounts == 3
+        assert client.skipped_accounts == 5
 
     follows = "; it follows active and dormant accounts"
     assert caplog.messages == [
         f"Meridian Energy doesn't follow an account whose status is CLOSED{follows}",
         (
-            "Meridian Energy doesn't follow an account whose status is an unnamed "
-            f"status{follows}"
+            "Meridian Energy doesn't follow an account whose status is one it "
+            f"doesn't show{follows}"
         ),
     ]
+    for text in ("A-TEST-4", "A-TEST-6", "A12345678"):
+        assert text not in caplog.text
 
 
 def _billing_options(**changes: object) -> dict[str, object]:
@@ -1700,8 +1775,8 @@ async def test_json_request_maps_network_error() -> None:
     "expires", [None, "not-a-number", "0", -1, "999999999999999999999999"]
 )
 def test_parse_firebase_tokens_rejects_invalid_expiry(expires) -> None:
-    with pytest.raises(MeridianAuthenticationError):
-        _parse_firebase_tokens(
+    with pytest.raises(TokenParseError):
+        parse_firebase_tokens(
             {
                 "idToken": "id",
                 "refreshToken": "refresh",
@@ -1713,7 +1788,7 @@ def test_parse_firebase_tokens_rejects_invalid_expiry(expires) -> None:
 
 def test_parse_firebase_tokens_derives_current_user_id_from_jwt() -> None:
     claims = base64.urlsafe_b64encode(json.dumps({"sub": "uid"}).encode()).decode()
-    tokens = _parse_firebase_tokens(
+    tokens = parse_firebase_tokens(
         {
             "idToken": f"header.{claims.rstrip('=')}.signature",
             "refreshToken": "refresh",
@@ -1740,7 +1815,7 @@ def test_a_session_without_a_readable_user_id_is_still_a_session(
     Nothing sends it to Meridian or Google, so a session whose token does
     not name its user is still a session.
     """
-    tokens = _parse_firebase_tokens(
+    tokens = parse_firebase_tokens(
         {"idToken": id_token, "refreshToken": "refresh", "expiresIn": "3600"}
     )
 

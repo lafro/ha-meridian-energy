@@ -35,20 +35,32 @@ class MeridianMeterPoint:
 
 @dataclass(frozen=True, slots=True)
 class MeridianProperty:
-    """A Meridian property; its address only labels it, None when not given."""
+    """
+    A Meridian property; its address only labels it, None when not given.
+
+    ``feed_in_unread`` says that a register's feed-in flag couldn't be read
+    and no meter point was read as exporting.
+    """
 
     id: str
     address: str | None
     meter_points: tuple[MeridianMeterPoint, ...]
+    feed_in_unread: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class MeridianAccount:
-    """A Meridian customer account."""
+    """
+    A Meridian customer account.
+
+    ``skipped_properties`` counts the properties Meridian listed on it that
+    couldn't be read, and are not among ``properties``.
+    """
 
     number: str
     status: str
     properties: tuple[MeridianProperty, ...]
+    skipped_properties: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -56,8 +68,11 @@ class MeridianBillingPeriod:
     """
     Billing-cycle metadata for one Meridian account.
 
-    Only the start and end are used; the other fields are None when Meridian
-    gave none, or a value that can't be read.
+    The start and end are read strictly and set the bill's period. The next
+    billing date feeds the Next billing date sensor; the period length and
+    whether it is fixed appear only in diagnostics; the multiplier and start
+    day are kept but unused. Every field but the start and end is None when
+    Meridian gave none, or a value that can't be read.
     """
 
     period_length: str | None

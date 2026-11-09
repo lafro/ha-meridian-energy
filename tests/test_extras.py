@@ -9,6 +9,7 @@ and 15 cents, so a day of 24 hours 12 kWh and $3.60.
 
 from __future__ import annotations
 
+import copy
 import logging
 from datetime import date, timedelta
 from decimal import Decimal
@@ -68,9 +69,19 @@ _PRICES_LOST = (
     "Meridian Energy couldn't get the prices; Daily charge and Anytime price show "
     "unknown until it can"
 )
-_PRICES_UNANSWERED = "Meridian Energy couldn't get the prices; it asks again in a day"
+_PRICES_UNANSWERED = "Meridian Energy couldn't get the prices; it asks again later"
+_PRICES_BACK = "Meridian Energy is getting the prices again"
+_NO_PLAN = (
+    "Meridian lists no plan in force for the meter; Daily charge and Anytime price "
+    "show unknown until it does"
+)
+_ESTIMATE_LOST = (
+    "Meridian's day totals leave out a date of the billing period; Bill estimate "
+    "shows unknown until they don't"
+)
+_ESTIMATE_BACK = "Meridian's day totals cover the billing period again"
 _RATE_LIMITED = (
-    "Meridian asked Meridian Energy to wait (HTTP 429, code none, with "
+    "Meridian asked Meridian Energy to wait (HTTP 429, no code, with "
     "Retry-After); it waits before its next update"
 )
 _HUGE = "1E+1000000"
@@ -666,32 +677,41 @@ async def test_prices_that_fail_show_unknown_after_two_days(
     )
 
 
+@pytest.mark.parametrize("status", [500, 503])
 async def test_prices_never_answered_leave_the_price_sensors_as_they_are(
     hass: HomeAssistant,
     session: FakeMeridianSession,
     caplog: pytest.LogCaptureFixture,
+    status: int,
 ) -> None:
-    """No saying yet whether the plan is all-day: the line says only when it asks."""
+    """
+    No saying yet whether the plan is all-day; the line says it asks again.
+
+    When is the failure's to say: one that may pass (503) is asked again at
+    the next update, any other a day later.
+    """
     caplog.set_level(logging.INFO)
-    session.hook = _failing("prices")
+    session.hook = _failing("prices", json_response({}, status=status))
     coordinator = coordinator_for(hass, session)
 
     data = await sync(coordinator, NOW, session)
 
     assert data.account_results[0].price_sensors is None
-    assert _own(caplog, logging.INFO) == [
-        "Meridian Energy couldn't get the prices; it asks again in a day"
-    ]
-    await sync(coordinator, NOW + 23 * HOUR, session)
-    assert session.operations.count("prices") == 1
+    assert _own(caplog, logging.INFO) == [_PRICES_UNANSWERED]
+    sent = session.operations.count("prices")
+    if status == 503:
+        answered_at = NOW + HOUR
+    else:
+        await sync(coordinator, NOW + 23 * HOUR, session)
+        assert session.operations.count("prices") == sent
+        answered_at = NOW + DAY
 
     session.hook = lambda _operation, _variables: None
-    data = await sync(coordinator, NOW + DAY, session)
-    assert session.operations.count("prices") == 2
+    data = await sync(coordinator, answered_at, session)
+    assert session.operations.count("prices") == sent + 1
     assert data.account_results[0].price_sensors is True
-    assert _own(caplog, logging.INFO)[1:] == [
-        "Meridian Energy is getting the prices again"
-    ]
+    assert _own(caplog, logging.INFO) == [_PRICES_UNANSWERED, _PRICES_BACK]
+    assert [line for line in _own(caplog, logging.INFO) if "in a day" in line] == []
 
 
 async def test_a_rate_limit_on_a_figure_fails_nothing_and_waits(
@@ -1215,6 +1235,36 @@ async def test_a_failing_grid_export_leaves_the_rest_of_the_bill(
     )
 
 
+async def test_a_grid_export_day_failure_that_may_pass_is_asked_again_next(
+    hass: HomeAssistant,
+) -> None:
+    """
+    As the bill's other figures are: at the next update, not in 6 hours.
+
+    Until then, only the export and credit so far show unknown.
+    """
+    session = FakeMeridianSession(NOW, feed_in=(ACCOUNT_NUMBER,))
+    session.billing_period = _PERIOD
+    # Sent, then resent once, as a 503 is.
+    failures = iter([json_response({}, status=503)] * 2)
+    session.hook = lambda operation, variables: (
+        next(failures, None)
+        if operation == "measurements"
+        and variables["readingDirectionType"] == "GENERATION"
+        and variables["readingFrequencyType"] == "DAY_INTERVAL"
+        else None
+    )
+    coordinator = coordinator_for(hass, session)
+
+    data = await sync(coordinator, NOW, session)
+    bill = data.account_results[0].bill
+    assert (bill.usage, bill.export, bill.credit) == (Decimal(180), None, None)
+
+    data = await sync(coordinator, NOW + HOUR, session)
+    bill = data.account_results[0].bill
+    assert (bill.export, bill.credit) == (Decimal(180), Decimal(54))
+
+
 async def test_a_rate_limit_on_the_grid_export_days_waits_like_any_other(
     hass: HomeAssistant,
     caplog: pytest.LogCaptureFixture,
@@ -1383,6 +1433,74 @@ async def test_two_properties_get_no_price_sensors_and_one_bill(
     )
 
 
+def _two_properties(*, second_id: str | None) -> dict[str, Any]:
+    """Return the account with a second property, whose ID may be missing."""
+    account = copy.deepcopy(account_data())
+    second = copy.deepcopy(account["properties"][0])
+    second["id"] = second_id
+    account["properties"].append(second)
+    return account
+
+
+async def test_a_property_that_cannot_be_read_at_a_refresh_keeps_list_and_bill(
+    hass: HomeAssistant, session: FakeMeridianSession
+) -> None:
+    """
+    The list Meridian answered before is kept, both properties in it.
+
+    So the bill still adds up both, and no price sensor comes and goes.
+    """
+    answer = {"account": _two_properties(second_id="synthetic-property-2")}
+    session.hook = lambda operation, _variables: (
+        json_response({"data": answer}) if operation == "account" else None
+    )
+    coordinator = coordinator_for(hass, session)
+    await sync(coordinator, NOW, session)
+
+    answer["account"] = _two_properties(second_id=None)
+    data = await sync(coordinator, NOW + DAY, session)
+
+    (result,) = data.account_results
+    assert data.property_count == 2
+    assert result.price_sensors is False
+    assert "prices" not in session.operations
+    # 16 dates read now, both properties.
+    assert result.bill == BillFigures(
+        usage=Decimal(384), cost=Decimal("115.2"), estimate=Decimal("223.2")
+    )
+
+
+async def test_a_property_that_cannot_be_read_at_a_first_sync_leaves_the_bill_unknown(
+    hass: HomeAssistant, session: FakeMeridianSession
+) -> None:
+    """
+    With no list before it, the one property read is followed.
+
+    The bill and prices would leave the other out, so neither is asked for,
+    and the list is asked for again at the next update.
+    """
+    answer = {"account": _two_properties(second_id=None)}
+    session.hook = lambda operation, _variables: (
+        json_response({"data": answer}) if operation == "account" else None
+    )
+    coordinator = coordinator_for(hass, session)
+
+    data = await sync(coordinator, NOW, session)
+
+    (result,) = data.account_results
+    assert data.property_count == 1
+    assert result.bill == BillFigures()
+    assert result.price_sensors is None
+    assert _day_requests(session) == []
+    assert "prices" not in session.operations
+
+    answer["account"] = _two_properties(second_id="synthetic-property-2")
+    data = await sync(coordinator, NOW + HOUR, session)
+    assert session.operations.count("accountsList") == 2
+    assert data.property_count == 2
+    assert data.account_results[0].bill.usage == Decimal(360)
+
+
 @pytest.mark.parametrize(("cents", "credit"), [(1250, Decimal("12.5")), (0, None)])
 async def test_a_credit_shows_nothing_due_and_the_credit(
     hass: HomeAssistant,
@@ -1434,7 +1552,11 @@ async def test_figures_of_an_account_no_longer_listed_are_forgotten(
 async def test_a_figure_that_fails_once_in_a_way_that_may_pass_is_resent_at_once(
     hass: HomeAssistant, session: FakeMeridianSession
 ) -> None:
-    """As Meridian's web app does: a 503 is sent once more, 2 to 5 s later."""
+    """
+    Like Meridian's web app, which resends on 502 to 504.
+
+    A 503 is sent once more, 2 to 5 s later.
+    """
     failures = iter([json_response({}, status=503)])
     session.hook = lambda operation, _variables: (
         next(failures, None) if operation == "balance" else None
@@ -1461,8 +1583,8 @@ async def test_a_figure_still_failing_after_its_resend_waits_as_its_failure_says
     """
     A failure that may pass is asked again at the next update; others wait.
 
-    Only what Meridian's web app resends on may pass: HTTP 502 to 504, a
-    timeout or a network error. Any other failure waits the figure's own
+    Only HTTP 502 to 504, which Meridian's web app resends on, a timeout or
+    a network error may pass. Any other failure waits the figure's own
     interval, 6 hours for the balance.
     """
     session.hook = _failing("balance", json_response({}, status=status))
@@ -1482,26 +1604,39 @@ async def test_a_figure_still_failing_after_its_resend_waits_as_its_failure_says
     assert data.account_results[0].total_due == Decimal(40)
 
 
+@pytest.mark.parametrize("missing", [1, 4])
 async def test_the_estimate_is_unknown_when_the_day_totals_leave_out_a_date(
-    hass: HomeAssistant,
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture, missing: int
 ) -> None:
     """
     So far counts the dates read; the estimate needs every date of the period.
 
     An answer short of a date would leave that date's cost out of the
-    estimate, so it shows unknown rather than too little.
+    estimate, so it shows unknown rather than too little. One INFO line
+    says so, however many answers leave a date out, and one when an answer
+    covers the period again.
     """
-    kraken = FakeKraken(NOW, history_start=local_midnight(_PERIOD[0] + 4 * DAY))
+    caplog.set_level(logging.INFO)
+    kraken = FakeKraken(NOW, history_start=local_midnight(_PERIOD[0] + missing * DAY))
     session = FakeMeridianSession(NOW, kraken=kraken)
     session.billing_period = _PERIOD
     coordinator = coordinator_for(hass, session)
 
     data = await sync(coordinator, NOW, session)
 
-    # 5 to 15 July: 11 dates read, of 12 kWh and $3.60 each.
+    # From the first date read to 15 July, of 12 kWh and $3.60 each.
+    read = 15 - missing
     assert data.account_results[0].bill == BillFigures(
-        usage=Decimal(132), cost=Decimal("39.6"), estimate=None
+        usage=Decimal(12 * read), cost=Decimal("3.6") * read, estimate=None
     )
+    await sync(coordinator, NOW + 6 * HOUR, session)
+    assert len(_day_requests(session)) == 2
+    assert _own(caplog, logging.INFO) == [_ESTIMATE_LOST]
+
+    kraken.history_start = local_midnight(_PERIOD[0])
+    data = await sync(coordinator, NOW + 12 * HOUR, session)
+    assert data.account_results[0].bill.estimate == Decimal("111.6")
+    assert _own(caplog, logging.INFO) == [_ESTIMATE_LOST, _ESTIMATE_BACK]
 
 
 async def test_a_billing_period_that_ends_before_it_starts_is_refused(
@@ -1525,7 +1660,7 @@ async def test_a_billing_period_that_ends_before_it_starts_is_refused(
     )
 
 
-async def test_an_account_with_no_property_yet_has_no_bill_to_show(
+async def test_an_account_with_no_property_has_no_bill_to_show(
     hass: HomeAssistant,
 ) -> None:
     """Unknown, not 0: there is no property whose dates could be summed."""
@@ -1550,46 +1685,103 @@ async def test_an_account_with_no_property_yet_has_no_bill_to_show(
 
 
 async def test_a_day_with_no_agreement_in_force_keeps_the_price_sensors_unknown(
-    hass: HomeAssistant, session: FakeMeridianSession
+    hass: HomeAssistant,
+    session: FakeMeridianSession,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     As on the day a plan changes: Meridian has no agreement in force.
 
     That says nothing of the plan, so the price sensors stay, showing
-    unknown, until a later answer says.
+    unknown, until a later answer says. One INFO line says why, and one
+    when the prices are back.
     """
+    caplog.set_level(logging.INFO)
     coordinator = coordinator_for(hass, session)
     data = await sync(coordinator, NOW, session)
     assert data.account_results[0].price_sensors is True
 
     session.prices = {"meterPoints": [{"activeAgreement": None}]}
-    data = await sync(coordinator, NOW + DAY, session)
-
-    (result,) = data.account_results
-    assert (result.price_sensors, result.prices) == (None, None)
+    for day in (1, 2):
+        data = await sync(coordinator, NOW + day * DAY, session)
+        (result,) = data.account_results
+        assert (result.price_sensors, result.prices) == (None, None)
+        # Said once, at INFO: a state Meridian's app expects.
+        assert _own(caplog, logging.INFO) == [_NO_PLAN]
 
     session.prices = prices_data()
-    data = await sync(coordinator, NOW + 2 * DAY, session)
+    data = await sync(coordinator, NOW + 3 * DAY, session)
     assert data.account_results[0].price_sensors is True
     assert data.account_results[0].prices is not None
+    assert _own(caplog, logging.INFO) == [_NO_PLAN, _PRICES_BACK]
 
 
-async def test_bill_figures_are_summed_then_rounded_to_the_cent(
+async def test_prices_that_failed_then_name_no_plan_are_not_back(
     hass: HomeAssistant,
+    session: FakeMeridianSession,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An answer with no plan in force leaves them unknown: the line says why."""
+    caplog.set_level(logging.INFO)
+    session.hook = _failing("prices")
+    coordinator = coordinator_for(hass, session)
+    await sync(coordinator, NOW, session)
+
+    session.hook = lambda _operation, _variables: None
+    session.prices = {"meterPoints": [{"activeAgreement": None}]}
+    data = await sync(coordinator, NOW + DAY, session)
+
+    assert data.account_results[0].price_sensors is None
+    assert _own(caplog, logging.INFO) == [_PRICES_UNANSWERED, _NO_PLAN]
+
+
+@pytest.mark.parametrize(
+    ("kwh", "cents", "expected"),
+    [
+        # 15 dates read: 180.225 kWh and $54.225; all 31 dates: $112.065.
+        (
+            "0.500625",
+            "15.0625",
+            BillFigures(
+                usage=Decimal("180.23"),
+                cost=Decimal("54.23"),
+                export=Decimal("180.23"),
+                credit=Decimal("54.23"),
+                estimate=Decimal("112.07"),
+            ),
+        ),
+        # 15 dates read: 180.0045 kWh and $54.0045; all 31 dates: $111.6093.
+        (
+            "0.5000125",
+            "15.00125",
+            BillFigures(
+                usage=Decimal(180),
+                cost=Decimal(54),
+                export=Decimal(180),
+                credit=Decimal(54),
+                estimate=Decimal("111.61"),
+            ),
+        ),
+    ],
+    ids=["a half", "under a half"],
+)
+async def test_bill_figures_are_summed_then_rounded_to_the_cent(
+    hass: HomeAssistant, kwh: str, cents: str, expected: BillFigures
 ) -> None:
     """
     The rule: each figure is summed in full, then rounded to 0.01.
 
-    A half is rounded away from zero, as money is. Each date here is 12.015
-    kWh and $3.615, both ways, so rounding each date first would give other
-    totals ($54.30 so far), and rounding a half to even 180.22 kWh, $54.22
-    and $112.06.
+    A half is rounded away from zero, as money is, and less than a half
+    down. Each date here is 12.015 kWh and $3.615, both ways, so rounding
+    each date first would give other totals ($54.30 so far), and rounding a
+    half to even 180.22 kWh, $54.22 and $112.06; at 12.0003 kWh and
+    $3.6003, rounding up would give 180.01 kWh and $54.01.
     """
     kraken = FakeKraken(
         NOW,
         days=100,
-        value=lambda _start, _channel: "0.500625",
-        cost=lambda _start, _channel: "15.0625",
+        value=lambda _start, _channel: kwh,
+        cost=lambda _start, _channel: cents,
     )
     session = FakeMeridianSession(NOW, kraken=kraken, feed_in=(ACCOUNT_NUMBER,))
     session.billing_period = _PERIOD
@@ -1597,11 +1789,4 @@ async def test_bill_figures_are_summed_then_rounded_to_the_cent(
 
     data = await sync(coordinator, NOW, session)
 
-    # 15 dates read: 180.225 kWh and $54.225; all 31 dates: $112.065.
-    assert data.account_results[0].bill == BillFigures(
-        usage=Decimal("180.23"),
-        cost=Decimal("54.23"),
-        export=Decimal("180.23"),
-        credit=Decimal("54.23"),
-        estimate=Decimal("112.07"),
-    )
+    assert data.account_results[0].bill == expected

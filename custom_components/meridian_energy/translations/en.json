@@ -3,10 +3,10 @@
   "config": {
     "abort": {
       "already_configured": "This Meridian login is already set up.",
-      "earlier_entry": "Meridian Energy is already set up for this login by an earlier version. Delete it under Settings → Devices & services, then add it again.",
+      "earlier_entry": "Meridian Energy is already set up for this login by an earlier version. Delete it under Settings → Devices & services (choose Keep if asked), then add it again.",
       "login_expired": "This sign-in has expired. Start again to get a new code.",
       "no_accounts": "Meridian has no active electricity account for this email.",
-      "no_properties": "Meridian lists an account for this email, but no property with an electricity supply yet. Add Meridian Energy again once the supply has started."
+      "no_properties": "Meridian lists an account for this email, but no property on it. Check the account in the Meridian app, then add Meridian Energy again."
     },
     "error": {
       "cannot_connect": "Couldn't get an answer from Meridian. Wait a few minutes, then try again.",
@@ -18,7 +18,9 @@
       "otp_not_found": "Meridian didn't find that code; it may already have been used. Close this window and start again to get a new one.",
       "otp_too_many_attempts": "Too many tries. Close this window and start again to get a new code.",
       "rate_limited": "Meridian asked Meridian Energy to wait. Wait a while, then try again.",
-      "reauth_email_refused": "Meridian didn't accept the email for this entry. If you now sign in to MyMeridian with a different email, remove Meridian Energy and add it again with that email."
+      "reauth_email_refused": "Meridian didn't accept the email for this entry. If you now sign in to MyMeridian with a different email, remove Meridian Energy and add it again with that email.",
+      "sign_in_rate_limited": "Meridian's sign-in service asked Meridian Energy to wait. Wait a while, then try again.",
+      "sign_in_unreadable": "Meridian Energy couldn't read the sign-in answer. Select Submit to try again; if it keeps failing, check for an update to Meridian Energy."
     },
     "step": {
       "user": {
@@ -60,6 +62,9 @@
     "rate_limited": {
       "message": "Meridian asked Meridian Energy to wait. It tries again automatically."
     },
+    "sign_in_rate_limited": {
+      "message": "Meridian's sign-in service asked Meridian Energy to wait. It tries again automatically."
+    },
     "invalid_data": {
       "message": "Meridian refused a request or sent an answer Meridian Energy can't read ({detail}). It tries again automatically; if this keeps happening, check for an update to Meridian Energy."
     },
@@ -67,7 +72,7 @@
       "message": "Meridian lists no active electricity account for this login. Meridian Energy checks again automatically; if the account has closed, remove Meridian Energy."
     },
     "no_properties": {
-      "message": "Meridian lists an account for this login, but no property with an electricity supply yet. Meridian Energy checks again daily."
+      "message": "Meridian lists an account for this login, but no property on it. Meridian Energy checks again daily."
     },
     "entry_too_old": {
       "message": "This Meridian Energy entry was set up by an earlier version. Remove Meridian Energy and add it again."

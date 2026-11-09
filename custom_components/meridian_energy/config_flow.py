@@ -13,7 +13,6 @@ import probatio
 from homeassistant.config_entries import (
     SOURCE_IGNORE,
     SOURCE_REAUTH,
-    ConfigEntryState,
     ConfigFlow,
     ConfigFlowResult,
 )
@@ -31,7 +30,10 @@ from .api import (
     MeridianOtpError,
     MeridianRateLimitError,
     MeridianRejectedError,
+    MeridianSignInServiceUnreadableError,
     http_status,
+    is_unreadable,
+    log_rate_limit,
 )
 from .const import (
     CONF_FIREBASE_USER_ID,
@@ -94,13 +96,14 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
         A setup of the same email left at a form, as in a closed browser
         tab, does not block this one: Home Assistant aborts it once either
         creates the entry. An entry an earlier version made, refused as too
-        old, must be deleted first, so the abort says so.
+        old, must be deleted first, so the abort says so; one a later
+        version made is simply already set up.
         """
         email = str(user_input[CONF_EMAIL]).strip().lower()
         existing = await self.async_set_unique_id(email, raise_on_progress=False)
         if (
             existing is not None
-            and existing.state is ConfigEntryState.MIGRATION_ERROR
+            and existing.version < self.VERSION
             and existing.source != SOURCE_IGNORE
         ):
             return self.async_abort(reason="earlier_entry")
@@ -219,7 +222,7 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
             if not accounts:
                 return self.async_abort(reason="no_accounts")
             if not any(account.properties for account in accounts):
-                # Listed, but with no property with a supply yet.
+                # Listed, but with no property on any of them.
                 return self.async_abort(reason="no_properties")
             # Another setup of the same login may have created its entry.
             self._abort_if_unique_id_configured()
@@ -382,16 +385,25 @@ def _otp_error_key(code: str) -> str:
 
 
 def _connection_error_key(err: MeridianConnectionError) -> str:
-    """Return the form error for a request to Meridian that got no usable answer."""
+    """
+    Return the form error for a request that got no usable answer.
+
+    A rate limit is logged with what its answer said, and named by the
+    service that asked to wait. A session answer from the sign-in service
+    that can't be read is that; a page that is not JSON is no answer.
+    """
     if isinstance(err, MeridianRateLimitError):
-        return "rate_limited"
+        log_rate_limit(err, "the form asks to wait")
+        return "sign_in_rate_limited" if err.sign_in_service else "rate_limited"
+    if isinstance(err, MeridianSignInServiceUnreadableError) and not is_unreadable(err):
+        return _unreadable_answer()
     return "cannot_connect"
 
 
 def _unreadable_answer() -> str:
     """Log a sign-in answer that can't be read, and return its form error."""
     _LOGGER.debug("A sign-in answer couldn't be read; the form asks to try again")
-    return "cannot_connect"
+    return "sign_in_unreadable"
 
 
 def _log_discovery_failure(err: Exception) -> None:

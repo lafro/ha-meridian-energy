@@ -122,12 +122,12 @@ __all__ = [
     "MeridianRateLimitError",
     "MeridianRejectedError",
     "MeridianSignInServiceError",
+    "MeridianSignInServiceUnreadableError",
     "MeridianUpstreamError",
     "_MeridianHttpError",
     "_graphql_error_code",
     "_optional_string",
     "_parse_datetime",
-    "_parse_firebase_tokens",
     "_parse_measurement",
     "_parse_retry_after",
     "_required_string",
@@ -135,6 +135,7 @@ __all__ = [
     "http_status",
     "is_passing_failure",
     "is_unreadable",
+    "log_rate_limit",
 ]
 
 _LAST_DAY_OF_LONG_MONTH = 31
@@ -149,10 +150,11 @@ _SENDS = 2
 _FOLLOWED_STATUSES = frozenset({"ACTIVE", "DORMANT"})
 # The billing period lengths known; any other is read as none.
 _PERIOD_LENGTHS = frozenset({"MONTHLY", "QUARTERLY"})
-# A plain upper-case name, as Kraken's enums are: only such text is logged.
-_ENUM_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
-# What a status is called in the log when it is not a plain upper-case name.
-_UNNAMED = "an unnamed status"
+# A plain upper-case name with no digits, as Kraken's enums are: only such
+# text is logged.
+_ENUM_NAME = re.compile(r"[A-Z][A-Z_]{0,31}")
+# What a status is called in the log when it is not such a name.
+_UNNAMED = "one it doesn't show"
 # The service names a rate limit's INFO line gives.
 _MERIDIAN = "Meridian"
 _SIGN_IN_SERVICE = "The sign-in service"
@@ -202,9 +204,9 @@ def _feed_in_state(register: Any, today: date) -> bool | None:
     )
 
 
-def _parse_property(raw: Any, today: date) -> tuple[MeridianProperty, bool]:
+def _parse_property(raw: Any, today: date) -> MeridianProperty:
     """
-    Return a property, and whether an unread register left it as not exporting.
+    Return a property, noting when an unread register left it as not exporting.
 
     Only its ID, its meter points and their registers must be readable: the
     address, and each meter's ID and ICP, are kept when given but never
@@ -233,12 +235,12 @@ def _parse_property(raw: Any, today: date) -> tuple[MeridianProperty, bool]:
                 has_feed_in=True in meter_states,
             )
         )
-    property_data = MeridianProperty(
+    return MeridianProperty(
         id=_required_string(raw_property, "id"),
         address=_optional_string(raw_property.get("address")),
         meter_points=tuple(meter_points),
+        feed_in_unread=None in states and True not in states,
     )
-    return property_data, None in states and True not in states
 
 
 def _whole(value: Any, low: int, high: int | None) -> bool:
@@ -318,6 +320,28 @@ class MeridianSignInServiceError(MeridianConnectionError):
         return f"sign-in service: {'timed out' if self.timed_out else 'network error'}"
 
 
+class MeridianSignInServiceUnreadableError(MeridianSignInServiceError):
+    """
+    Google's sign-in service sent an answer that can't be read.
+
+    ``reason`` is ``not JSON`` or ``unexpected data``. It is raised from the
+    error that read the answer, so a page that is not JSON stays
+    ``is_unreadable``. Never an ended sign-in, and never sent again.
+    """
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(None)
+        self.args = (
+            f"The sign-in service sent an answer that can't be read: {reason}",
+        )
+        self.reason = reason
+
+    @property
+    def detail(self) -> str:
+        """Describe the answer, as in ``sign-in service: not JSON``."""
+        return f"sign-in service: {self.reason}"
+
+
 class MeridianRejectedError(MeridianConnectionError):
     """
     Meridian's service refused a request with a client error (HTTP 4xx).
@@ -348,7 +372,7 @@ class MeridianRateLimitError(MeridianConnectionError):
 
     Besides the wait, it says what the answer was, for a log line: its HTTP
     status, the code it named if any, whether it carried Retry-After, and
-    the service that sent it.
+    whether the sign-in service sent it rather than Meridian.
     """
 
     def __init__(
@@ -358,14 +382,19 @@ class MeridianRateLimitError(MeridianConnectionError):
         answer_status: int | None = None,
         code: str | None = None,
         retry_after_given: bool = False,
-        service: str = _MERIDIAN,
+        sign_in_service: bool = False,
     ) -> None:
         super().__init__("Meridian rate limited the request")
         self.retry_after = retry_after
         self.answer_status = answer_status
         self.code = code
         self.retry_after_given = retry_after_given
-        self.service = service
+        self.sign_in_service = sign_in_service
+
+    @property
+    def service(self) -> str:
+        """Return the service that asked to wait, as its log line names it."""
+        return _SIGN_IN_SERVICE if self.sign_in_service else _MERIDIAN
 
 
 class MeridianOtpError(MeridianAuthenticationError):
@@ -402,14 +431,6 @@ class InvertedPeriodError(ValueError):
         super().__init__("Meridian gave a billing period that ends before it starts")
 
 
-def _parse_firebase_tokens(payload: dict[str, Any]) -> MeridianTokenSet:
-    """Translate strict token parsing failures into an authentication error."""
-    try:
-        return parse_firebase_tokens(payload)
-    except TokenParseError as err:
-        raise MeridianAuthenticationError(str(err)) from err
-
-
 class MeridianApiClient:
     """Client for Meridian's OTP, Firebase and GraphQL services."""
 
@@ -423,8 +444,9 @@ class MeridianApiClient:
         self._transport = MeridianTransport(session)
         self._tokens = tokens
         self._token_update_callback = token_update_callback
-        # How many accounts the latest list skipped for their status.
-        self.skipped_accounts = 0
+        # How many accounts the latest list skipped for their status, and
+        # how many properties it skipped as unreadable.
+        self.skipped_accounts = self.skipped_properties = 0
         # What was already logged once, so each is logged once per client.
         self._logged: set[tuple[Any, ...]] = set()
 
@@ -437,8 +459,9 @@ class MeridianApiClient:
         """
         Ask Meridian to email a one-time login code.
 
-        Only an answer in JSON, as Meridian's own are, refuses the email; a
-        page from something in between is no answer.
+        Meridian's refusals are assumed to be JSON: only an answer in JSON
+        refuses the email. A page from something in between makes no claim
+        about it, and is no answer.
         """
         payload = {
             "email": email,
@@ -474,8 +497,10 @@ class MeridianApiClient:
         """
         Exchange an emailed code for a renewable Firebase session.
 
-        Only an answer in JSON refuses the code or the session; a page from
-        something in between is no answer.
+        Meridian's and Google's refusals are assumed to be JSON; a page from
+        something in between, or an answer that can't be read, makes no
+        claim about the email, code or session. A session answer that can't
+        be read is a ``TokenParseError``, a ``ValueError``.
         """
         try:
             response = await self._async_json_request(
@@ -523,13 +548,13 @@ class MeridianApiClient:
             )
         except _MeridianHttpError as err:
             if err.status == _HTTP_TOO_MANY_REQUESTS:
-                raise _rate_limit(err, _SIGN_IN_SERVICE) from err
+                raise _rate_limit(err, sign_in_service=True) from err
             if _no_refusal(err):
                 raise _connection_error(err, meridian_service=False) from err
             raise MeridianAuthenticationError(
                 "Meridian authentication exchange was rejected"
             ) from err
-        tokens = _parse_firebase_tokens(firebase)
+        tokens = parse_firebase_tokens(firebase)
         await self._async_set_tokens(tokens)
         return tokens
 
@@ -538,8 +563,9 @@ class MeridianApiClient:
         Refresh the Firebase ID token when it is close to expiry.
 
         Only a refusal in JSON (HTTP 400, 401 or 403) ends the sign-in. An
-        answer that can't be read is invalid data (``TokenParseError``, a
-        ``ValueError``), which a later update tries again.
+        answer that can't be read is the sign-in service's
+        (``MeridianSignInServiceUnreadableError``): invalid data, which a
+        later update tries again.
         """
         if self._tokens is None:
             raise MeridianAuthenticationError("No Meridian session is available")
@@ -561,7 +587,7 @@ class MeridianApiClient:
             )
         except _MeridianHttpError as err:
             if err.status == _HTTP_TOO_MANY_REQUESTS:
-                raise _rate_limit(err, _SIGN_IN_SERVICE) from err
+                raise _rate_limit(err, sign_in_service=True) from err
             if err.status in {400, 401, 403} and err.json_body:
                 raise MeridianAuthenticationError(
                     "Meridian session refresh was rejected"
@@ -574,7 +600,10 @@ class MeridianApiClient:
             "expiresIn": response.get("expires_in"),
             "localId": response.get("user_id"),
         }
-        tokens = parse_firebase_tokens(normalized)
+        try:
+            tokens = parse_firebase_tokens(normalized)
+        except TokenParseError as err:
+            raise MeridianSignInServiceUnreadableError("unexpected data") from err
         await self._async_set_tokens(tokens)
         _LOGGER.debug("Meridian session refreshed")
         return tokens
@@ -584,8 +613,11 @@ class MeridianApiClient:
         Return the active and dormant accounts, with their properties.
 
         An account with any other status is skipped, and counted in
-        ``skipped_accounts``; each such status is logged once, by name only
-        when it is a plain upper-case name, so nothing identifying is.
+        ``skipped_accounts``; each such status is logged once, named only
+        when it looks like an enum name, with no digits. A property that
+        can't be read is skipped, and counted in ``skipped_properties`` and
+        on its account; a ``ValueError`` when one was and no account has a
+        property left.
         """
         data = await self._async_graphql(
             "accountsList",
@@ -607,6 +639,9 @@ class MeridianApiClient:
                 continue
             accounts.append(await self._async_get_account(number, status, position))
         self.skipped_accounts = skipped
+        self.skipped_properties = sum(item.skipped_properties for item in accounts)
+        if self.skipped_properties and not any(item.properties for item in accounts):
+            raise ValueError("Meridian Energy can't read any property Meridian lists")
         return tuple(accounts)
 
     def _log_skipped_status(self, status: str) -> None:
@@ -627,9 +662,10 @@ class MeridianApiClient:
         """
         Return an account and the properties that can be followed.
 
-        A property whose answer can't be read is skipped, and logged by its
-        position; a register whose feed-in flag can't be read counts as no
-        feed-in, and is logged likewise.
+        A property whose answer can't be read is skipped, counted, and
+        logged by its place in Meridian's lists. A register whose feed-in
+        flag can't be read counts as no feed-in, which the property notes
+        (``feed_in_unread``) for the coordinator to log.
         """
         data = await self._async_graphql(
             "account",
@@ -643,29 +679,20 @@ class MeridianApiClient:
         for number, raw_property in enumerate(raw_properties, start=1):
             place = (number, len(raw_properties), position)
             try:
-                property_data, unread = _parse_property(raw_property, today)
+                properties.append(_parse_property(raw_property, today))
             except ValueError:
                 self._log_once(
                     ("property", *place),
                     logging.WARNING,
-                    "Meridian Energy skipped property %d of %d on account %d: it "
-                    "can't read Meridian's answer for it",
+                    "Meridian Energy skipped property %d of %d on account %d, as "
+                    "Meridian lists them: it can't read Meridian's answer for it",
                     place,
                 )
-                continue
-            if unread:
-                self._log_once(
-                    ("feed_in", *place),
-                    logging.INFO,
-                    "Meridian Energy can't read whether property %d of %d on "
-                    "account %d sends power to the grid; it takes it as not",
-                    place,
-                )
-            properties.append(property_data)
         return MeridianAccount(
             number=_required_string(account, "number"),
             status=status,
             properties=tuple(properties),
+            skipped_properties=len(raw_properties) - len(properties),
         )
 
     def _log_once(
@@ -795,10 +822,11 @@ class MeridianApiClient:
         """
         Return the retailer-defined current billing period for an account.
 
-        Only its start and end are used, and both are read strictly; a period
-        that ends before it starts is refused (``InvertedPeriodError``). The
-        other fields are None when absent or unreadable, which logs the
-        field's name once at DEBUG, never its value.
+        The start and end are read strictly, and a period that ends before it
+        starts is refused (``InvertedPeriodError``). The other fields, the
+        next billing date among them, are read leniently: each is None when
+        absent or unreadable, logging the field's name once at DEBUG, never
+        its value.
         """
         data = await self._async_graphql(
             "billingPeriods",
@@ -1048,6 +1076,8 @@ class MeridianApiClient:
                 raise MeridianSignInServiceError(None, timed_out=True) from err
             raise MeridianUpstreamError(None) from err
         except MeridianUnreadableResponseError as err:
+            if not meridian_service:
+                raise MeridianSignInServiceUnreadableError("not JSON") from err
             raise MeridianConnectionError(str(err)) from err
         except MeridianTransportError as err:
             if not meridian_service:
@@ -1094,7 +1124,12 @@ def is_passing_failure(err: BaseException) -> bool:
     the sign-in service, as Meridian's web app resends a query after 502 to
     504. Never a rate limit, a refusal or an answer that can't be read.
     """
-    if isinstance(err, MeridianRateLimitError | MeridianRejectedError):
+    if isinstance(
+        err,
+        MeridianRateLimitError
+        | MeridianRejectedError
+        | MeridianSignInServiceUnreadableError,
+    ):
         return False
     if isinstance(err, MeridianUpstreamError | MeridianSignInServiceError):
         return err.status is None or err.status in TRANSIENT_STATUSES
@@ -1107,9 +1142,10 @@ def _no_refusal(err: _MeridianHttpError) -> bool:
     """
     Return whether a sign-in step's unsuccessful answer is no refusal.
 
-    A timeout (408) or a server error is a failure of the service; any
-    other status refuses only in JSON, as the services' own answers are. A
-    page from something in between is no answer.
+    A timeout (408) or a server error is a failure of the service. Meridian's
+    and Google's refusals are assumed to be JSON, so any other status
+    refuses only in JSON; a page from something in between makes no claim
+    about the email, code or session, and is no answer.
     """
     return (
         err.status == _HTTP_REQUEST_TIMEOUT
@@ -1119,7 +1155,7 @@ def _no_refusal(err: _MeridianHttpError) -> bool:
 
 
 def _rate_limit(
-    err: _MeridianHttpError, service: str = _MERIDIAN
+    err: _MeridianHttpError, *, sign_in_service: bool = False
 ) -> MeridianRateLimitError:
     """Return the rate limit an HTTP 429 answer is, with what it said."""
     return MeridianRateLimitError(
@@ -1127,7 +1163,24 @@ def _rate_limit(
         answer_status=err.status,
         code=", ".join(shown_codes(_error_codes(err.payload))) or None,
         retry_after_given=err.retry_after_given,
-        service=service,
+        sign_in_service=sign_in_service,
+    )
+
+
+def log_rate_limit(err: MeridianRateLimitError, then: str) -> None:
+    """
+    Log at INFO what a rate limit's answer said, and what is done about it.
+
+    Its status, code and whether it gave Retry-After, never its body, so a
+    real limit leaves a trace of its form.
+    """
+    _LOGGER.info(
+        "%s asked Meridian Energy to wait (HTTP %s, %s, %s Retry-After); %s",
+        err.service,
+        "-" if err.answer_status is None else err.answer_status,
+        err.code or "no code",
+        "with" if err.retry_after_given else "without",
+        then,
     )
 
 
