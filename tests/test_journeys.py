@@ -814,8 +814,9 @@ def test_deleted_statistics_are_waited_for_until_they_are_gone(
     monkeypatch.setattr(journeys, "POLL_S", 0.01)
     hour = {"start": _FIRST.timestamp() * 1000, "state": 0.5, "sum": 0.5}
     client = _Client()
-    # The first two reads still find the hour; the next two find nothing.
-    client.periods = [{"meridian_energy:a": [hour]}] * 2 + [{}]
+    # Each statistics() call reads twice: the first two calls still find the
+    # hour, and only the third finds nothing.
+    client.periods = [{"meridian_energy:a": [hour]}] * 4 + [{}]
     journey = _journey(tmp_path, client)
     journey.clear_statistics(["meridian_energy:b", "meridian_energy:a"])
     assert client.cleared == [["meridian_energy:a", "meridian_energy:b"]]

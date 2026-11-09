@@ -214,7 +214,7 @@ def test_a_balance_that_does_not_read_is_refused(account: dict[str, Any]) -> Non
     "cents", [10**13, -(10**13), 10**400], ids=["1E+13", "-1E+13", "1E+400"]
 )
 @pytest.mark.parametrize("field", ["balance", "payment"])
-def test_a_balance_or_payment_past_1e12_cents_is_refused(
+def test_a_balance_or_payment_from_1e13_cents_is_refused(
     field: str, cents: int
 ) -> None:
     """Far past any account's, and past what a sensor can show at 10**400."""
@@ -257,7 +257,8 @@ def fresh_rate_log() -> None:
         ("$2.00 /day + GST", "from $0.30 /kWh", (None, None)),
         ("$2.00 /day $0.30 /kWh", "$0.30 /kWh, $0.25 /kWh off-peak", (None, None)),
         ("212.500 c/day extra", "31.41 c/kWh more", (None, None)),
-        # Up to 1E+12 in either unit; past it, too large to divide or to show.
+        # Below 1E+13 in either unit, as written; from 1E+13 up, too large to
+        # divide or to show.
         pytest.param(
             "$1" + "0" * 12 + " /day",
             "1" + "0" * 12 + " c/kWh",
