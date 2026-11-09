@@ -525,6 +525,8 @@ def _coordinator_mock(data: MeridianSyncData | None) -> MagicMock:
     coordinator.last_exception = None
     coordinator.extras_diagnostics.return_value = _EXTRAS
     coordinator.unit_diagnostics = list
+    coordinator.client.skipped_accounts = 1
+    coordinator.rate_limits_met = 2
     return coordinator
 
 
@@ -585,7 +587,7 @@ async def test_diagnostics_name_the_last_failure_by_key_and_cause(hass) -> None:
         translation_key="cannot_connect",
         translation_placeholders={"detail": "HTTP 504"},
     )
-    failure.__cause__ = MeridianUpstreamError(504, gateway=True)
+    failure.__cause__ = MeridianUpstreamError(504)
     coordinator.last_update_success = False
     coordinator.last_exception = failure
 
@@ -669,6 +671,22 @@ async def test_diagnostics_snapshot(hass, snapshot, freezer) -> None:
 
 
 @pytest.mark.asyncio
+async def test_an_account_with_no_property_has_no_estimates_to_count(hass) -> None:
+    """Unknown, not 0: there is no property whose hours could be estimates."""
+    coordinator = MeridianDataCoordinator(hass, MagicMock())
+    coordinator._topology = (replace(_account(), properties=()),)
+    coordinator.data = replace(_data(), results=())
+    entry = _entry(coordinator)
+    entities = []
+
+    await async_setup_entry(hass, entry, entities.extend)
+
+    estimated = _by_key(entities)["estimated_readings"]
+    assert estimated.native_value is None
+    await entry._async_process_on_unload(hass)
+
+
+@pytest.mark.asyncio
 async def test_entities_before_first_sync_come_from_topology(hass) -> None:
     """Before the first sync: the feed-in sensors from the accounts, no prices."""
     account = _account()
@@ -746,6 +764,8 @@ async def test_diagnostics_before_first_sync(hass, freezer) -> None:
         "last_failure": None,
         "first_sync_pending": True,
         "account_count": 1,
+        "skipped_account_count": 1,
+        "rate_limits": 2,
         "extras": _EXTRAS,
         "units": [
             {

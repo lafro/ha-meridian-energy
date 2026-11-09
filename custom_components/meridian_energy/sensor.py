@@ -119,11 +119,7 @@ DESCRIPTIONS = (
         entity_category=EntityCategory.DIAGNOSTIC,
         state_class=SensorStateClass.MEASUREMENT,
         suggested_display_precision=0,
-        value_fn=lambda data, result: sum(
-            item.estimated_rows
-            for item in data.results
-            if item.account_key == result.account_key
-        ),
+        value_fn=lambda data, result: _estimated_rows(data, result.account_key),
     ),
     _EnergyDescription(
         key="bill_usage",
@@ -459,6 +455,12 @@ def _account_result(
     return next(
         (item for item in data.account_results if item.account_key == key), None
     )
+
+
+def _estimated_rows(data: MeridianSyncData, key: str) -> int | None:
+    """Return an account's estimated hours, None for an account with no property."""
+    rows = [item.estimated_rows for item in data.results if item.account_key == key]
+    return sum(rows) if rows else None
 
 
 def _account_has_feed_in(account: MeridianAccount) -> bool:

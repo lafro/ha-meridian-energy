@@ -12,6 +12,7 @@ import pytest
 from custom_components.meridian_energy import parsers as parsers_module
 from custom_components.meridian_energy.models import (
     MeridianBill,
+    MeridianNoAgreement,
     MeridianPayment,
     MeridianPrices,
 )
@@ -365,10 +366,21 @@ def _plan(*rates: dict[str, Any]) -> dict[str, Any]:
             rate("CONSUMPTION_CHARGE", "$0.30 /kWh"),
         ),
         _plan(rate("STANDING_CHARGE", "$2 /day")),
-        # Two meter points, or none with a current agreement.
+        # Two meter points.
         {"meterPoints": prices_data()["meterPoints"] * 2},
-        {"meterPoints": [{"activeAgreement": None}]},
     ],
 )
 def test_any_plan_but_one_all_day_agreement_has_no_prices(plan: dict[str, Any]) -> None:
     assert parse_prices(plan) is None
+
+
+def test_a_meter_point_with_no_agreement_in_force_says_nothing_of_the_plan() -> None:
+    """
+    No agreement in force is told apart from a plan with no all-day prices.
+
+    A day between agreements says nothing of the plan, so the price sensors
+    stay and show unknown, where a plan they cannot show has none.
+    """
+    assert parse_prices({"meterPoints": [{"activeAgreement": None}]}) == (
+        MeridianNoAgreement()
+    )

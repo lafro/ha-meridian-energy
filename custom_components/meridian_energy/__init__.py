@@ -67,11 +67,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> 
             },
         )
 
+    user_id = entry.data.get(CONF_FIREBASE_USER_ID)
     tokens = MeridianTokenSet(
         id_token="",
         refresh_token=str(entry.data[CONF_REFRESH_TOKEN]),
         expires_at=datetime.fromtimestamp(0, UTC),
-        user_id=str(entry.data[CONF_FIREBASE_USER_ID]),
+        user_id=user_id if isinstance(user_id, str) else None,
     )
     client = MeridianApiClient(
         async_get_clientsession(hass),

@@ -36,6 +36,7 @@ from .meridian_http import (
     ACCOUNT_NUMBER,
     FakeMeridianSession,
     Response,
+    account_data,
     json_response,
     property_id,
 )
@@ -528,6 +529,31 @@ async def test_no_account_raises_the_notice_at_once_and_removal_clears_it(
 
     await async_remove_entry(hass, entry)  # type: ignore[arg-type]
     assert registry.async_get_issue(DOMAIN, issue_id) is None
+
+
+async def test_an_account_with_no_property_yet_has_a_notice_of_its_own(
+    hass: HomeAssistant,
+) -> None:
+    """As when a supply has yet to start: listed, but nothing to follow yet."""
+    entry = _entry(hass)
+    session = FakeMeridianSession(NOW)
+    session.hook = lambda operation, _variables: (
+        json_response({"data": {"account": {**account_data(), "properties": []}}})
+        if operation == "account"
+        else None
+    )
+    coordinator = coordinator_for(hass, session, config_entry=entry)
+
+    with pytest.raises(UpdateFailed) as failure:
+        await sync(coordinator, NOW, session)
+
+    assert failure.value.translation_key == "no_properties"
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, f"sync_failing_{entry.entry_id}")
+    assert issue is not None
+    assert (
+        "no property with an electricity supply yet"
+        in issue.translation_placeholders["reason"]
+    )
 
 
 async def test_an_ended_sign_in_never_raises_the_notice(hass: HomeAssistant) -> None:

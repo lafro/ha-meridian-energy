@@ -12,6 +12,7 @@ from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from functools import partial
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -19,6 +20,7 @@ from aiohttp import ClientError
 
 from custom_components.meridian_energy import parsers as parsers_module
 from custom_components.meridian_energy.api import (
+    InvertedPeriodError,
     MeridianApiClient,
     MeridianAuthenticationError,
     MeridianConnectionError,
@@ -26,8 +28,8 @@ from custom_components.meridian_energy.api import (
     MeridianOtpError,
     MeridianRateLimitError,
     MeridianRejectedError,
+    _feed_in_state,
     _graphql_error_code,
-    _is_active_feed_in_register,
     _MeridianHttpError,
     _optional_string,
     _parse_datetime,
@@ -47,12 +49,17 @@ from custom_components.meridian_energy.graphql import (
 from custom_components.meridian_energy.models import (
     MeasurementPage,
     MeridianMeasurement,
+    MeridianMeterPoint,
     MeridianTokenSet,
     require_list,
     require_mapping,
 )
-from custom_components.meridian_energy.parsers import optional_date
+from custom_components.meridian_energy.parsers import (
+    optional_date,
+    optional_local_date,
+)
 
+from .kraken_fake import NZ
 from .meridian_http import FakeMeridianSession, balance_data, prices_data
 
 
@@ -210,7 +217,9 @@ async def test_send_otp_maps_client_errors(
 ) -> None:
     client = MeridianApiClient(MagicMock())
     client._async_json_request = AsyncMock(
-        side_effect=_MeridianHttpError(status, {"secret": "must-not-leak"}, 123)
+        side_effect=_MeridianHttpError(
+            status, {"secret": "must-not-leak"}, 123, json_body=True
+        )
     )
 
     with pytest.raises(error_type) as raised:
@@ -342,7 +351,7 @@ async def test_validate_otp_takes_a_429_without_a_code_name_as_a_rate_limit(
 async def test_validate_otp_names_an_unknown_refusal_by_its_code() -> None:
     client = MeridianApiClient(MagicMock())
     client._async_json_request = AsyncMock(
-        side_effect=_MeridianHttpError(400, {"code": "SOMETHING_ELSE"})
+        side_effect=_MeridianHttpError(400, {"code": "SOMETHING_ELSE"}, json_body=True)
     )
 
     with pytest.raises(MeridianOtpError) as raised:
@@ -368,7 +377,7 @@ async def test_validate_otp_maps_custom_token_exchange_error(
     client._async_json_request = AsyncMock(
         side_effect=[
             {"customToken": "custom"},
-            _MeridianHttpError(status, {"secret": "must-not-leak"}),
+            _MeridianHttpError(status, {"secret": "must-not-leak"}, json_body=True),
         ]
     )
 
@@ -441,7 +450,7 @@ async def test_refresh_rejected_requires_reauth(status: int) -> None:
     )
     client = MeridianApiClient(MagicMock(), tokens=expired)
     client._async_json_request = AsyncMock(
-        side_effect=_MeridianHttpError(status, {"error": "redacted"})
+        side_effect=_MeridianHttpError(status, {"error": "redacted"}, json_body=True)
     )
     with pytest.raises(MeridianAuthenticationError):
         await client.async_refresh_tokens()
@@ -653,7 +662,7 @@ async def test_get_accounts_ignores_inactive_feed_in_registers() -> None:
 def test_active_feed_in_register_contract(
     register: dict[str, object], today: date, expected: bool
 ) -> None:
-    assert _is_active_feed_in_register(register, today) is expected
+    assert _feed_in_state(register, today) is expected
 
 
 @pytest.mark.parametrize(
@@ -673,8 +682,8 @@ def test_back_to_back_feed_in_registers_are_active_one_at_a_time(
     }
     later = {"isFeedIn": True, "activeFrom": handover, "activeTo": None}
     assert (
-        _is_active_feed_in_register(earlier, today),
-        _is_active_feed_in_register(later, today),
+        _feed_in_state(earlier, today),
+        _feed_in_state(later, today),
     ) == expected
 
 
@@ -689,16 +698,24 @@ def test_back_to_back_feed_in_registers_are_active_one_at_a_time(
 def test_feed_in_register_dates_are_strict_and_quote_nothing(
     value: object, message: str
 ) -> None:
-    register = {"isFeedIn": True, "activeFrom": value}
+    """A feed-in register's unreadable date is no feed-in, read strictly."""
     with pytest.raises(ValueError, match=message) as raised:
-        _is_active_feed_in_register(register, date(2026, 7, 16))
+        optional_local_date(value, NZ)
     assert "A-TEST-1" not in "".join(traceback.format_exception(raised.value))
     assert "2026" not in str(raised.value)
+    register = {"isFeedIn": True, "activeFrom": value}
+    assert _feed_in_state(register, date(2026, 7, 16)) is None
 
 
-def test_active_feed_in_register_rejects_invalid_flag() -> None:
-    with pytest.raises(ValueError, match="flag"):
-        _is_active_feed_in_register({"isFeedIn": "yes"}, date(2026, 7, 16))
+@pytest.mark.parametrize(
+    "register",
+    [{"isFeedIn": "yes"}, {"isFeedIn": None}, {}, None, "register"],
+    ids=["text", "null", "absent", "null register", "not an object"],
+)
+def test_a_feed_in_flag_that_is_not_true_or_false_cannot_be_read(
+    register: object,
+) -> None:
+    assert _feed_in_state(register, date(2026, 7, 16)) is None
 
 
 @pytest.mark.asyncio
@@ -719,27 +736,222 @@ async def test_get_account_skips_null_meter_point() -> None:
             }
         }
     )
-    account = await client._async_get_account("A-TEST")
+    account = await client._async_get_account("A-TEST", "DORMANT", 1)
     assert account.properties[0].meter_points == ()
+
+
+def _register(*, is_feed_in: object = True) -> dict[str, object]:
+    return {
+        "identifier": "synthetic-register",
+        "activeFrom": None,
+        "activeTo": None,
+        "isFeedIn": is_feed_in,
+    }
+
+
+def _property(**changes: object) -> dict[str, object]:
+    return {
+        "id": "synthetic-property",
+        "address": "1 Synthetic Street",
+        "meterPoints": [
+            {
+                "id": "synthetic-meter",
+                "marketIdentifier": "0000000000TEST",
+                "registers": [_register()],
+            }
+        ],
+        **changes,
+    }
+
+
+def _answering(
+    accounts: list[dict[str, object]], properties: list[object]
+) -> AsyncMock:
+    """Answer the account list, then each account with these properties."""
+
+    async def answer(
+        operation: str, _query: str, variables: dict[str, Any], **_kwargs: Any
+    ) -> dict[str, Any]:
+        if operation == "accountsList":
+            return {"viewer": {"accounts": accounts}}
+        return {
+            "account": {
+                "number": variables["accountNumber"],
+                "status": None,
+                "properties": properties,
+            }
+        }
+
+    return AsyncMock(side_effect=answer)
+
+
+@pytest.mark.asyncio
+async def test_an_account_needs_no_status_address_meter_id_or_icp() -> None:
+    """
+    Only a property's ID and its registers are needed to follow it.
+
+    The status comes from the account list; the rest is kept when given.
+    """
+    client = MeridianApiClient(MagicMock(), tokens=_tokens())
+    bare_meter = {"id": None, "marketIdentifier": None, "registers": [_register()]}
+    client._async_graphql = _answering(
+        [{"number": "A-TEST", "status": "DORMANT", "id": "account"}],
+        [_property(address=None, meterPoints=[bare_meter])],
+    )
+
+    (account,) = await client.async_get_accounts()
+
+    assert account.status == "DORMANT"
+    (prop,) = account.properties
+    assert prop.address is None
+    assert prop.meter_points == (
+        MeridianMeterPoint(id=None, market_identifier=None, has_feed_in=True),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_property_that_cannot_be_read_is_skipped_and_logged_by_place(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The others are followed; the line names its place, never its contents."""
+    caplog.set_level(logging.INFO, logger="custom_components.meridian_energy")
+    client = MeridianApiClient(MagicMock(), tokens=_tokens())
+    client._async_graphql = _answering(
+        [{"number": "A-TEST-1", "status": "ACTIVE", "id": "account"}],
+        [
+            _property(),
+            _property(id=None, address="2 Synthetic Street"),
+            "synthetic-property-3",
+            _property(meterPoints=[{"id": "synthetic-meter", "registers": "none"}]),
+        ],
+    )
+
+    for _update in range(2):
+        (account,) = await client.async_get_accounts()
+        assert [prop.id for prop in account.properties] == ["synthetic-property"]
+
+    assert [(r.levelno, r.getMessage()) for r in caplog.records] == [
+        (
+            logging.WARNING,
+            (
+                f"Meridian Energy skipped property {number} of 4 on account 1: it "
+                "can't read Meridian's answer for it"
+            ),
+        )
+        for number in (2, 3, 4)
+    ]
+    for text in ("A-TEST-1", "Synthetic Street", "synthetic-property"):
+        assert text not in caplog.text
+
+
+@pytest.mark.parametrize("flag", ["yes", None, 1], ids=["text", "null", "a number"])
+@pytest.mark.asyncio
+async def test_a_feed_in_flag_that_cannot_be_read_counts_as_none_and_is_logged(
+    caplog: pytest.LogCaptureFixture, flag: object
+) -> None:
+    caplog.set_level(logging.INFO, logger="custom_components.meridian_energy")
+    client = MeridianApiClient(MagicMock(), tokens=_tokens())
+    meter = {"id": "synthetic-meter", "registers": [_register(is_feed_in=flag)]}
+    client._async_graphql = _answering(
+        [
+            {"number": "A-TEST-1", "status": "ACTIVE", "id": "1"},
+            {"number": "A-TEST-2", "status": "ACTIVE", "id": "2"},
+        ],
+        [_property(meterPoints=[meter])],
+    )
+
+    for _update in range(2):
+        accounts = await client.async_get_accounts()
+        assert [
+            account.properties[0].meter_points[0].has_feed_in for account in accounts
+        ] == [False, False]
+
+    assert caplog.messages == [
+        f"Meridian Energy can't read whether property 1 of 1 on account {place} "
+        "sends power to the grid; it takes it as not"
+        for place in (1, 2)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_readable_feed_in_register_outweighs_an_unreadable_one(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Nothing is taken as not sending power: nothing is logged."""
+    caplog.set_level(logging.INFO, logger="custom_components.meridian_energy")
+    client = MeridianApiClient(MagicMock(), tokens=_tokens())
+    meter = {
+        "id": "synthetic-meter",
+        "registers": [_register(is_feed_in="yes"), _register()],
+    }
+    client._async_graphql = _answering(
+        [{"number": "A-TEST-1", "status": "ACTIVE", "id": "1"}],
+        [_property(meterPoints=[meter])],
+    )
+
+    (account,) = await client.async_get_accounts()
+
+    assert account.properties[0].meter_points[0].has_feed_in is True
+    assert caplog.messages == []
+
+
+@pytest.mark.asyncio
+async def test_accounts_with_other_statuses_are_skipped_counted_and_logged_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Active and dormant accounts are followed; any other is counted.
+
+    Each status is logged once, by name only when it is a plain upper-case
+    name, so a status that carries text can't put it in the log.
+    """
+    caplog.set_level(logging.INFO, logger="custom_components.meridian_energy")
+    client = MeridianApiClient(MagicMock(), tokens=_tokens())
+    client._async_graphql = _answering(
+        [
+            {"number": "A-TEST-1", "status": "ACTIVE", "id": "1"},
+            {"number": "A-TEST-2", "status": "CLOSED", "id": "2"},
+            {"number": "A-TEST-3", "status": "CLOSED", "id": "3"},
+            {"number": "A-TEST-4", "status": "on hold for A-TEST-4", "id": "4"},
+            {"number": "A-TEST-5", "status": "DORMANT", "id": "5"},
+        ],
+        [_property()],
+    )
+
+    for _update in range(2):
+        accounts = await client.async_get_accounts()
+        assert [account.number for account in accounts] == ["A-TEST-1", "A-TEST-5"]
+        assert client.skipped_accounts == 3
+
+    follows = "; it follows active and dormant accounts"
+    assert caplog.messages == [
+        f"Meridian Energy doesn't follow an account whose status is CLOSED{follows}",
+        (
+            "Meridian Energy doesn't follow an account whose status is an unnamed "
+            f"status{follows}"
+        ),
+    ]
+
+
+def _billing_options(**changes: object) -> dict[str, object]:
+    """Return billing options in the shape Meridian answers: a fixed monthly cycle."""
+    return {
+        "periodLength": "MONTHLY",
+        "periodLengthMultiplier": None,
+        "isFixed": True,
+        "currentBillingPeriodStartDate": "2026-07-20",
+        "currentBillingPeriodEndDate": "2026-08-19",
+        "nextBillingDate": "2026-08-20",
+        "periodStartDay": 20,
+        **changes,
+    }
 
 
 @pytest.mark.asyncio
 async def test_get_billing_period_parses_supported_metadata() -> None:
     client = MeridianApiClient(MagicMock(), tokens=_tokens())
     client._async_graphql = AsyncMock(
-        return_value={
-            "account": {
-                "billingOptions": {
-                    "periodLength": "MONTHLY",
-                    "periodLengthMultiplier": 1,
-                    "isFixed": True,
-                    "currentBillingPeriodStartDate": "2026-07-20",
-                    "currentBillingPeriodEndDate": "2026-08-19",
-                    "nextBillingDate": "2026-08-20",
-                    "periodStartDay": 20,
-                }
-            }
-        }
+        return_value={"account": {"billingOptions": _billing_options()}}
     )
 
     result = await client.async_get_billing_period("A-TEST")
@@ -748,7 +960,7 @@ async def test_get_billing_period_parses_supported_metadata() -> None:
     assert result.end == date(2026, 8, 19)
     assert result.next_billing_date == date(2026, 8, 20)
     assert result.period_length == "MONTHLY"
-    assert result.period_length_multiplier == 1
+    assert result.period_length_multiplier is None
     assert result.is_fixed is True
     assert result.period_start_day == 20
     assert client._async_graphql.await_args.args[0] == "billingPeriods"
@@ -756,38 +968,88 @@ async def test_get_billing_period_parses_supported_metadata() -> None:
 
 
 @pytest.mark.parametrize(
-    ("field", "value", "message"),
+    ("field", "value"),
     [
-        ("periodLength", "WEEKLY", "period length"),
-        ("periodLengthMultiplier", 0, "multiplier"),
-        ("periodLengthMultiplier", True, "multiplier"),
-        ("periodStartDay", 0, "start day"),
-        ("periodStartDay", True, "start day"),
-        ("isFixed", "yes", "fixed"),
-        ("currentBillingPeriodStartDate", "not-a-date", "date"),
+        ("periodLength", "WEEKLY"),
+        ("periodLength", {"name": "MONTHLY"}),
+        ("periodLengthMultiplier", 0),
+        ("periodLengthMultiplier", True),
+        ("periodStartDay", 0),
+        ("periodStartDay", 32),
+        ("periodStartDay", True),
+        ("isFixed", "yes"),
+        ("nextBillingDate", "2026-13-45"),
+        ("nextBillingDate", 20260820),
     ],
 )
 @pytest.mark.asyncio
-async def test_get_billing_period_rejects_invalid_metadata(
-    field: str, value: object, message: str
+async def test_unused_billing_fields_are_read_leniently(
+    caplog: pytest.LogCaptureFixture, field: str, value: object
 ) -> None:
-    options = {
-        "periodLength": "MONTHLY",
-        "periodLengthMultiplier": 1,
-        "isFixed": True,
-        "currentBillingPeriodStartDate": "2026-07-20",
-        "currentBillingPeriodEndDate": "2026-08-19",
-        "nextBillingDate": None,
-        "periodStartDay": 20,
-    }
-    options[field] = value
+    """
+    A field the bill figures don't use never refuses the period.
+
+    It reads as None, and its name, never its value, is logged once at DEBUG.
+    """
+    caplog.set_level(logging.DEBUG)
     client = MeridianApiClient(MagicMock(), tokens=_tokens())
     client._async_graphql = AsyncMock(
-        return_value={"account": {"billingOptions": options}}
+        return_value={"account": {"billingOptions": _billing_options(**{field: value})}}
     )
 
-    with pytest.raises(ValueError, match=message):
+    for _ in range(2):
+        result = await client.async_get_billing_period("A-TEST")
+
+    assert (result.start, result.end) == (date(2026, 7, 20), date(2026, 8, 19))
+    read = {
+        "periodLength": result.period_length,
+        "periodLengthMultiplier": result.period_length_multiplier,
+        "periodStartDay": result.period_start_day,
+        "isFixed": result.is_fixed,
+        "nextBillingDate": result.next_billing_date,
+    }
+    assert read[field] is None
+    assert [record.getMessage() for record in caplog.records] == [
+        f"Meridian's billing period has an unreadable {field}"
+    ]
+
+
+@pytest.mark.parametrize(
+    "field", ["currentBillingPeriodStartDate", "currentBillingPeriodEndDate"]
+)
+@pytest.mark.asyncio
+async def test_the_billing_period_dates_are_read_strictly(field: str) -> None:
+    client = MeridianApiClient(MagicMock(), tokens=_tokens())
+    client._async_graphql = AsyncMock(
+        return_value={
+            "account": {"billingOptions": _billing_options(**{field: "not-a-date"})}
+        }
+    )
+
+    with pytest.raises(ValueError, match="date"):
         await client.async_get_billing_period("A-TEST")
+
+
+@pytest.mark.asyncio
+async def test_a_period_that_ends_before_it_starts_is_refused() -> None:
+    client = MeridianApiClient(MagicMock(), tokens=_tokens())
+    client._async_graphql = AsyncMock(
+        return_value={
+            "account": {
+                "billingOptions": _billing_options(
+                    currentBillingPeriodStartDate="2026-08-20",
+                    currentBillingPeriodEndDate="2026-08-19",
+                )
+            }
+        }
+    )
+
+    with pytest.raises(InvertedPeriodError) as refused:
+        await client.async_get_billing_period("A-TEST")
+
+    assert str(refused.value) == (
+        "Meridian gave a billing period that ends before it starts"
+    )
 
 
 @pytest.mark.asyncio
@@ -1461,28 +1723,29 @@ def test_parse_firebase_tokens_derives_current_user_id_from_jwt() -> None:
     assert tokens.user_id == "uid"
 
 
-@pytest.mark.parametrize("id_token", ["invalid", "a.b.c"])
-def test_parse_firebase_tokens_rejects_missing_user_id(id_token: str) -> None:
-    with pytest.raises(MeridianAuthenticationError, match="user identifier"):
-        _parse_firebase_tokens(
-            {
-                "idToken": id_token,
-                "refreshToken": "refresh",
-                "expiresIn": "3600",
-            }
-        )
+_NOT_CLAIMS = base64.urlsafe_b64encode(json.dumps(["not", "claims"]).encode()).decode()
 
 
-def test_parse_firebase_tokens_rejects_non_mapping_claims() -> None:
-    claims = base64.urlsafe_b64encode(json.dumps(["not", "claims"]).encode()).decode()
-    with pytest.raises(MeridianAuthenticationError, match="user identifier"):
-        _parse_firebase_tokens(
-            {
-                "idToken": f"header.{claims.rstrip('=')}.signature",
-                "refreshToken": "refresh",
-                "expiresIn": "3600",
-            }
-        )
+@pytest.mark.parametrize(
+    "id_token",
+    ["invalid", "a.b.c", f"header.{_NOT_CLAIMS.rstrip('=')}.signature"],
+    ids=["one part", "unreadable claims", "claims not a mapping"],
+)
+def test_a_session_without_a_readable_user_id_is_still_a_session(
+    id_token: str,
+) -> None:
+    """
+    The user ID is kept when it can be read, and is never needed.
+
+    Nothing sends it to Meridian or Google, so a session whose token does
+    not name its user is still a session.
+    """
+    tokens = _parse_firebase_tokens(
+        {"idToken": id_token, "refreshToken": "refresh", "expiresIn": "3600"}
+    )
+
+    assert tokens.id_token == id_token
+    assert tokens.user_id is None
 
 
 def test_parse_measurement_defensive_validation() -> None:
@@ -1691,10 +1954,10 @@ async def test_a_window_whose_pages_cannot_end_is_refused(
             context="grid_import window=-6..0d",
         )
 
-    assert pace.await_count == len(pages)
-    contexts = [
-        call.kwargs["context"] for call in client.async_get_measurements.await_args_list
-    ]
+    calls = client.async_get_measurements.await_args_list
+    # Each page's request is paced, a resend of it included.
+    assert [call.kwargs["pace"] for call in calls] == [pace] * len(pages)
+    contexts = [call.kwargs["context"] for call in calls]
     assert contexts == [
         f"grid_import window=-6..0d page={number}"
         for number in range(1, len(pages) + 1)

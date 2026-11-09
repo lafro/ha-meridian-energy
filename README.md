@@ -16,7 +16,7 @@ An unofficial Home Assistant integration for Meridian Energy electricity account
 
 ## Installation
 
-You need Home Assistant 2026.10 or newer and a GitHub account: HACS needs one, and so does the Marketplace for a repository outside its catalog.
+You need Home Assistant 2026.10 or newer, its time zone set to Pacific/Auckland so its days are Meridian's, and a GitHub account, which HACS and the Marketplace need.
 
 1. Install Meridian Energy, or use the button above:
    - **Home Assistant 2026.11 or newer:** go to **Settings → Marketplace → Add from link**, enter `https://github.com/lafro/ha-meridian-energy` and select **Add**, connecting GitHub when asked. Then open **Meridian Energy** and select **Install**; setup opens by itself, normally with no restart.
@@ -28,7 +28,7 @@ Setup finishes once the code is accepted and your account is found. Meridian Ene
 
 Updates appear under **Settings → Updates**: install one there, then restart Home Assistant when asked.
 
-Beta versions are GitHub pre-releases, offered only if you opt in: in the Marketplace, **Meridian Energy → ⋮ → Include pre-releases** (before **Install**, to start on a beta); in HACS on 2026.10, enable and turn on the **Pre-release** switch on Meridian Energy's device under **Settings → Devices & services → HACS**.
+Betas are GitHub pre-releases, offered only if you opt in: in the Marketplace, **Meridian Energy → ⋮ → Include pre-releases** (before **Install**, to start on one); on 2026.10, enable and turn on the **Pre-release** switch on Meridian Energy's device under **Settings → Devices & services → HACS**.
 
 If an entry says it was set up by an earlier version, delete it and add it again, ideally with a [clean start](#starting-again).
 
@@ -45,17 +45,17 @@ For each property, Meridian Energy keeps two statistics, and two more with a fee
 
 With several properties on the login, each name ends with the property's address.
 
-In **Settings → Dashboards → Energy → Electricity grid → Add grid connection**, choose *Meridian grid import* as the energy imported and *Meridian grid import cost* as the entity tracking the total costs. With export, choose *Meridian grid export* as the energy exported and *Meridian grid export credit* as the entity tracking the total compensation.
+In **Settings → Dashboards → Energy → Electricity grid → Add grid connection**, choose *Meridian grid import* as the energy imported and *Meridian grid import cost* as the entity tracking the total costs, not a price: the Anytime price leaves out the daily charge. With export, choose *Meridian grid export* as the energy exported and *Meridian grid export credit* as the entity tracking the total compensation.
 
-Grid export isn't solar production: Meridian can't see what your home uses straight from your panels. Use your inverter's integration for **Solar production**.
+Grid export isn't solar production, which Meridian can't see: use your inverter's integration for **Solar production**.
 
 ## Sensors
 
-Each account has one device, **Meridian Energy**.
+Each account has one device, **Meridian Energy**. Amounts are in NZD.
 
 | Sensor | Shows |
 |---|---|
-| Bill usage so far | Grid import in the current billing period, counting actual readings only, as Meridian's app does |
+| Bill usage so far | Grid import in the current billing period, actual readings only: the app's **Usage → Trends** total, not its Home figure, which adds today's estimate |
 | Bill cost so far | The cost of that usage |
 | Bill export so far, Bill credit so far | Grid export in the period, and its credit (feed-in register only) |
 | Bill estimate | Meridian's estimate of the whole period's cost |
@@ -64,25 +64,9 @@ Each account has one device, **Meridian Energy**.
 | Last payment | Your latest payment's amount, with its date and status |
 | Daily charge, Anytime price | Your plan's prices, including GST (only for one property with one meter on an all-day plan) |
 | Last data update | When the last update succeeded (diagnostic) |
-| Latest usage data | The end of the newest hour of usage received (diagnostic) |
+| Latest usage data | The end of the newest hour Meridian has read, not estimated (diagnostic) |
 | Provisional data intervals | Hours of grid import in the last three weeks that are still estimates (diagnostic) |
-| Billing period start, Billing period end, Next billing date | The current billing period (diagnostic, disabled by default) |
-
-Example (default names): notify when this bill passes a budget.
-
-```yaml
-alias: Bill over budget
-triggers:
-  - trigger: numeric_state
-    entity_id: sensor.meridian_energy_bill_cost_so_far
-    above: 250
-actions:
-  - action: notify.notify
-    data:
-      message: >-
-        This bill has reached
-        ${{ states('sensor.meridian_energy_bill_cost_so_far') }} so far.
-```
+| Billing period start, Billing period end, Next billing date | The current billing period, and the first day of the next (diagnostic, disabled by default) |
 
 ## How data updates
 
@@ -92,14 +76,14 @@ actions:
 - The **so far** sensors count actual readings only, so they can read lower than the Energy dashboard.
 - Each hour's cost includes its share of the daily charge, which Meridian spreads over the day.
 - The billing period follows Meridian's billing cycle, so its dates can differ by a day or two from your bill's.
-- Some hours have no figure at Meridian, such as cost from before your account moved to Meridian's current system. Meridian Energy asks for them once more after each restart or reload.
+- Some hours have no figure at Meridian, such as cost from before its current system; they're asked for again after each restart or reload.
 - If Meridian refuses a request for older dates, Meridian Energy stops filling in older history until Home Assistant restarts.
 - An **Adjust sum** (in **Settings → Tools → Statistics**) made in about the last five weeks, or anywhere in history still being filled in, is replaced by Meridian's figures at a later update.
 
 ## Troubleshooting
 
 - **"Authentication expired for Meridian Energy":** Meridian ended the sign-in. Under **Settings → Devices & services**, select **Reconfigure** on the Meridian Energy card, then **Submit**, and enter the code Meridian emails you.
-- **"Meridian Energy isn't updating":** this repair notice appears after three failed updates in a row, or at once when Meridian stops listing any active or dormant account. It gives the reason, for example:
+- **"Meridian Energy isn't updating":** this repair notice appears after three failed updates in a row, or at once when Meridian lists nothing to follow. It gives the reason, for example:
 
   > Couldn't get an answer from Meridian (HTTP 504). Meridian Energy tries again automatically.
   >
@@ -121,7 +105,7 @@ For a clean start, delete **Meridian Energy** under **Settings → Devices & ser
 2. Delete **Meridian Energy** under **Settings → Devices & services**.
 3. On 2026.11, choose **Uninstall** when asked (or **Meridian Energy → ⋮ → Uninstall** in the Marketplace); on 2026.10, remove it in HACS. Then restart Home Assistant.
 
-Its statistics stay; delete them under **Settings → Tools → Statistics** if you no longer want the history.
+Its statistics stay until you delete them under **Settings → Tools → Statistics**.
 
 ## Limitations
 

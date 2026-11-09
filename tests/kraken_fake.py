@@ -25,8 +25,9 @@ that end before it, or for any ``startOn`` before its date, as the web
 app's clamping of ``startOn`` to the supply start suggests), gaps, rows
 without a cost, withdrawn newest rows, empty windows and in-band error
 codes, for any window starting on a date or only for one longer than a day
-(``week_codes``), and past hours still estimated (``estimated``). Every
-value is synthetic.
+(``week_codes``), past hours still estimated (``estimated``), and a date
+read only some time after it ends (``read_delay``): until then its hours
+are estimates. Every value is synthetic.
 
 A ``DAY_INTERVAL`` request gets a row for each channel and New Zealand date
 from ``startOn`` to ``endOn`` (none before the history starts), with the
@@ -133,8 +134,10 @@ class FakeKraken:
         week_codes: dict[date, str] | None = None,
         repeat_cursors: bool = False,
         estimated: Iterable[datetime] = (),
+        read_delay: timedelta = timedelta(0),
     ) -> None:
         self.now = now
+        self.read_delay = read_delay
         if history_start is None:
             history_start = now.replace(minute=0, second=0, microsecond=0) - timedelta(
                 days=400 if days is None else days
@@ -178,6 +181,11 @@ class FakeKraken:
         if self.future_rows:
             return local_midnight(self.now.astimezone(NZ).date() + timedelta(days=1))
         return self.now.replace(minute=0, second=0, microsecond=0)
+
+    @property
+    def read_until(self) -> datetime:
+        """Return where actual readings end: midnight after the last date read."""
+        return local_midnight((self.now - self.read_delay).astimezone(NZ).date())
 
     def history(self) -> list[tuple[datetime, int]]:
         """Return every row of the history, oldest first: an unbounded list."""
@@ -252,8 +260,7 @@ class FakeKraken:
         filters["readingFrequencyType"] = "DAY_INTERVAL"
         filters["readingQuality"] = (
             "ACTUAL"
-            if end <= local_midnight(self.now.astimezone(NZ).date())
-            and not self.estimated.intersection(hours)
+            if end <= self.read_until and not self.estimated.intersection(hours)
             else "ESTIMATE"
         )
         node["metaData"]["statistics"][0]["costInclTax"] = (
@@ -290,8 +297,7 @@ class FakeKraken:
                     "marketSupplyPointId": "0000000001SYN00",
                     "readingQuality": (
                         "ACTUAL"
-                        if end <= local_midnight(self.now.astimezone(NZ).date())
-                        and start not in self.estimated
+                        if end <= self.read_until and start not in self.estimated
                         else "ESTIMATE"
                     ),
                 },

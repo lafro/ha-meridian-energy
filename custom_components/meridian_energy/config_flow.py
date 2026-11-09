@@ -113,6 +113,8 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
             error = _connection_error_key(err)
         except MeridianAuthenticationError:
             error = "email_not_found"
+        except ValueError:
+            error = _unreadable_answer()
         else:
             return await self.async_step_otp()
         return self._show_user_form({"base": error})
@@ -166,6 +168,8 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
             error = _connection_error_key(err)
         except MeridianAuthenticationError:
             error = "invalid_auth"
+        except ValueError:
+            error = _unreadable_answer()
         else:
             data = {
                 CONF_EMAIL: email,
@@ -214,6 +218,9 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
         else:
             if not accounts:
                 return self.async_abort(reason="no_accounts")
+            if not any(account.properties for account in accounts):
+                # Listed, but with no property with a supply yet.
+                return self.async_abort(reason="no_properties")
             # Another setup of the same login may have created its entry.
             self._abort_if_unique_id_configured()
             self._created = True
@@ -345,6 +352,8 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
         except MeridianAuthenticationError:
             # There is no email to correct here: the entry's is the one sent.
             error = "reauth_email_refused"
+        except ValueError:
+            error = _unreadable_answer()
         else:
             return await self.async_step_otp()
         return self._show_reauth_confirm_form({"base": error})
@@ -376,6 +385,12 @@ def _connection_error_key(err: MeridianConnectionError) -> str:
     """Return the form error for a request to Meridian that got no usable answer."""
     if isinstance(err, MeridianRateLimitError):
         return "rate_limited"
+    return "cannot_connect"
+
+
+def _unreadable_answer() -> str:
+    """Log a sign-in answer that can't be read, and return its form error."""
+    _LOGGER.debug("A sign-in answer couldn't be read; the form asks to try again")
     return "cannot_connect"
 
 

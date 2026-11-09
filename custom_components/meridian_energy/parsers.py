@@ -22,6 +22,7 @@ from .models import (
     MeridianBalance,
     MeridianBill,
     MeridianMeasurement,
+    MeridianNoAgreement,
     MeridianPayment,
     MeridianPrices,
     MeridianTokenSet,
@@ -83,8 +84,13 @@ def parse_firebase_tokens(payload: dict[str, Any]) -> MeridianTokenSet:
     )
 
 
-def firebase_user_id(payload: dict[str, Any], id_token: str) -> str:
-    """Return the Firebase UID from a response field or signed token claims."""
+def firebase_user_id(payload: dict[str, Any], id_token: str) -> str | None:
+    """
+    Return the Firebase UID from a response field or the token's claims.
+
+    None when neither gives one: the ID is stored but never sent, so a
+    session without one still works.
+    """
     local_id = payload.get("localId")
     if isinstance(local_id, str) and local_id:
         return local_id
@@ -94,16 +100,10 @@ def firebase_user_id(payload: dict[str, Any], id_token: str) -> str:
         claims = json.loads(
             base64.urlsafe_b64decode(encoded_claims + padding).decode("utf-8")
         )
-        if not isinstance(claims, dict):
-            raise TypeError
-        subject = claims.get("sub")
-        if not isinstance(subject, str) or not subject:
-            raise TypeError
-    except (IndexError, TypeError, ValueError) as err:
-        raise TokenParseError(
-            "Firebase returned no authenticated user identifier"
-        ) from err
-    return subject
+    except IndexError, ValueError:
+        return None
+    subject = claims.get("sub") if isinstance(claims, dict) else None
+    return subject if isinstance(subject, str) and subject else None
 
 
 def parse_measurement(
@@ -204,7 +204,9 @@ def _cents(value: Any, context: str) -> int:
     return value
 
 
-def parse_prices(property_data: dict[str, Any]) -> MeridianPrices | None:
+def parse_prices(
+    property_data: dict[str, Any],
+) -> MeridianPrices | MeridianNoAgreement | None:
     """
     Parse an all-day plan's prices, or return None for any other plan.
 
@@ -213,13 +215,15 @@ def parse_prices(property_data: dict[str, Any]) -> MeridianPrices | None:
     read strictly, its discounted form when it has a discount; one that does
     not read as dollars or cents per day or kWh, as its band says, or is out
     of range, is None, and the name of each price's field is logged once.
+    A meter point with no agreement in force says nothing of the plan
+    (``MeridianNoAgreement``).
     """
     meters = require_list(property_data.get("meterPoints"), "meter points")
     if len(meters) != 1:
         return None
     agreement = require_mapping(meters[0], "meter point").get("activeAgreement")
     if agreement is None:
-        return None
+        return MeridianNoAgreement()
     agreement = require_mapping(agreement, "agreement")
     rates = [
         require_mapping(rate, "rate")

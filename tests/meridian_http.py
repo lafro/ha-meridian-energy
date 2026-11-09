@@ -383,8 +383,8 @@ def billing_data(period: tuple[date, date] | None = None) -> dict[str, Any]:
     return {
         "billingOptions": {
             "periodLength": "MONTHLY",
-            "periodLengthMultiplier": 1,
-            "isFixed": False,
+            "periodLengthMultiplier": None,
+            "isFixed": True,
             "currentBillingPeriodStartDate": start and start.isoformat(),
             "currentBillingPeriodEndDate": end and end.isoformat(),
             "nextBillingDate": end and (end + timedelta(days=1)).isoformat(),

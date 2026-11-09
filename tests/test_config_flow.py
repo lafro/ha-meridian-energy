@@ -346,11 +346,13 @@ async def test_an_ignored_entry_never_blocks_adding_the_login(
 # message about getting an answer from Meridian.
 _CONNECTION_ERRORS = [
     (MeridianConnectionError(), "cannot_connect"),
-    (MeridianUpstreamError(504, gateway=True), "cannot_connect"),
-    (MeridianUpstreamError(None, gateway=True), "cannot_connect"),
-    (MeridianUpstreamError(503, gateway=False), "cannot_connect"),
+    (MeridianUpstreamError(504), "cannot_connect"),
+    (MeridianUpstreamError(None), "cannot_connect"),
+    (MeridianUpstreamError(503), "cannot_connect"),
     (MeridianRejectedError(400), "cannot_connect"),
     (MeridianRateLimitError(120), "rate_limited"),
+    # An answer that can't be read, which says nothing of the sign-in.
+    (ValueError("unreadable"), "cannot_connect"),
 ]
 
 
@@ -728,6 +730,7 @@ _DISCOVERY_FAILURES = [
     ("mixed_graphql_errors", "invalid_data", "MeridianGraphQLError"),
     ("unusable_data", "invalid_data", "ValueError"),
 ]
+_RESENT = {"gateway_timeout", "service_error", "no_connection"}
 
 
 @pytest.mark.parametrize(
@@ -754,7 +757,8 @@ async def test_account_discovery_failures_are_named_and_logged(
     caplog.set_level(logging.DEBUG, logger=config_flow_module.__name__)
     session = FakeMeridianSession(_NOW)
     async with stalled_session() as stalled:
-        failures = {"remaining": 1}
+        # A failure that may pass is sent once more before the form shows it.
+        failures = {"remaining": 2 if kind in _RESENT else 1}
 
         def fail_the_account_list(
             operation: str, _variables: dict[str, Any]
@@ -834,6 +838,95 @@ async def test_account_discovery_aborts_when_none_are_available(
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "no_accounts"
     assert hass.config_entries.async_entries(DOMAIN) == []
+
+
+@pytest.mark.asyncio
+async def test_an_account_with_no_property_yet_is_told_apart_from_none(
+    hass: HomeAssistant, meridian: _FakeMeridian
+) -> None:
+    """As when a supply has yet to start: the account is there, its supply not."""
+    meridian.async_get_accounts.return_value = (
+        MeridianAccount(number=_TEST_ACCOUNT, status="ACTIVE", properties=()),
+    )
+
+    result = await _submit_login(hass)
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "no_properties"
+    assert hass.config_entries.async_entries(DOMAIN) == []
+
+
+async def _answer_sign_in_step(
+    hass: HomeAssistant, step: str, answer: Response
+) -> ConfigFlowResult:
+    """Run a setup through the real client, one sign-in step answered so."""
+    session = FakeMeridianSession(_NOW)
+    session.auth_hook = lambda operation: answer if operation == step else None
+    with patch.object(
+        config_flow_module, "async_get_clientsession", return_value=session
+    ):
+        result = await hass.config_entries.flow.async_init(
+            DOMAIN, context={"source": SOURCE_USER}
+        )
+        result = await hass.config_entries.flow.async_configure(
+            result["flow_id"], {CONF_EMAIL: _TEST_EMAIL}
+        )
+        if step != "send_code":
+            result = await hass.config_entries.flow.async_configure(
+                result["flow_id"], {"otp": "123456"}
+            )
+    return result
+
+
+@pytest.mark.parametrize("step", ["send_code", "check_code", "session_sign_in"])
+@pytest.mark.parametrize(
+    "answer",
+    [
+        Response(b"<html>Forbidden</html>", status=403, headers={"Content-Type": ""}),
+        Response(b"<html>Not found</html>", status=404, headers={"Content-Type": ""}),
+        json_response(["not", "an", "object"]),
+        Response(b"", headers={"Content-Type": "application/json"}),
+    ],
+    ids=["403 page", "404 page", "JSON not an object", "empty"],
+)
+@pytest.mark.asyncio
+async def test_an_answer_that_refuses_nothing_is_no_answer_at_either_step(
+    hass: HomeAssistant, step: str, answer: Response
+) -> None:
+    """
+    Only an answer in JSON, as the services' own are, refuses a sign-in.
+
+    A page from something in between, or an answer that can't be read, is
+    the service not answering: the form says so, and Submit tries again.
+    """
+    result = await _answer_sign_in_step(hass, step, answer)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == ("user" if step == "send_code" else "otp")
+    assert result["errors"] == {"base": "cannot_connect"}
+
+
+@pytest.mark.asyncio
+async def test_a_session_that_names_no_user_still_signs_in(
+    hass: HomeAssistant,
+) -> None:
+    """The user ID is kept when given; nothing sends it, so none is needed."""
+    answer = json_response(
+        {
+            "idToken": "synthetic-id",
+            "refreshToken": "synthetic-refresh",
+            "expiresIn": "3600",
+        }
+    )
+    with patch(
+        "custom_components.meridian_energy.async_setup_entry",
+        new=AsyncMock(return_value=True),
+    ):
+        result = await _answer_sign_in_step(hass, "session_sign_in", answer)
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert result["data"][CONF_FIREBASE_USER_ID] is None
+    assert result["data"][CONF_REFRESH_TOKEN] == "synthetic-refresh"
 
 
 @pytest.mark.asyncio

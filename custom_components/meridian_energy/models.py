@@ -14,30 +14,31 @@ class MeridianTokenSet:
     A renewable Firebase authentication session.
 
     The tokens and the Firebase user ID are left out of ``repr`` so that a
-    token set reaching a log line or a traceback never shows them.
+    token set reaching a log line or a traceback never shows them. The user
+    ID is stored but never sent, so an answer without one is still a session.
     """
 
     id_token: str = field(repr=False)
     refresh_token: str = field(repr=False)
     expires_at: datetime
-    user_id: str = field(repr=False)
+    user_id: str | None = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
 class MeridianMeterPoint:
-    """An electricity meter point."""
+    """An electricity meter point; its ID and ICP are kept but never used."""
 
-    id: str
-    market_identifier: str
+    id: str | None
+    market_identifier: str | None
     has_feed_in: bool
 
 
 @dataclass(frozen=True, slots=True)
 class MeridianProperty:
-    """A Meridian property."""
+    """A Meridian property; its address only labels it, None when not given."""
 
     id: str
-    address: str
+    address: str | None
     meter_points: tuple[MeridianMeterPoint, ...]
 
 
@@ -52,11 +53,16 @@ class MeridianAccount:
 
 @dataclass(frozen=True, slots=True)
 class MeridianBillingPeriod:
-    """Billing-cycle metadata for one Meridian account."""
+    """
+    Billing-cycle metadata for one Meridian account.
+
+    Only the start and end are used; the other fields are None when Meridian
+    gave none, or a value that can't be read.
+    """
 
     period_length: str | None
     period_length_multiplier: int | None
-    is_fixed: bool
+    is_fixed: bool | None
     start: date | None
     end: date | None
     next_billing_date: date | None
@@ -90,8 +96,9 @@ class PropertySyncResult:
     """
     Non-sensitive summary of a property sync, from its usage readings.
 
-    The estimated rows are the hours of the last 21 days whose reading is
-    not ``ACTUAL``, oldest and newest included.
+    The latest reading is the end of the newest ``ACTUAL`` hour of the last
+    21 days. The estimated rows are the hours of the last 21 days whose
+    reading is not ``ACTUAL``, oldest and newest included.
     """
 
     property_key: str
@@ -137,6 +144,11 @@ class MeridianPrices:
     plan: str | None
     daily_charge: Decimal | None
     anytime: Decimal | None
+
+
+@dataclass(frozen=True, slots=True)
+class MeridianNoAgreement:
+    """A property with no agreement in force today, so no plan and no prices."""
 
 
 @dataclass(frozen=True, slots=True)

@@ -5,7 +5,8 @@
       "already_configured": "This Meridian login is already set up.",
       "earlier_entry": "Meridian Energy is already set up for this login by an earlier version. Delete it under Settings → Devices & services, then add it again.",
       "login_expired": "This sign-in has expired. Start again to get a new code.",
-      "no_accounts": "Meridian has no active electricity account for this email."
+      "no_accounts": "Meridian has no active electricity account for this email.",
+      "no_properties": "Meridian lists an account for this email, but no property with an electricity supply yet. Add Meridian Energy again once the supply has started."
     },
     "error": {
       "cannot_connect": "Couldn't get an answer from Meridian. Wait a few minutes, then try again.",
@@ -64,6 +65,9 @@
     },
     "no_accounts": {
       "message": "Meridian lists no active electricity account for this login. Meridian Energy checks again automatically; if the account has closed, remove Meridian Energy."
+    },
+    "no_properties": {
+      "message": "Meridian lists an account for this login, but no property with an electricity supply yet. Meridian Energy checks again daily."
     },
     "entry_too_old": {
       "message": "This Meridian Energy entry was set up by an earlier version. Remove Meridian Energy and add it again."

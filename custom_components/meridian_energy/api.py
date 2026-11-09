@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import random
+import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -26,6 +29,8 @@ from .const import (
     READING_QUALITY_COMBINED,
     REDIRECT_URL,
     REQUEST_TIMEOUT_SECONDS,
+    TRANSIENT_RESEND_DELAY_SECONDS,
+    TRANSIENT_STATUSES,
 )
 from .graphql import (
     ACCOUNT_QUERY as _ACCOUNT_QUERY,
@@ -61,6 +66,7 @@ from .models import (
     MeridianBillingPeriod,
     MeridianMeasurement,
     MeridianMeterPoint,
+    MeridianNoAgreement,
     MeridianPrices,
     MeridianProperty,
     MeridianTokenSet,
@@ -92,18 +98,21 @@ from .parsers import (
     required_string as _required_string,
 )
 from .transport import (
-    MeridianHttpError as _MeridianHttpError,
-)
-from .transport import (
+    AnswerNote,
     MeridianTimeoutError,
     MeridianTransport,
     MeridianTransportError,
+    MeridianUnreadableResponseError,
+)
+from .transport import (
+    MeridianHttpError as _MeridianHttpError,
 )
 from .transport import (
     parse_retry_after as _parse_retry_after,
 )
 
 __all__ = [
+    "InvertedPeriodError",
     "MeridianApiClient",
     "MeridianAuthenticationError",
     "MeridianConnectionError",
@@ -112,6 +121,7 @@ __all__ = [
     "MeridianOtpError",
     "MeridianRateLimitError",
     "MeridianRejectedError",
+    "MeridianSignInServiceError",
     "MeridianUpstreamError",
     "_MeridianHttpError",
     "_graphql_error_code",
@@ -123,6 +133,8 @@ __all__ = [
     "_required_string",
     "exception_chain",
     "http_status",
+    "is_passing_failure",
+    "is_unreadable",
 ]
 
 _LAST_DAY_OF_LONG_MONTH = 31
@@ -131,9 +143,19 @@ _HTTP_CLIENT_ERROR = 400
 _HTTP_REQUEST_TIMEOUT = 408
 _HTTP_TOO_MANY_REQUESTS = 429
 _HTTP_SERVER_ERROR = 500
-# Statuses a gateway in front of Meridian's API sends when the origin did not
-# answer in time: its own 504, and Cloudflare's 524.
-_GATEWAY_TIMEOUT_STATUSES = frozenset({504, 524})
+# A query that failed in a way that may pass is sent once more.
+_SENDS = 2
+# The account statuses whose accounts are followed.
+_FOLLOWED_STATUSES = frozenset({"ACTIVE", "DORMANT"})
+# The billing period lengths known; any other is read as none.
+_PERIOD_LENGTHS = frozenset({"MONTHLY", "QUARTERLY"})
+# A plain upper-case name, as Kraken's enums are: only such text is logged.
+_ENUM_NAME = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
+# What a status is called in the log when it is not a plain upper-case name.
+_UNNAMED = "an unnamed status"
+# The service names a rate limit's INFO line gives.
+_MERIDIAN = "Meridian"
+_SIGN_IN_SERVICE = "The sign-in service"
 # The codes Meridian gives a login code it refused.
 _OTP_CODES = frozenset(
     {"OTP_EXPIRED", "OTP_INVALID", "OTP_NOT_FOUND", "OTP_TOO_MANY_ATTEMPTS"}
@@ -149,23 +171,95 @@ _MEASUREMENTS_QUERY = measurements_query(_MEASUREMENTS_NAME)
 TokenUpdateCallback = Callable[[MeridianTokenSet], Awaitable[None]]
 
 
-def _is_active_feed_in_register(register: dict[str, Any], today: date) -> bool:
-    """
-    Return whether a feed-in register is active on the supplied local date.
+async def _async_wait(seconds: float) -> None:
+    """Wait before a resend; a seam tests patch."""
+    await asyncio.sleep(seconds)
 
+
+def _feed_in_state(register: Any, today: date) -> bool | None:
+    """
+    Return whether a register is a feed-in register active on a local date.
+
+    None when that can't be read: a register that is not an object, a flag
+    that is not true or false, or a feed-in register's unreadable dates.
     ``activeTo`` is exclusive: a register's ``activeTo`` is the next one's
     ``activeFrom``.
     """
+    if not isinstance(register, dict):
+        return None
     is_feed_in = register.get("isFeedIn")
     if not isinstance(is_feed_in, bool):
-        raise ValueError("Invalid feed-in register flag")
+        return None
     if not is_feed_in:
         return False
-    active_from = _optional_local_date(register.get("activeFrom"), _NZ)
-    active_to = _optional_local_date(register.get("activeTo"), _NZ)
+    try:
+        active_from = _optional_local_date(register.get("activeFrom"), _NZ)
+        active_to = _optional_local_date(register.get("activeTo"), _NZ)
+    except ValueError:
+        return None
     return (active_from is None or active_from <= today) and (
         active_to is None or today < active_to
     )
+
+
+def _parse_property(raw: Any, today: date) -> tuple[MeridianProperty, bool]:
+    """
+    Return a property, and whether an unread register left it as not exporting.
+
+    Only its ID, its meter points and their registers must be readable: the
+    address, and each meter's ID and ICP, are kept when given but never
+    needed. A ``ValueError`` when the property can't be followed.
+    """
+    raw_property = require_mapping(raw, "property")
+    meter_points: list[MeridianMeterPoint] = []
+    states: list[bool | None] = []
+    for raw_meter_value in require_list(
+        raw_property.get("meterPoints") or [], "property.meterPoints"
+    ):
+        if raw_meter_value is None:
+            continue
+        raw_meter = require_mapping(raw_meter_value, "meter point")
+        meter_states = [
+            _feed_in_state(register, today)
+            for register in require_list(
+                raw_meter.get("registers") or [], "meter registers"
+            )
+        ]
+        states.extend(meter_states)
+        meter_points.append(
+            MeridianMeterPoint(
+                id=_optional_string(raw_meter.get("id")),
+                market_identifier=_optional_string(raw_meter.get("marketIdentifier")),
+                has_feed_in=True in meter_states,
+            )
+        )
+    property_data = MeridianProperty(
+        id=_required_string(raw_property, "id"),
+        address=_optional_string(raw_property.get("address")),
+        meter_points=tuple(meter_points),
+    )
+    return property_data, None in states and True not in states
+
+
+def _whole(value: Any, low: int, high: int | None) -> bool:
+    """Return whether a value is a whole number from ``low`` to ``high``, if any."""
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and low <= value
+        and (high is None or value <= high)
+    )
+
+
+def _is_iso_date(value: Any) -> bool:
+    """Return whether a value is a plain date, as ``2026-07-16``."""
+    if not isinstance(value, str):
+        return False
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
 
 
 class MeridianError(Exception):
@@ -181,24 +275,47 @@ class MeridianUpstreamError(MeridianConnectionError):
     Meridian's service, or a gateway in front of it, failed or did not answer.
 
     ``status`` is the HTTP status, or None when no answer came within the
-    request's time limit. ``gateway`` marks a gateway timeout (HTTP 504 or
-    524, or no answer at all), as opposed to a service that answered with an
-    error.
+    request's time limit.
     """
 
-    def __init__(self, status: int | None, *, gateway: bool) -> None:
+    def __init__(self, status: int | None) -> None:
         super().__init__(
             "Meridian did not answer in time"
             if status is None
             else f"Meridian service returned HTTP {status}"
         )
         self.status = status
-        self.gateway = gateway
 
     @property
     def detail(self) -> str:
         """Describe the failure without identifiers, as in ``HTTP 503``."""
         return "timed out" if self.status is None else f"HTTP {self.status}"
+
+
+class MeridianSignInServiceError(MeridianConnectionError):
+    """
+    Google's sign-in service, which holds the session, failed or did not answer.
+
+    ``status`` is its HTTP status, or None when no answer came: ``timed_out``
+    then says whether the request ran out of time rather than failing on the
+    way.
+    """
+
+    def __init__(self, status: int | None, *, timed_out: bool = False) -> None:
+        super().__init__(
+            "The sign-in service did not answer"
+            if status is None
+            else f"The sign-in service returned HTTP {status}"
+        )
+        self.status = status
+        self.timed_out = timed_out
+
+    @property
+    def detail(self) -> str:
+        """Describe the failure, as in ``sign-in service: HTTP 503``."""
+        if self.status is not None:
+            return f"sign-in service: HTTP {self.status}"
+        return f"sign-in service: {'timed out' if self.timed_out else 'network error'}"
 
 
 class MeridianRejectedError(MeridianConnectionError):
@@ -226,11 +343,29 @@ class MeridianAuthenticationError(MeridianError):
 
 
 class MeridianRateLimitError(MeridianConnectionError):
-    """Meridian asked the client to defer further requests."""
+    """
+    Meridian, or the sign-in service, asked the client to defer requests.
 
-    def __init__(self, retry_after: float) -> None:
+    Besides the wait, it says what the answer was, for a log line: its HTTP
+    status, the code it named if any, whether it carried Retry-After, and
+    the service that sent it.
+    """
+
+    def __init__(
+        self,
+        retry_after: float,
+        *,
+        answer_status: int | None = None,
+        code: str | None = None,
+        retry_after_given: bool = False,
+        service: str = _MERIDIAN,
+    ) -> None:
         super().__init__("Meridian rate limited the request")
         self.retry_after = retry_after
+        self.answer_status = answer_status
+        self.code = code
+        self.retry_after_given = retry_after_given
+        self.service = service
 
 
 class MeridianOtpError(MeridianAuthenticationError):
@@ -258,6 +393,15 @@ class MeridianGraphQLError(MeridianError):
         self.codes = codes
 
 
+class InvertedPeriodError(ValueError):
+    """Meridian gave a billing period that ends before it starts."""
+
+    detail = "a period that ends before it starts"
+
+    def __init__(self) -> None:
+        super().__init__("Meridian gave a billing period that ends before it starts")
+
+
 def _parse_firebase_tokens(payload: dict[str, Any]) -> MeridianTokenSet:
     """Translate strict token parsing failures into an authentication error."""
     try:
@@ -279,6 +423,10 @@ class MeridianApiClient:
         self._transport = MeridianTransport(session)
         self._tokens = tokens
         self._token_update_callback = token_update_callback
+        # How many accounts the latest list skipped for their status.
+        self.skipped_accounts = 0
+        # What was already logged once, so each is logged once per client.
+        self._logged: set[tuple[Any, ...]] = set()
 
     @property
     def tokens(self) -> MeridianTokenSet | None:
@@ -286,7 +434,12 @@ class MeridianApiClient:
         return self._tokens
 
     async def async_send_otp(self, email: str, journey_id: str) -> None:
-        """Ask Meridian to email a one-time login code."""
+        """
+        Ask Meridian to email a one-time login code.
+
+        Only an answer in JSON, as Meridian's own are, refuses the email; a
+        page from something in between is no answer.
+        """
         payload = {
             "email": email,
             "brand": BRAND,
@@ -304,8 +457,8 @@ class MeridianApiClient:
             )
         except _MeridianHttpError as err:
             if err.status == _HTTP_TOO_MANY_REQUESTS:
-                raise MeridianRateLimitError(err.retry_after) from err
-            if err.status == _HTTP_REQUEST_TIMEOUT or err.status >= _HTTP_SERVER_ERROR:
+                raise _rate_limit(err) from err
+            if _no_refusal(err):
                 raise _connection_error(err) from err
             raise MeridianAuthenticationError(
                 "Meridian did not accept the login request"
@@ -318,7 +471,12 @@ class MeridianApiClient:
     async def async_validate_otp(
         self, email: str, otp: str, journey_id: str
     ) -> MeridianTokenSet:
-        """Exchange an emailed code for a renewable Firebase session."""
+        """
+        Exchange an emailed code for a renewable Firebase session.
+
+        Only an answer in JSON refuses the code or the session; a page from
+        something in between is no answer.
+        """
         try:
             response = await self._async_json_request(
                 AUTH_OTP_URL,
@@ -342,8 +500,8 @@ class MeridianApiClient:
                     code, "Meridian rejected the login code"
                 ) from err
             if err.status == _HTTP_TOO_MANY_REQUESTS:
-                raise MeridianRateLimitError(err.retry_after) from err
-            if err.status == _HTTP_REQUEST_TIMEOUT or err.status >= _HTTP_SERVER_ERROR:
+                raise _rate_limit(err) from err
+            if _no_refusal(err):
                 raise _connection_error(err) from err
             raise MeridianOtpError(
                 str(code or "OTP_INVALID"), "Meridian rejected the login code"
@@ -365,8 +523,8 @@ class MeridianApiClient:
             )
         except _MeridianHttpError as err:
             if err.status == _HTTP_TOO_MANY_REQUESTS:
-                raise MeridianRateLimitError(err.retry_after) from err
-            if err.status == _HTTP_REQUEST_TIMEOUT or err.status >= _HTTP_SERVER_ERROR:
+                raise _rate_limit(err, _SIGN_IN_SERVICE) from err
+            if _no_refusal(err):
                 raise _connection_error(err, meridian_service=False) from err
             raise MeridianAuthenticationError(
                 "Meridian authentication exchange was rejected"
@@ -376,7 +534,13 @@ class MeridianApiClient:
         return tokens
 
     async def async_refresh_tokens(self, *, force: bool = False) -> MeridianTokenSet:
-        """Refresh the Firebase ID token when it is close to expiry."""
+        """
+        Refresh the Firebase ID token when it is close to expiry.
+
+        Only a refusal in JSON (HTTP 400, 401 or 403) ends the sign-in. An
+        answer that can't be read is invalid data (``TokenParseError``, a
+        ``ValueError``), which a later update tries again.
+        """
         if self._tokens is None:
             raise MeridianAuthenticationError("No Meridian session is available")
         if not force and self._tokens.expires_at > datetime.now(UTC) + timedelta(
@@ -397,8 +561,8 @@ class MeridianApiClient:
             )
         except _MeridianHttpError as err:
             if err.status == _HTTP_TOO_MANY_REQUESTS:
-                raise MeridianRateLimitError(err.retry_after) from err
-            if err.status in {400, 401, 403}:
+                raise _rate_limit(err, _SIGN_IN_SERVICE) from err
+            if err.status in {400, 401, 403} and err.json_body:
                 raise MeridianAuthenticationError(
                     "Meridian session refresh was rejected"
                 ) from err
@@ -410,13 +574,19 @@ class MeridianApiClient:
             "expiresIn": response.get("expires_in"),
             "localId": response.get("user_id"),
         }
-        tokens = _parse_firebase_tokens(normalized)
+        tokens = parse_firebase_tokens(normalized)
         await self._async_set_tokens(tokens)
         _LOGGER.debug("Meridian session refreshed")
         return tokens
 
     async def async_get_accounts(self) -> tuple[MeridianAccount, ...]:
-        """Return active Meridian accounts and their electricity properties."""
+        """
+        Return the active and dormant accounts, with their properties.
+
+        An account with any other status is skipped, and counted in
+        ``skipped_accounts``; each such status is logged once, by name only
+        when it is a plain upper-case name, so nothing identifying is.
+        """
         data = await self._async_graphql(
             "accountsList",
             _ACCOUNTS_QUERY,
@@ -426,17 +596,41 @@ class MeridianApiClient:
         raw_accounts = require_list(viewer.get("accounts"), "viewer.accounts")
 
         accounts: list[MeridianAccount] = []
-        for raw_account_value in raw_accounts:
+        skipped = 0
+        for position, raw_account_value in enumerate(raw_accounts, start=1):
             raw_account = require_mapping(raw_account_value, "account")
             number = _required_string(raw_account, "number")
             status = _required_string(raw_account, "status")
-            if status not in {"ACTIVE", "DORMANT"}:
+            if status not in _FOLLOWED_STATUSES:
+                skipped += 1
+                self._log_skipped_status(status)
                 continue
-            details = await self._async_get_account(number)
-            accounts.append(details)
+            accounts.append(await self._async_get_account(number, status, position))
+        self.skipped_accounts = skipped
         return tuple(accounts)
 
-    async def _async_get_account(self, account_number: str) -> MeridianAccount:
+    def _log_skipped_status(self, status: str) -> None:
+        """Log once that accounts with a status are not followed."""
+        name = status if _ENUM_NAME.fullmatch(status) else _UNNAMED
+        if ("status", name) in self._logged:
+            return
+        self._logged.add(("status", name))
+        _LOGGER.info(
+            "Meridian Energy doesn't follow an account whose status is %s; it "
+            "follows active and dormant accounts",
+            name,
+        )
+
+    async def _async_get_account(
+        self, account_number: str, status: str, position: int
+    ) -> MeridianAccount:
+        """
+        Return an account and the properties that can be followed.
+
+        A property whose answer can't be read is skipped, and logged by its
+        position; a register whose feed-in flag can't be read counts as no
+        feed-in, and is logged likewise.
+        """
         data = await self._async_graphql(
             "account",
             _ACCOUNT_QUERY,
@@ -444,48 +638,44 @@ class MeridianApiClient:
         )
         account = require_mapping(data.get("account"), "account")
         today = datetime.now(_NZ).date()
+        raw_properties = require_list(account.get("properties"), "account.properties")
         properties: list[MeridianProperty] = []
-        for raw_property_value in require_list(
-            account.get("properties"), "account.properties"
-        ):
-            raw_property = require_mapping(raw_property_value, "property")
-            meter_points: list[MeridianMeterPoint] = []
-            for raw_meter_value in require_list(
-                raw_property.get("meterPoints") or [], "property.meterPoints"
-            ):
-                if raw_meter_value is None:
-                    continue
-                raw_meter = require_mapping(raw_meter_value, "meter point")
-                registers = require_list(
-                    raw_meter.get("registers") or [], "meter registers"
+        for number, raw_property in enumerate(raw_properties, start=1):
+            place = (number, len(raw_properties), position)
+            try:
+                property_data, unread = _parse_property(raw_property, today)
+            except ValueError:
+                self._log_once(
+                    ("property", *place),
+                    logging.WARNING,
+                    "Meridian Energy skipped property %d of %d on account %d: it "
+                    "can't read Meridian's answer for it",
+                    place,
                 )
-                meter_points.append(
-                    MeridianMeterPoint(
-                        id=_required_string(raw_meter, "id"),
-                        market_identifier=_required_string(
-                            raw_meter, "marketIdentifier"
-                        ),
-                        has_feed_in=any(
-                            _is_active_feed_in_register(
-                                require_mapping(register, "register"),
-                                today,
-                            )
-                            for register in registers
-                        ),
-                    )
+                continue
+            if unread:
+                self._log_once(
+                    ("feed_in", *place),
+                    logging.INFO,
+                    "Meridian Energy can't read whether property %d of %d on "
+                    "account %d sends power to the grid; it takes it as not",
+                    place,
                 )
-            properties.append(
-                MeridianProperty(
-                    id=_required_string(raw_property, "id"),
-                    address=_required_string(raw_property, "address"),
-                    meter_points=tuple(meter_points),
-                )
-            )
+            properties.append(property_data)
         return MeridianAccount(
             number=_required_string(account, "number"),
-            status=_required_string(account, "status"),
+            status=status,
             properties=tuple(properties),
         )
+
+    def _log_once(
+        self, key: tuple[Any, ...], level: int, message: str, args: tuple[int, ...]
+    ) -> None:
+        """Log a line once for this client, keyed by what it is about."""
+        if key in self._logged:
+            return
+        self._logged.add(key)
+        _LOGGER.log(level, message, *args)
 
     async def async_get_measurements(
         self,
@@ -498,6 +688,7 @@ class MeridianApiClient:
         last: int,
         before: str | None = None,
         frequency: str = READING_FREQUENCY_HOUR,
+        pace: Callable[[], Awaitable[None]] | None = None,
         context: str = "",
     ) -> MeasurementPage:
         """
@@ -506,8 +697,9 @@ class MeridianApiClient:
         The window is ``start_on`` to ``end_on``, New Zealand dates, both
         included. Every page of a window sends both bounds and ``last``; a
         continuation page adds ``before``, the previous page's start cursor,
-        and differs from the first page in nothing else. ``context`` goes
-        into the request's DEBUG line.
+        and differs from the first page in nothing else. ``pace`` is awaited
+        before each send, a resend included. ``context`` goes into the
+        request's DEBUG line.
         """
         if start_on > end_on or last < 1:
             raise ValueError("Invalid Meridian measurements window")
@@ -531,6 +723,7 @@ class MeridianApiClient:
             time_limit=MEASUREMENTS_TIMEOUT_SECONDS,
             operation_name=_MEASUREMENTS_NAME,
             url=_MEASUREMENTS_URL,
+            pace=pace,
             context=context,
         )
         account = require_mapping(data.get("account"), "measurement account")
@@ -566,16 +759,14 @@ class MeridianApiClient:
         """
         Return every row of one window, following its pages backwards.
 
-        ``pace`` is awaited before each page's request. A window takes at
-        most 8 pages; each continuation must carry a new cursor, and an empty
-        page must be the last. Otherwise the answer is one this can't read
-        (``ValueError``).
+        ``pace`` is awaited before each request, a resend included. A window
+        takes at most 8 pages; each continuation must carry a new cursor, and
+        an empty page must be the last. Otherwise the answer is one this can't
+        read (``ValueError``).
         """
         rows: list[MeridianMeasurement] = []
         before: str | None = None
         for page_number in range(1, MAX_WINDOW_PAGES + 1):
-            if pace is not None:
-                await pace()
             page = await self.async_get_measurements(
                 account_number=account_number,
                 property_id=property_id,
@@ -585,6 +776,7 @@ class MeridianApiClient:
                 last=last,
                 before=before,
                 frequency=frequency,
+                pace=pace,
                 context=f"{context} page={page_number}".strip(),
             )
             rows.extend(page.measurements)
@@ -600,7 +792,14 @@ class MeridianApiClient:
     async def async_get_billing_period(
         self, account_number: str
     ) -> MeridianBillingPeriod:
-        """Return the retailer-defined current billing period for an account."""
+        """
+        Return the retailer-defined current billing period for an account.
+
+        Only its start and end are used, and both are read strictly; a period
+        that ends before it starts is refused (``InvertedPeriodError``). The
+        other fields are None when absent or unreadable, which logs the
+        field's name once at DEBUG, never its value.
+        """
         data = await self._async_graphql(
             "billingPeriods",
             _BILLING_PERIODS_QUERY,
@@ -608,35 +807,50 @@ class MeridianApiClient:
         )
         account = require_mapping(data.get("account"), "billing account")
         options = require_mapping(account.get("billingOptions"), "billing options")
-        period_length = _optional_string(options.get("periodLength"))
-        if period_length not in {None, "MONTHLY", "QUARTERLY"}:
-            raise ValueError("Unsupported Meridian billing period length")
-        multiplier = options.get("periodLengthMultiplier")
-        if multiplier is not None and (
-            not isinstance(multiplier, int)
-            or isinstance(multiplier, bool)
-            or multiplier <= 0
-        ):
-            raise ValueError("Invalid Meridian billing period multiplier")
-        start_day = options.get("periodStartDay")
-        if start_day is not None and (
-            not isinstance(start_day, int)
-            or isinstance(start_day, bool)
-            or not 1 <= start_day <= _LAST_DAY_OF_LONG_MONTH
-        ):
-            raise ValueError("Invalid Meridian billing period start day")
-        is_fixed = options.get("isFixed")
-        if not isinstance(is_fixed, bool):
-            raise ValueError("Invalid Meridian fixed billing-period flag")
+        start = _optional_date(options.get("currentBillingPeriodStartDate"))
+        end = _optional_date(options.get("currentBillingPeriodEndDate"))
+        if start is not None and end is not None and end < start:
+            raise InvertedPeriodError
+        length = self._lenient(
+            options,
+            "periodLength",
+            lambda value: isinstance(value, str) and value in _PERIOD_LENGTHS,
+        )
+        multiplier = self._lenient(
+            options, "periodLengthMultiplier", lambda value: _whole(value, 1, None)
+        )
+        start_day = self._lenient(
+            options,
+            "periodStartDay",
+            lambda value: _whole(value, 1, _LAST_DAY_OF_LONG_MONTH),
+        )
+        is_fixed = self._lenient(
+            options, "isFixed", lambda value: isinstance(value, bool)
+        )
+        next_billing = self._lenient(options, "nextBillingDate", _is_iso_date)
         return MeridianBillingPeriod(
-            period_length=period_length,
+            period_length=length,
             period_length_multiplier=multiplier,
             is_fixed=is_fixed,
-            start=_optional_date(options.get("currentBillingPeriodStartDate")),
-            end=_optional_date(options.get("currentBillingPeriodEndDate")),
-            next_billing_date=_optional_date(options.get("nextBillingDate")),
+            start=start,
+            end=end,
+            next_billing_date=(
+                None if next_billing is None else date.fromisoformat(next_billing)
+            ),
             period_start_day=start_day,
         )
+
+    def _lenient(
+        self, options: dict[str, Any], name: str, valid: Callable[[Any], bool]
+    ) -> Any:
+        """Return a field's value if valid, else None; an invalid one is logged once."""
+        value = options.get(name)
+        if value is None or valid(value):
+            return value
+        if ("billing", name) not in self._logged:
+            self._logged.add(("billing", name))
+            _LOGGER.debug("Meridian's billing period has an unreadable %s", name)
+        return None
 
     async def async_get_balance(self, account_number: str) -> MeridianBalance:
         """Return an account's balance, last bill and recent payments."""
@@ -651,8 +865,8 @@ class MeridianApiClient:
 
     async def async_get_prices(
         self, account_number: str, property_id: str
-    ) -> MeridianPrices | None:
-        """Return a property's all-day prices, or None for any other plan."""
+    ) -> MeridianPrices | MeridianNoAgreement | None:
+        """Return a property's all-day prices, None for any other plan."""
         data = await self._async_graphql(
             "prices",
             PRICES_QUERY,
@@ -663,7 +877,7 @@ class MeridianApiClient:
         account = require_mapping(data.get("account"), "prices account")
         return parse_prices(require_mapping(account.get("property"), "prices property"))
 
-    async def _async_graphql(  # noqa: C901 - one branch per kind of answer
+    async def _async_graphql(
         self,
         operation: str,
         query: str,
@@ -672,7 +886,50 @@ class MeridianApiClient:
         time_limit: float = REQUEST_TIMEOUT_SECONDS,
         operation_name: str | None = None,
         url: str = GRAPHQL_URL,
+        pace: Callable[[], Awaitable[None]] | None = None,
         context: str = "",
+    ) -> dict[str, Any]:
+        """
+        Send one GraphQL query, and once more after a failure that may pass.
+
+        Meridian's web app resends a query that met HTTP 502, 503 or 504;
+        this does once, 2 to 5 s later, and after a timeout or a network
+        error, the session's renewal included (``is_passing_failure``). A
+        rate limit is never resent. ``pace`` is awaited before each send.
+        """
+        for send in range(_SENDS):
+            if pace is not None:
+                await pace()
+            try:
+                return await self._async_graphql_once(
+                    operation,
+                    query,
+                    variables,
+                    time_limit=time_limit,
+                    operation_name=operation_name,
+                    url=url,
+                    context=context,
+                )
+            except MeridianConnectionError as err:
+                if send == _SENDS - 1 or not is_passing_failure(err):
+                    raise
+                _LOGGER.debug(
+                    "Resending a request that failed (%s)",
+                    getattr(err, "detail", "network error"),
+                )
+                await _async_wait(random.uniform(*TRANSIENT_RESEND_DELAY_SECONDS))  # noqa: S311
+        raise AssertionError  # pragma: no cover - the loop returns or raises
+
+    async def _async_graphql_once(  # noqa: C901 - one branch per kind of answer
+        self,
+        operation: str,
+        query: str,
+        variables: dict[str, Any],
+        *,
+        time_limit: float,
+        operation_name: str | None,
+        url: str,
+        context: str,
     ) -> dict[str, Any]:
         """
         Send one GraphQL query, renewing the session once if it is rejected.
@@ -686,6 +943,7 @@ class MeridianApiClient:
         """
         for attempt in range(2):
             tokens = await self.async_refresh_tokens(force=attempt == 1)
+            note = AnswerNote()
             try:
                 response = await self._async_json_request(
                     url,
@@ -699,10 +957,11 @@ class MeridianApiClient:
                     headers={"Authorization": tokens.id_token},
                     authenticated=True,
                     context=context,
+                    note=note,
                 )
             except _MeridianHttpError as err:
                 if err.status == _HTTP_TOO_MANY_REQUESTS:
-                    raise MeridianRateLimitError(err.retry_after) from err
+                    raise _rate_limit(err) from err
                 if err.status in {401, 403} and attempt == 1:
                     if not err.json_body:
                         raise _connection_error(err) from err
@@ -732,7 +991,12 @@ class MeridianApiClient:
                     ",".join(shown_codes(codes)) or "none",
                 )
                 if RATE_LIMIT_CODE in codes:
-                    raise MeridianRateLimitError(DEFAULT_RETRY_AFTER_SECONDS)
+                    raise MeridianRateLimitError(
+                        DEFAULT_RETRY_AFTER_SECONDS,
+                        answer_status=note.status,
+                        code=RATE_LIMIT_CODE,
+                        retry_after_given=note.retry_after_given,
+                    )
                 raise MeridianGraphQLError(operation, codes)
             return require_mapping(response.get("data"), f"GraphQL {operation} data")
 
@@ -755,13 +1019,15 @@ class MeridianApiClient:
         authenticated: bool,
         meridian_service: bool = True,
         context: str = "",
+        note: AnswerNote | None = None,
     ) -> dict[str, Any]:
         """
         Send one request through the transport and translate its failures.
 
-        ``meridian_service`` is False for Google's session service (Firebase),
-        which the login uses: its failures are never Meridian's service, or a
-        gateway in front of it, failing to answer.
+        ``meridian_service`` is False for Google's sign-in service (Firebase),
+        which holds the session: its failures are its own
+        (``MeridianSignInServiceError``), never Meridian's service failing.
+        An answer that is not JSON is unreadable, whichever sent it.
         """
         del authenticated  # Documents intent at each call site; never log the request.
         try:
@@ -773,14 +1039,19 @@ class MeridianApiClient:
                 data=data,
                 headers=headers,
                 context=context,
+                note=note,
             )
         except _MeridianHttpError:
             raise
         except MeridianTimeoutError as err:
             if not meridian_service:
-                raise MeridianConnectionError(str(err)) from err
-            raise MeridianUpstreamError(None, gateway=True) from err
+                raise MeridianSignInServiceError(None, timed_out=True) from err
+            raise MeridianUpstreamError(None) from err
+        except MeridianUnreadableResponseError as err:
+            raise MeridianConnectionError(str(err)) from err
         except MeridianTransportError as err:
+            if not meridian_service:
+                raise MeridianSignInServiceError(None) from err
             raise MeridianConnectionError(str(err)) from err
 
 
@@ -807,6 +1078,59 @@ def http_status(err: BaseException | None) -> int | None:
     return None
 
 
+def is_unreadable(err: BaseException) -> bool:
+    """Return whether a failure is an answer that is not JSON, as a web page."""
+    return any(
+        isinstance(item, MeridianUnreadableResponseError)
+        for item in exception_chain(err)
+    )
+
+
+def is_passing_failure(err: BaseException) -> bool:
+    """
+    Return whether a failure may pass on its own, so asking again may succeed.
+
+    HTTP 502, 503 or 504, a timeout or a network error, from Meridian or
+    the sign-in service, as Meridian's web app resends a query after 502 to
+    504. Never a rate limit, a refusal or an answer that can't be read.
+    """
+    if isinstance(err, MeridianRateLimitError | MeridianRejectedError):
+        return False
+    if isinstance(err, MeridianUpstreamError | MeridianSignInServiceError):
+        return err.status is None or err.status in TRANSIENT_STATUSES
+    # A network error has no status; any answer, an unreadable one included,
+    # has one.
+    return isinstance(err, MeridianConnectionError) and http_status(err) is None
+
+
+def _no_refusal(err: _MeridianHttpError) -> bool:
+    """
+    Return whether a sign-in step's unsuccessful answer is no refusal.
+
+    A timeout (408) or a server error is a failure of the service; any
+    other status refuses only in JSON, as the services' own answers are. A
+    page from something in between is no answer.
+    """
+    return (
+        err.status == _HTTP_REQUEST_TIMEOUT
+        or err.status >= _HTTP_SERVER_ERROR
+        or not err.json_body
+    )
+
+
+def _rate_limit(
+    err: _MeridianHttpError, service: str = _MERIDIAN
+) -> MeridianRateLimitError:
+    """Return the rate limit an HTTP 429 answer is, with what it said."""
+    return MeridianRateLimitError(
+        err.retry_after,
+        answer_status=err.status,
+        code=", ".join(shown_codes(_error_codes(err.payload))) or None,
+        retry_after_given=err.retry_after_given,
+        service=service,
+    )
+
+
 def _connection_error(
     err: _MeridianHttpError, *, meridian_service: bool = True
 ) -> MeridianConnectionError:
@@ -815,20 +1139,17 @@ def _connection_error(
 
     A request timeout or a server error from Meridian's service, or a gateway
     in front of it, is that service failing; another client error from it is
-    the request being refused (``MeridianRejectedError``). Any other status,
-    and any status from Google's session service (``meridian_service=False``),
-    stays a plain connection error.
+    the request being refused (``MeridianRejectedError``). Any status from
+    Google's sign-in service (``meridian_service=False``) is that service's
+    failure.
     """
-    if meridian_service and (
-        err.status == _HTTP_REQUEST_TIMEOUT or err.status >= _HTTP_SERVER_ERROR
-    ):
-        return MeridianUpstreamError(
-            err.status, gateway=err.status in _GATEWAY_TIMEOUT_STATUSES
-        )
-    if meridian_service and err.status >= _HTTP_CLIENT_ERROR:
+    if not meridian_service:
+        return MeridianSignInServiceError(err.status)
+    if err.status == _HTTP_REQUEST_TIMEOUT or err.status >= _HTTP_SERVER_ERROR:
+        return MeridianUpstreamError(err.status)
+    if err.status >= _HTTP_CLIENT_ERROR:
         return MeridianRejectedError(err.status, _error_codes(err.payload))
-    service = "Meridian" if meridian_service else "Meridian's session"
-    return MeridianConnectionError(f"{service} service returned HTTP {err.status}")
+    return MeridianConnectionError(f"Meridian service returned HTTP {err.status}")
 
 
 def _error_codes(payload: dict[str, Any]) -> tuple[str, ...]:

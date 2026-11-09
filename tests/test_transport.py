@@ -27,6 +27,7 @@ from custom_components.meridian_energy.api import (
     MeridianConnectionError,
     MeridianRateLimitError,
     MeridianRejectedError,
+    MeridianSignInServiceError,
     MeridianUpstreamError,
     http_status,
 )
@@ -227,6 +228,18 @@ def _transport_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogReco
     ]
 
 
+def _sent_twice(caplog: pytest.LogCaptureFixture) -> logging.LogRecord:
+    """
+    Return the line of a request whose failure may pass.
+
+    The client sends such a request once more, so the same line is logged
+    for each of the two sends.
+    """
+    first, second = _transport_records(caplog)
+    assert second.getMessage() == first.getMessage()
+    return first
+
+
 async def _measurements(client: MeridianApiClient) -> object:
     return await client.async_get_measurements(
         account_number="A-TEST-1",
@@ -261,8 +274,7 @@ async def test_html_gateway_error_is_logged_by_class_before_parsing(
         await _measurements(client)
 
     assert raised.value.status == 504
-    assert raised.value.gateway is True
-    (record,) = _transport_records(caplog)
+    record = _sent_twice(caplog)
     assert record.levelno == logging.DEBUG
     assert record.getMessage() == (
         f"Meridian request: operation=measurements status=504 content=html "
@@ -340,9 +352,8 @@ async def test_timeout_before_an_answer_logs_its_class_and_elapsed_time(
         await _measurements(client)
 
     assert raised.value.status is None
-    assert raised.value.gateway is True
     assert raised.value.detail == "timed out"
-    (record,) = _transport_records(caplog)
+    record = _sent_twice(caplog)
     assert record.getMessage() == (
         "Meridian request: operation=measurements status=- content=- "
         "error=TimeoutError elapsed=75.0s"
@@ -379,12 +390,12 @@ async def test_a_body_that_fails_after_the_headers_logs_what_had_arrived(
 
     # Readings at the start and when the body fails.
     with (
-        patch.object(transport_module, "monotonic", side_effect=[100.0, 175.0]),
+        patch.object(transport_module, "monotonic", side_effect=_Clock(75.0)),
         pytest.raises(MeridianConnectionError) as raised,
     ):
         await _measurements(client)
 
-    (record,) = _transport_records(caplog)
+    record = _sent_twice(caplog)
     assert record.getMessage() == (
         "Meridian request: operation=measurements status=200 content=json "
         f"error={type(error).__name__} elapsed=75.0s"
@@ -395,9 +406,7 @@ async def test_a_body_that_fails_after_the_headers_logs_what_had_arrived(
     )
 
 
-@pytest.mark.parametrize(
-    ("status", "gateway"), [(503, False), (504, True)], ids=["503", "504"]
-)
+@pytest.mark.parametrize("status", [503, 504], ids=["503", "504"])
 @pytest.mark.parametrize(
     "error",
     [
@@ -408,15 +417,14 @@ async def test_a_body_that_fails_after_the_headers_logs_what_had_arrived(
 )
 @pytest.mark.asyncio
 async def test_an_error_page_that_fails_to_arrive_keeps_its_status(
-    caplog: pytest.LogCaptureFixture, status: int, gateway: bool, error: Exception
+    caplog: pytest.LogCaptureFixture, status: int, error: Exception
 ) -> None:
     """
     An error status that arrived classifies the failure, body or not.
 
     A gateway's error page cut off or stalled after its status line is still
     that gateway's answer. It used to be a network error, or a request with
-    no answer at all, so the form and the warning lost the status, and a 504
-    did not read as a gateway timeout.
+    no answer at all, so the form and the warning lost the status.
     """
     caplog.set_level(logging.DEBUG, logger="custom_components.meridian_energy")
     response = _Response(
@@ -434,7 +442,6 @@ async def test_an_error_page_that_fails_to_arrive_keeps_its_status(
         await _measurements(client)
 
     assert raised.value.status == status
-    assert raised.value.gateway is gateway
     assert raised.value.detail == f"HTTP {status}"
     assert http_status(raised.value) == status
     # The cause names what happened to the body, by class only.
@@ -443,7 +450,7 @@ async def test_an_error_page_that_fails_to_arrive_keeps_its_status(
     assert cause.error_class == type(error).__name__
     logged = "".join(traceback.format_exception(raised.value))
     assert str(error) not in logged
-    (record,) = _transport_records(caplog)
+    record = _sent_twice(caplog)
     assert (
         f" status={status} content=html error={type(error).__name__} elapsed="
         in record.getMessage()
@@ -526,7 +533,7 @@ async def test_no_connection_in_time_is_a_network_failure(
 
     assert not isinstance(raised.value, MeridianUpstreamError)
     assert raised.value.__cause__.error_class == "ConnectionTimeoutError"
-    (record,) = _transport_records(caplog)
+    record = _sent_twice(caplog)
     assert re.fullmatch(
         r"Meridian request: operation=measurements status=- content=- "
         r"error=ConnectionTimeoutError elapsed=0\.\ds",
@@ -575,8 +582,7 @@ async def test_an_answer_that_never_comes_is_meridian_not_answering(
         await server.wait_closed()
 
     assert raised.value.status is None
-    assert raised.value.gateway is True
-    (record,) = _transport_records(caplog)
+    record = _sent_twice(caplog)
     # The connection was made at once; only the answer never came.
     assert record.getMessage().startswith(
         "Meridian request: operation=measurements status=- content=- "
@@ -630,7 +636,7 @@ async def test_connection_failure_logs_its_class_and_elapsed_time(
         await _measurements(client)
 
     assert not isinstance(raised.value, MeridianUpstreamError)
-    (record,) = _transport_records(caplog)
+    record = _sent_twice(caplog)
     assert record.getMessage() == (
         "Meridian request: operation=measurements status=- content=- "
         "error=ClientConnectionError elapsed=0.5s"
@@ -638,21 +644,9 @@ async def test_connection_failure_logs_its_class_and_elapsed_time(
     assert "synthetic reset" not in caplog.text
 
 
-@pytest.mark.parametrize(
-    ("status", "gateway"),
-    [
-        (408, False),
-        (500, False),
-        (502, False),
-        (503, False),
-        (520, False),
-        (523, False),
-        (504, True),
-        (524, True),
-    ],
-)
+@pytest.mark.parametrize("status", [408, 500, 502, 503, 504, 520, 523, 524])
 @pytest.mark.asyncio
-async def test_upstream_statuses_are_classified(status: int, gateway: bool) -> None:
+async def test_upstream_statuses_are_classified(status: int) -> None:
     client = MeridianApiClient(
         _CapturingSession(_Response(b"", status=status, headers={})),  # type: ignore[arg-type]
         tokens=_tokens(),
@@ -662,7 +656,6 @@ async def test_upstream_statuses_are_classified(status: int, gateway: bool) -> N
         await _measurements(client)
 
     assert raised.value.status == status
-    assert raised.value.gateway is gateway
     assert raised.value.detail == f"HTTP {status}"
     assert str(raised.value) == f"Meridian service returned HTTP {status}"
 
@@ -703,11 +696,12 @@ async def test_a_client_error_renewing_the_session_is_not_meridians() -> None:
         tokens=expired,
     )
 
-    with pytest.raises(MeridianConnectionError) as raised:
+    with pytest.raises(MeridianSignInServiceError) as raised:
         await _measurements(client)
 
     assert not isinstance(raised.value, MeridianRejectedError)
-    assert str(raised.value) == "Meridian's session service returned HTTP 404"
+    assert str(raised.value) == "The sign-in service returned HTTP 404"
+    assert raised.value.detail == "sign-in service: HTTP 404"
 
 
 @pytest.mark.asyncio

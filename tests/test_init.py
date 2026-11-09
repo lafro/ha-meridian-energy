@@ -218,6 +218,34 @@ async def test_setup_entry_and_rotating_token_persistence(hass) -> None:
     reload_entry.assert_not_awaited()
 
 
+@pytest.mark.parametrize("user_id", ["null", "absent"])
+@pytest.mark.asyncio
+async def test_an_entry_kept_without_a_user_id_sets_up(hass, user_id: str) -> None:
+    """Nothing sends the user ID, so an entry without one loads as any other."""
+    data: dict[str, object] = {
+        "email": "person@example.com",
+        CONF_REFRESH_TOKEN: "old-refresh",
+    }
+    if user_id == "null":
+        data[CONF_FIREBASE_USER_ID] = None
+    entry = _entry(data=data)
+    entry.add_to_hass(hass)
+
+    with (
+        patch("custom_components.meridian_energy.MeridianApiClient") as client_class,
+        patch(
+            "custom_components.meridian_energy.MeridianDataCoordinator",
+            return_value=_mock_coordinator(),
+        ),
+        patch.object(hass.config_entries, "async_forward_entry_setups", AsyncMock()),
+    ):
+        assert await async_setup_entry(hass, entry) is True
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    tokens = client_class.call_args.kwargs["tokens"]
+    assert (tokens.refresh_token, tokens.user_id) == ("old-refresh", None)
+
+
 @pytest.mark.asyncio
 async def test_setup_defers_first_sync_until_home_assistant_started(
     hass, caplog
@@ -535,7 +563,7 @@ class TestPublicConfigEntryLifecycle:
                 data.account_results[0],
                 billing_period=MeridianBillingPeriod(
                     period_length="MONTHLY",
-                    period_length_multiplier=1,
+                    period_length_multiplier=None,
                     is_fixed=True,
                     start=date(2026, 7, 1),
                     end=date(2026, 7, 31),
@@ -735,7 +763,9 @@ class TestPublicConfigEntryLifecycle:
         assert [flow["context"]["source"] for flow in flows] == [SOURCE_REAUTH]
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("release", ["third_failure", "refused_session"])
+    @pytest.mark.parametrize(
+        "release", ["third_failure", "refused_session", "ended_session"]
+    )
     async def test_an_update_entity_sync_that_outlives_its_entry_leaves_nothing(
         self, recorder_mock, hass, caplog, release: str
     ) -> None:
@@ -745,8 +775,9 @@ class TestPublicConfigEntryLifecycle:
         Its measurements answer is held while the entry is removed. Released
         as the third failed update in a row, it raises no repair notice;
         released as a refused session, whose renewal rotates the refresh
-        token, it stores nothing in the removed entry. Either way nothing is
-        logged as an error.
+        token, it stores nothing in the removed entry; released as a session
+        refused again after its renewal, it starts no reauthentication.
+        Either way nothing is logged as an error.
         """
         del recorder_mock
         session = FakeMeridianSession(NOW)
@@ -792,7 +823,11 @@ class TestPublicConfigEntryLifecycle:
                 after: Response | None = unavailable
             else:
                 held = iter([Response(b"{}", status=401, gate=gate)])
-                after = None
+                after = (
+                    json_response({}, status=401)
+                    if release == "ended_session"
+                    else None
+                )
                 session.auth_hook = renew
             session.hook = lambda operation, _variables: (
                 next(held, after) if operation == "measurements" else None
@@ -830,8 +865,9 @@ class TestPublicConfigEntryLifecycle:
             ir.async_get(hass).async_get_issue(DOMAIN, f"sync_failing_{entry.entry_id}")
             is None
         )
-        if release == "refused_session":
+        if release != "third_failure":
             assert renewals
+        assert hass.config_entries.flow.async_progress_by_handler(DOMAIN) == []
         assert [
             record.getMessage()
             for record in caplog.records
