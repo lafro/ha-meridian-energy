@@ -30,7 +30,7 @@ Updates appear under **Settings → Updates**: install one there, then restart H
 
 Beta versions are GitHub pre-releases, offered only if you opt in: in the Marketplace, **Meridian Energy → ⋮ → Include pre-releases** (before **Install**, to start on a beta); in HACS on 2026.10, enable and turn on the **Pre-release** switch on Meridian Energy's device under **Settings → Devices & services → HACS**.
 
-If an entry says it was set up by an earlier version, remove it and add it again, ideally with a [clean start](#starting-again).
+If an entry says it was set up by an earlier version, delete it and add it again, ideally with a [clean start](#starting-again).
 
 ## Energy dashboard
 
@@ -59,7 +59,7 @@ Each account has one device, **Meridian Energy**.
 | Bill cost so far | The cost of that usage |
 | Bill export so far, Bill credit so far | Grid export in the period, and its credit (feed-in register only) |
 | Bill estimate | Meridian's estimate of the whole period's cost |
-| Total due | What you owe, 0 when in credit; its credit attribute holds any credit, otherwise empty |
+| Total due | What you owe, 0 when in credit; its credit attribute holds any credit |
 | Last bill | When your latest bill was issued, with the period it covers |
 | Last payment | Your latest payment's amount, with its date and status |
 | Daily charge, Anytime price | Your plan's prices, including GST (only for one property with one meter on an all-day plan) |
@@ -89,9 +89,9 @@ actions:
 - Meridian Energy asks Meridian for new data every hour.
 - Meridian's readings usually arrive 2–3 days late, as estimates until then, and gaps usually fill in within a week or two. Each update asks again for the last three days, and once a day (and after each restart or reload) for the last three weeks, so readings replace the estimates.
 - Hours missing in the last 90 days, as after an outage, are filled in by the next updates; earlier history stays.
-- The **so far** sensors count actual readings only, so they can read lower than the Energy dashboard, which shows estimates too.
+- The **so far** sensors count actual readings only, so they can read lower than the Energy dashboard.
 - Each hour's cost includes its share of the daily charge, which Meridian spreads over the day.
-- The billing period follows Meridian's billing cycle, so its dates can differ by a day or two from those printed on your bill.
+- The billing period follows Meridian's billing cycle, so its dates can differ by a day or two from your bill's.
 - Some hours have no figure at Meridian, such as cost from before your account moved to Meridian's current system. Meridian Energy asks for them once more after each restart or reload.
 - If Meridian refuses a request for older dates, Meridian Energy stops filling in older history until Home Assistant restarts.
 - An **Adjust sum** (in **Settings → Tools → Statistics**) made in about the last five weeks, or anywhere in history still being filled in, is replaced by Meridian's figures at a later update.
@@ -107,13 +107,13 @@ actions:
 
   An ended sign-in asks you to reconnect instead.
 - **Asked to wait:** at setup, try again later; afterwards, Meridian Energy waits as asked.
-- **A warning that Meridian Energy couldn't update grid import or export:** the rest kept updating, so the update counts as working; the next tries that part again.
+- **A warning that Meridian Energy couldn't update grid import or export:** the rest kept updating; the next update tries that part again.
 - **An answer Meridian Energy can't read:** it tries again; if this keeps happening, check for an update to Meridian Energy.
 - **Reporting a problem:** in the integration's ⋮ menu, select **Enable debug logging**, reproduce the problem, then **Disable debug logging** to download the log. Download diagnostics from the same menu. Both leave out your email, account and meter numbers, address, tokens, usage and amounts, but check them before sharing.
 
 ### Starting again
 
-For a clean start, delete **Meridian Energy** under **Settings → Devices & services** (choose **Keep** if asked), delete its statistics in **Settings → Tools → Statistics** (select them, then **Delete selected statistics**), and add it again. The statistics keep their IDs, so the Energy dashboard needs no change.
+For a clean start, delete **Meridian Energy** under **Settings → Devices & services** (choose **Keep** if asked), delete its statistics in **Settings → Tools → Statistics** (select them, then **Delete selected statistics**), and add it again. Only the last 90 days come back; the Energy dashboard needs no change.
 
 ## Removal
 

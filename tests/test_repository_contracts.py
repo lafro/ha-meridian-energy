@@ -467,6 +467,13 @@ def test_the_0_3_0_notes_are_short_and_say_how_much_history_comes_back() -> None
     assert words <= NOTES_WORD_LIMIT, f"0.3.0 notes have {words} words"
 
 
+def test_starting_again_says_how_much_history_comes_back() -> None:
+    """README's clean start says that only the last days' history is fetched again."""
+    readme = Path("README.md").read_text()
+    section = readme.split("\n### Starting again\n", 1)[1].split("\n## ", 1)[0]
+    assert f"last {HISTORY_DAYS} days" in section
+
+
 @pytest.mark.parametrize(("name", "limit"), WORD_LIMITS.items())
 def test_documents_stay_within_their_word_limits(name: str, limit: int) -> None:
     """The docs stay short enough to be read whole."""
