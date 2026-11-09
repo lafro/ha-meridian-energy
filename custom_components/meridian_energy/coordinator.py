@@ -260,13 +260,16 @@ class _Extra:
     One kind of an account's other figures: the last value got, and when.
 
     ``due`` is when it is next asked for, None for the next update;
-    ``failing`` says whether the last time it was asked for failed.
+    ``failing`` says whether the last time it was asked for failed;
+    ``lost`` says whether the kind was reported lost for this account at its
+    last sync.
     """
 
     value: Any = None
     at: datetime | None = None
     due: datetime | None = None
     failing: bool = False
+    lost: bool = False
 
     def kept(self, kind: str, now: datetime) -> Any:
         """Return the value while it is kept, two intervals after it was got."""
@@ -1095,9 +1098,9 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         A billing period is withheld once it has ended. It is asked for again
         at the first update after its end, and every 6 hours until a new one
         comes, both decided from the last period Meridian gave; until a new
-        one shows, the billing period is not reported back. ``lost`` gathers
-        the kinds that failed and show unknown, each with the key of the line
-        that says what is unknown.
+        one shows after a failure, this account's billing period is not
+        reported back. ``lost`` gathers the kinds that failed and show
+        unknown, each with the key of the line that says what is unknown.
         """
         number = account.number
         today = nz_date(now)
@@ -1118,9 +1121,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 now + BILL_DAYS_INTERVAL if ended else local_midnight(last.end + _DAY),
             )
         bill = await self._async_bill(account, period, failed, now, lost)
-        if period is None and (
-            billing.failing or (ended and "billing" in self._extras_lost)
-        ):
+        billing.lost = period is None and (billing.failing or (ended and billing.lost))
+        if billing.lost:
             _lose(
                 lost, "billing", "billing_bill" if bill == BillFigures() else "billing"
             )

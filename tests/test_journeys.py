@@ -447,6 +447,7 @@ class _Client:
         # turn; the last answers every request after it.
         self.backlogs: list[int] = [0]
         self.periods: list[dict[str, Any]] = [{}]
+        self.cleared: list[list[str]] = []
         self.instance = SimpleNamespace(state=state or Path("/nonexistent"))
 
     def rest(self, method: str, path: str, data: dict[str, Any] | None = None) -> Any:
@@ -466,6 +467,9 @@ class _Client:
             return [{"backlog": _next(self.backlogs)}]
         if messages[0]["type"] == "recorder/statistics_during_period":
             return [_next(self.periods)]
+        if messages[0]["type"] == "recorder/clear_statistics":
+            self.cleared.append(messages[0]["statistic_ids"])
+            return [None]
         assert messages[0]["type"] == "frontend/get_translations"
         (domain,) = messages[0]["integration"]
         category = messages[0]["category"]
@@ -802,6 +806,68 @@ def test_statistics_are_read_once_the_recorder_has_saved_them(
         "meridian_energy:b": [],
     }
     assert client.periods == [{"meridian_energy:a": [hour, later]}]
+
+
+def test_deleted_statistics_are_waited_for_until_they_are_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(journeys, "POLL_S", 0.01)
+    hour = {"start": _FIRST.timestamp() * 1000, "state": 0.5, "sum": 0.5}
+    client = _Client()
+    # Each statistics() call reads twice: the first two calls still find the
+    # hour, and only the third finds nothing.
+    client.periods = [{"meridian_energy:a": [hour]}] * 4 + [{}]
+    journey = _journey(tmp_path, client)
+    journey.clear_statistics(["meridian_energy:b", "meridian_energy:a"])
+    assert client.cleared == [["meridian_energy:a", "meridian_energy:b"]]
+    assert client.periods == [{}]
+
+
+def test_a_removed_entry_is_waited_for_until_it_is_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(journeys, "POLL_S", 0.01)
+    monkeypatch.setattr(journeys, "SYNC_TIMEOUT_S", 0.05)
+    listed = "/api/config/config_entries/entry?domain=meridian_energy"
+    client = _Client({listed: [{"entry_id": "E1"}]})
+    journey = _journey(tmp_path, client)
+    journey.entries = ["E1", "E2"]
+    journey.remove("E2")
+    assert client.sent[0] == "DELETE /api/config/config_entries/entry/E2"
+    assert journey.entries == ["E1"]
+    with pytest.raises(JourneyError, match="waiting for the entry to be removed"):
+        journey.remove("E1")
+    assert journey.entries == []
+
+
+def test_the_hours_before_must_be_kept_unchanged(tmp_path: Path) -> None:
+    journey = _journey(tmp_path)
+    before = _history(_FIRST, 3)
+    changed = [*before[:1], Row(before[1].start, 9.0, 9.0), *before[2:]]
+    ids = {"consumption": "meridian_energy:a", "consumption_cost": "meridian_energy:b"}
+    journey.check_unchanged(
+        "the removal",
+        ids,
+        {"meridian_energy:a": before, "meridian_energy:b": before},
+        {
+            "meridian_energy:a": [*before, *_history(_FIRST + 3 * HOUR, 1)],
+            "meridian_energy:b": changed,
+        },
+    )
+    second = before[1]
+    was = f"{second.start:%Y-%m-%dT%H:%M}Z was {second.state}/{second.sum}"
+    assert [(c.name, c.ok, c.detail) for c in journey.result.checks] == [
+        (
+            "consumption: the hours stored before the removal are unchanged",
+            True,
+            "3 hours identical",
+        ),
+        (
+            "consumption_cost: the hours stored before the removal are unchanged",
+            False,
+            f"{was}, now 9.0/9.0",
+        ),
+    ]
 
 
 def _log_line(level: str, name: str, message: str, offset: str = "") -> str:

@@ -1111,6 +1111,26 @@ class Journey:
         (rows,) = wait("the recorder to save the statistics", saved, SYNC_TIMEOUT_S)
         return dict(rows)
 
+    def clear_statistics(self, ids: Iterable[str]) -> None:
+        """Delete statistics, as Settings does, and wait until they are gone."""
+        wanted = sorted(ids)
+        self.client.ws({"type": "recorder/clear_statistics", "statistic_ids": wanted})
+        wait(
+            "the statistics to be deleted",
+            lambda: not any(self.statistics(wanted).values()) or None,
+            SYNC_TIMEOUT_S,
+        )
+
+    def remove(self, entry_id: str) -> None:
+        """Remove an entry, as its Delete menu item does, and wait until it is gone."""
+        self.client.rest("DELETE", f"/api/config/config_entries/entry/{entry_id}")
+        self.entries.remove(entry_id)
+        wait(
+            "the entry to be removed",
+            lambda: self.entry(entry_id) is None or None,
+            SYNC_TIMEOUT_S,
+        )
+
     def remove_entries(self) -> None:
         """Remove the journey's entries and close its flows, as they stand."""
         for flow_id in self.flows:
@@ -1190,6 +1210,22 @@ class Journey:
             or "no units",
         )
 
+    def check_unchanged(
+        self,
+        when: str,
+        ids: Mapping[str, str],
+        before: Mapping[str, list[Row]],
+        after: Mapping[str, list[Row]],
+    ) -> None:
+        """Check that every hour stored before ``when`` is still there, unchanged."""
+        for kind, sid in ids.items():
+            changed = changed_rows(before[sid], after[sid])
+            self.check(
+                f"{kind}: the hours stored before {when} are unchanged",
+                not changed,
+                "; ".join(changed[:3]) or f"{len(before[sid])} hours identical",
+            )
+
     def check_nothing_refused(self) -> None:
         """Check that the stand-in refused nothing and answered every request."""
         refused = read_refused(self.folder)
@@ -1229,14 +1265,21 @@ class Journey:
 # ------------------------------------------------------------------- journeys
 
 
-def _created_at_once(j: Journey, done: dict[str, Any], took: timedelta) -> str:
-    """Check that the code alone created the entry, at once; return its id."""
+def _created_at_once(
+    j: Journey, done: dict[str, Any], took: timedelta, *, screens_from: int = 0
+) -> str:
+    """
+    Check that the code alone created the entry, at once; return its id.
+
+    The screens checked are those met from ``screens_from`` on.
+    """
     j.require("the entry follows the code", done.get("type") == "create_entry")
+    met = j.result.screens[screens_from:]
     j.check(
         "the screens met: no account choice, no import",
-        [(s.kind, s.step) for s in j.result.screens]
+        [(s.kind, s.step) for s in met]
         == [("form", "user"), ("form", "otp"), ("create_entry", "default")],
-        " → ".join(f"{s.kind} {s.step}" for s in j.result.screens),
+        " → ".join(f"{s.kind} {s.step}" for s in met),
     )
     j.check(
         "the entry is created within seconds of the code",
@@ -1284,6 +1327,66 @@ def first_setup(j: Journey) -> None:
     )
     j.check_log("the setup and the first sync", mark)
     j.check_warnings("the setup and the first sync", mark, every_logger=True)
+
+
+def _add(j: Journey, email: str) -> tuple[str, datetime, datetime, dict[str, Any]]:
+    """Add the entry again; return its id, when the code went and came, its sync."""
+    shown = len(j.result.screens)
+    done, started, ended = j.set_up(email)
+    entry_id = _created_at_once(j, done, ended - started, screens_from=shown)
+    return entry_id, started, ended, j.wait_synced(entry_id)
+
+
+def add_again(j: Journey) -> None:
+    """
+    Remove the entry and add it again: over the kept statistics, then without.
+
+    Removing the entry keeps its statistics. Added again over them, its first
+    sync asks for the last 21 dates, in 3 windows per direction, and nothing
+    older, since the history is whole: the sums continue from the kept ones
+    and no hour changes. Removed again and its statistics deleted, as for a
+    clean start, it is a first install: the first sync asks for 13 windows per
+    direction back to New Zealand midnight 90 dates ago, and the sums start
+    afresh.
+    """
+    account, email = "A-JOURNEY-8", "journey-8@example.com"
+    ids = statistic_ids(account, feed_in=True)
+    directions = (standin.CONSUMPTION, standin.GENERATION)
+    j.scenario(Scenario(accounts=(account,), feed_in=(account,)))
+    mark = j.log_mark()
+    entry_id, _, ended, _ = _add(j, email)
+    imported = datetime.now(UTC)
+    before = j.check_entry(
+        entry_id, {account: Expected(ended, imported, imported)}, feed_in=(account,)
+    )
+    j.check_log("the setup and the first sync", mark)
+    j.remove(entry_id)
+    j.check_unchanged("the removal", ids, before, j.statistics(ids.values()))
+
+    when = "added again over the kept statistics"
+    mark = j.log_mark()
+    entry_id, started, _, _ = _add(j, email)
+    for direction in directions:
+        j.check_windows(when, started, RECENT_WINDOWS, direction)
+    after = j.check_entry(
+        entry_id,
+        {account: Expected(ended, imported, datetime.now(UTC))},
+        feed_in=(account,),
+    )
+    j.check_unchanged("it was added again", ids, before, after)
+    j.check_log(when, mark)
+
+    when = "added again with the statistics deleted"
+    j.remove(entry_id)
+    j.clear_statistics(ids.values())
+    mark = j.log_mark()
+    entry_id, started, ended, coordinator = _add(j, email)
+    for direction in directions:
+        j.check_windows(when, started, FIRST_SYNC_WINDOWS, direction)
+    j.check_complete(coordinator, 2)
+    now = datetime.now(UTC)
+    j.check_entry(entry_id, {account: Expected(ended, now, now)}, feed_in=(account,))
+    j.check_log(when, mark)
 
 
 def figures(j: Journey, relaunch: Callable[[], None]) -> None:
@@ -1570,6 +1673,7 @@ def restart(j: Journey, relaunch: Callable[[], None]) -> None:
 
 JOURNEYS: dict[str, str] = {
     "first_setup": "First-time setup with a feed-in register, the history",
+    "add_again": "Remove and add again: the history continues; deleted, it comes back",
     "figures": "Meridian's own figures fail at the first sync, then come",
     "outage": "Meridian times out from the start, the notice, then the history",
     "two_accounts": "Two accounts on one login, both followed",

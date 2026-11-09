@@ -809,6 +809,113 @@ async def test_with_two_accounts_a_narrower_billing_line_waits_for_the_wider(
     assert _own(caplog, logging.INFO) == [_BILLING_AND_BILL_LOST, _BILLING_LOST]
 
 
+_TWO_ORDERS = [(ACCOUNT_NUMBER, "A-TEST-2"), ("A-TEST-2", ACCOUNT_NUMBER)]
+
+
+async def _two_billing_accounts(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+    accounts: tuple[str, str],
+    *,
+    periods: Any,
+    failing: Any,
+    updates: list[int],
+) -> tuple[list[tuple[int, str]], int | None]:
+    """
+    Update at these hours, each account's period from ``periods(number, hours)``.
+
+    Return each INFO line with the update it came at, and the first update
+    from 36 hours on at which ACCOUNT_NUMBER shows a period.
+    """
+    caplog.set_level(logging.INFO)
+    session = FakeMeridianSession(NOW, accounts=accounts)
+
+    def answer(operation: str, variables: dict[str, Any]) -> Response | None:
+        if operation != "billingPeriods":
+            return None
+        hours = round((session.kraken.now - NOW) / HOUR)
+        number = variables["accountNumber"]
+        if failing(number, hours):
+            return _FAILED
+        period = billing_data(periods(number, hours))
+        return json_response({"data": {"account": period}})
+
+    session.hook = answer
+    coordinator = coordinator_for(hass, session)
+    said: list[tuple[int, str]] = []
+    shown = None
+    for update in updates:
+        data = await sync(coordinator, NOW + update * HOUR, session)
+        said.extend((update, line) for line in _own(caplog, logging.INFO)[len(said) :])
+        own = data.account_results[accounts.index(ACCOUNT_NUMBER)].billing_period
+        if shown is None and update >= 36 and own is not None:
+            shown = update
+    return said, shown
+
+
+@pytest.mark.parametrize("accounts", _TWO_ORDERS)
+async def test_an_ended_period_never_failed_joins_no_other_accounts_loss(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture, accounts: tuple[str, str]
+) -> None:
+    """One account's period ended and is answered as it is; the other's fails."""
+    ended = (TODAY - 30 * DAY, TODAY)
+
+    said, _shown = await _two_billing_accounts(
+        hass,
+        caplog,
+        accounts,
+        periods=lambda number, _hours: _PERIOD if number == ACCOUNT_NUMBER else ended,
+        failing=lambda number, hours: (
+            number == ACCOUNT_NUMBER and (1 <= hours <= 70 or 73 <= hours <= 150)
+        ),
+        # Every ask and keep's end falls on a 6-hour grid; hourly around 48 and 72.
+        updates=[
+            *range(0, 46, 6),
+            *range(46, 51),
+            *range(54, 72, 6),
+            *range(72, 75),
+            *range(78, 171, 6),
+        ],
+    )
+
+    # Kept two days after it was got: lost at 48 and 120 hours, back when asked.
+    assert said == [
+        (48, _BILLING_LOST),
+        (72, _BILLING_BACK),
+        (120, _BILLING_LOST),
+        (168, _BILLING_BACK),
+    ]
+
+
+@pytest.mark.parametrize("accounts", _TWO_ORDERS)
+async def test_a_period_back_after_a_failure_waits_for_no_other_account(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture, accounts: tuple[str, str]
+) -> None:
+    """The other account's ended period, answered as it is, rolls only later."""
+
+    def periods(number: str, hours: int) -> tuple[date, date]:
+        if number == ACCOUNT_NUMBER:
+            if hours >= 36:
+                return (TODAY + 2 * DAY, TODAY + 32 * DAY)
+            return (TODAY + DAY - 30 * DAY, TODAY + DAY)
+        if hours >= 80:
+            return (TODAY + DAY, TODAY + 31 * DAY)
+        return (TODAY - 30 * DAY, TODAY)
+
+    said, shown = await _two_billing_accounts(
+        hass,
+        caplog,
+        accounts,
+        periods=periods,
+        failing=lambda number, hours: number == ACCOUNT_NUMBER and 24 <= hours <= 45,
+        # Every ask falls on a 6-hour grid; hourly from the end to the back line.
+        updates=[*range(0, 36, 6), *range(36, 51), *range(54, 91, 6)],
+    )
+
+    assert shown == 48
+    assert said == [(36, _BILLING_AND_BILL_LOST), (48, _BILLING_BACK)]
+
+
 async def test_no_figure_is_asked_for_after_a_measurements_rate_limit(
     hass: HomeAssistant, session: FakeMeridianSession
 ) -> None:
@@ -938,6 +1045,76 @@ async def test_a_day_total_too_large_to_add_fails_only_the_bill(
     await refresh(coordinator, NOW + HOUR, session)
     assert coordinator.last_update_success
     assert len(_day_requests(session)) == 1
+
+
+_TOO_LARGE_DOLLARS = "1" + "0" * 1_000_000
+_PAST_A_FLOAT = "9" * 400
+
+
+@pytest.mark.parametrize(
+    ("daily", "anytime"),
+    [
+        pytest.param(f"${_TOO_LARGE_DOLLARS} /day", "$0.300000 /kWh", id="dollars"),
+        pytest.param("$2.000000 /day", f"{_PAST_A_FLOAT} c/kWh", id="cents"),
+    ],
+)
+async def test_a_price_too_large_shows_unknown_and_nothing_fails(
+    hass: HomeAssistant,
+    session: FakeMeridianSession,
+    caplog: pytest.LogCaptureFixture,
+    daily: str,
+    anytime: str,
+) -> None:
+    """Only that price is unknown; its number is never logged."""
+    caplog.set_level(logging.DEBUG)
+    session.prices = prices_data(daily, anytime)
+    coordinator = coordinator_for(hass, session)
+
+    for update in (0, 1):
+        await refresh(coordinator, NOW + update * HOUR, session)
+        assert coordinator.last_update_success
+
+    prices = coordinator.data.account_results[0].prices
+    assert prices is not None
+    assert (prices.daily_charge, prices.anytime) == (
+        (None, Decimal("0.3")) if daily != "$2.000000 /day" else (Decimal(2), None)
+    )
+    assert session.operations.count("prices") == 1
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert "0" * 13 not in caplog.text
+    assert "9" * 13 not in caplog.text
+
+
+@pytest.mark.parametrize("field", ["balance", "payment"])
+async def test_a_balance_or_payment_too_large_shows_unknown_and_nothing_fails(
+    hass: HomeAssistant,
+    session: FakeMeridianSession,
+    caplog: pytest.LogCaptureFixture,
+    field: str,
+) -> None:
+    """Past what a sensor could show: the balance's figures are unknown, no more."""
+    caplog.set_level(logging.DEBUG)
+    too_large = 10**400
+    if field == "balance":
+        session.balance = {**session.balance, "balance": too_large}
+    else:
+        session.balance["payments"]["edges"][0]["node"]["amount"] = too_large
+    coordinator = coordinator_for(hass, session)
+
+    for update in (0, 1):
+        await refresh(coordinator, NOW + update * HOUR, session)
+        assert coordinator.last_update_success
+
+    (result,) = coordinator.data.account_results
+    assert (result.total_due, result.last_bill, result.last_payment) == (
+        None,
+        None,
+        None,
+    )
+    assert result.prices is not None
+    assert session.operations.count("balance") == 1
+    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
+    assert "0" * 13 not in caplog.text
 
 
 async def test_a_property_whose_grid_import_failed_skips_its_day_request(

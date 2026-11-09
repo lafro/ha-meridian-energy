@@ -4,29 +4,27 @@ Notable changes to Meridian Energy for Home Assistant. Releases from v0.2.6 onwa
 
 ## 0.3.0
 
-Requires Home Assistant 2026.10.0 or newer, the same as 0.2.6. Your sensors and settings carry over, so there's nothing to change after updating.
+### Before you update
 
-This release fills in more of your energy history and stops setup getting stuck. It also changes when Meridian sensors show unknown or unavailable: see **Sensors** below.
+1. Remove **Meridian Energy** under **Settings → Devices & services**. If asked "Also uninstall Meridian Energy?", choose **Keep**, so the update is still offered.
+2. Delete its statistics under **Settings → Tools → Statistics**: select them, then **Delete selected statistics**. Only the last 90 days are fetched again.
+3. Update, restart Home Assistant, and add Meridian Energy again.
 
-### Energy history
+An entry set up by an earlier version is refused, with a message asking you to remove it and add it again.
 
-- **Older gaps in your history are filled in.** The integration now asks Meridian for hours missing from your Energy dashboard from 14 to 90 days ago, including gaps from before you updated, and fills them in over the hourly updates that follow. Gaps Meridian has no readings for stay empty.
-- **Later corrections from Meridian are picked up.** About once a month, the integration now asks Meridian again for the days from 14 to 90 days ago that are already in your history, and saves readings Meridian has changed, such as an estimate replaced by an actual reading. Past days' usage and cost may change as a result.
+### New
 
-### Sensors
+- Sensors for your bill: **Bill usage so far** and **Bill cost so far**; with a feed-in register, **Bill export so far** and **Bill credit so far**; **Bill estimate**; **Total due**; **Last bill**; **Last payment**; and, on an all-day plan, **Daily charge** and **Anytime price**. They replace the Current bill sensors, with new entity IDs: update automations and dashboards that used those.
+- A repair notice, **Meridian Energy isn't updating**, when updates keep failing. It says why, and goes away by itself once an update works.
+- Clearer sign-in and error messages.
 
-- **Sensors can take longer to come back after an outage.** If updates keep failing, the integration now waits longer each time before asking Meridian for your usage again, up to a day. So once Meridian or your internet is back, your Meridian sensors can stay unavailable for many hours; in 0.2.6 they came back within about an hour. The usage you missed is filled in once they're back. To try again straight away, reload the integration: **Settings → Devices & services → Meridian Energy → ⋮ → Reload**.
-- **Sensors can go unavailable while Home Assistant is busy.** If Home Assistant takes too long to save Meridian's readings, for example during a long backup, or fails to save some hours, your Meridian sensors may now show unavailable until a later update, when the integration tries those hours again. In 0.2.6 they stayed available, but hours that failed to save could stay missing from your Energy dashboard.
-- **If you've set up more than one property, or you export solar.** When updates keep failing for just one property, or just the export, your Meridian sensors now stay available; in 0.2.6 they all became unavailable. Until the failing one catches up, the Current bill sensors that count it may be incomplete or show unknown.
-- **If you use Adjust sum on a Meridian statistic.** After you adjust an hour in your current bill, the matching Current bill sensor now shows unknown, and so does its cost or credit if you adjusted usage or export. They come back with your next bill's first readings, or sooner if the integration writes that hour again from Meridian, which undoes your adjustment: it writes the last 14 days again at every restart and now also once a week.
+### Fixed
 
-### Setting up
+- Setup no longer waits for your history: it finishes once Meridian accepts your code and finds your account, and your history loads in the background. Its sensors show as unavailable until then.
+- Setup works with a solar feed-in register.
+- Each hour's cost counts every charge and credit Meridian's app counts, each with its sign, so a credit lowers it.
 
-These apply when you add the integration.
-
-- **Setup no longer gets stuck.** In 0.2.6, if downloading your history at the end of setup failed, the setup window kept spinning and never said what had gone wrong. It now says what went wrong and, unless your sign-in has expired, lets you try again from the same window up to 4 times.
-- **Setup can finish with part of your history.** If Meridian is too slow to send all of it, setup can finish once your most recent week has arrived, and the rest is fetched in the background. Your Current bill sensors may show unknown until then.
-- **You can finish setup without your history.** If the **History import failed** screen says Meridian's service returned an error or didn't answer in time, you can turn on **Continue without history**. The integration then fetches your history by itself later.
+**Requires Home Assistant 2026.10 or newer.**
 
 ## 0.2.6
 

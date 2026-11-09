@@ -4,7 +4,7 @@
 
 - Python 3.14.2 or newer, below 3.15
 - `uv`
-- `lsof`, for the live test and the journeys
+- `lsof`, for the live test and journeys
 
 Never use real credentials in tests or commit captured Meridian answers. Fixtures are synthetic: no real emails, account numbers, ICPs, addresses, tokens, usage or cost.
 
@@ -39,24 +39,25 @@ uv run python scripts/live_ha.py stop                  # remove it all
 The journeys run the integration end to end in a real Home Assistant against a stand-in Meridian:
 
 ```bash
-uv run python scripts/journeys.py                        # the working tree, all of them
+uv run python scripts/journeys.py                        # all, from the working tree
 uv run python scripts/journeys.py --ref v0.3.0b2         # or a release tag or commit
 uv run python scripts/journeys.py --only reauth restart  # some of them
 uv run python scripts/journeys.py --clean-up             # delete a left-over instance
 ```
 
-A run builds its own disposable Home Assistant, as the live test does, on port 8125. The stand-in (`tests/meridian_standin.py`) answers Meridian requests with synthetic data and refuses every other aiohttp request, TCP connection and forward name lookup from Home Assistant that would leave the computer, but not UDP or other programs; building the instance and its first start download from PyPI.
+Each run builds a disposable Home Assistant, as the live test does, on port 8125. The stand-in (`tests/meridian_standin.py`) answers Meridian requests with synthetic data and refuses every other aiohttp request, TCP connection and forward name lookup from Home Assistant that would leave the computer, but not UDP or other programs; building the instance and its first start download from PyPI.
 
 | Journey | What it does |
 | --- | --- |
 | `first_setup` | A feed-in register and an account in credit: the entry at once; the first sync asks 13 windows per direction back to midnight 90 dates ago, completing both histories; every figure has a value |
-| `figures` | Billing period, day totals and prices fail at the first sync: the update works, the bill shows unknown and the log says so; reloads bring every figure; a restart with the prices failing leaves only them unknown |
+| `add_again` | Removed and added again: the kept history continues unchanged; deleted, it imports anew |
+| `figures` | Meridian's own figures fail at the first sync: the update works, the bill shows unknown, as the log says; reloads bring them; a restart with prices failing leaves only those unknown |
 | `outage` | Meridian times out from the start: the entry loads, sensors unavailable; a notice after 3 failed updates; once Meridian answers, one update imports 90 dates and the notice goes |
 | `two_accounts` | Two accounts on one login, both followed |
 | `reauth` | Meridian ends the sign-in; reconnecting with a new code keeps the history unbroken |
-| `restart` | Reload, then restart: each first sync asks only for the last 21 dates; no hour changes |
+| `restart` | Reload, then restart: each first sync asks only the last 21 dates; no hour changes |
 
-Every journey also checks its entry and sensors; that each statistic has every hour, none zero, with the value sent and consistent sums; that every screen has its words; that the integration's log above debug level is exactly as expected, with no warning from Home Assistant's recorder, websocket API or sensors; and that the stand-in refused nothing. The run prints PASS or FAIL for each check, writes a report, deletes the instance and exits non-zero if anything failed.
+Every journey also checks its entry and sensors; that each statistic has every hour, none zero, as sent, with consistent sums; that every screen has its words; that the integration logs above debug level only what is expected, and Home Assistant's recorder, websocket API and sensors no warning; and that the stand-in refused nothing. The run prints each check, writes a report, deletes the instance and exits non-zero on any failure.
 
 Run the journeys before every release, betas included, and in every pull request that changes sign-in, setup or the import; say in it that they passed; CI doesn't run them.
 

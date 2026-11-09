@@ -37,9 +37,9 @@ class TokenParseError(ValueError):
 
 
 _MAX_TOKEN_LIFETIME_SECONDS = 86400
-# The largest power of ten a measurement's value or cost may reach: no
-# hour's or day's kWh, nor any cost in cents, comes near 1E+13, and a number
-# far past it would overflow when added up.
+# The largest power of ten a number read from Meridian may reach: no hour's
+# or day's kWh, cost, price or amount comes near 1E+13, and a number far past
+# it would overflow when added up, or be too large for a sensor to show.
 _LARGEST_EXPONENT = 12
 _KNOWN_COST_TYPES = COST_STATISTIC_TYPES | GENERATION_CREDIT_TYPES
 _COST_TYPE_PATTERN = re.compile(r"[A-Z][A-Z0-9_]{0,63}")
@@ -197,6 +197,8 @@ def _nodes(connection: Any, context: str) -> list[dict[str, Any]]:
 def _cents(value: Any, context: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
         raise ValueError(f"Invalid Meridian {context}")
+    if Decimal(value).adjusted() > _LARGEST_EXPONENT:
+        raise ValueError(f"Meridian {context} is out of range")
     return value
 
 
@@ -207,8 +209,8 @@ def parse_prices(property_data: dict[str, Any]) -> MeridianPrices | None:
     All-day: one meter point, whose current agreement has one daily charge
     and one price per kWh, and no rate tied to a time of day. Each price is
     read strictly, its discounted form when it has a discount; one that does
-    not read as dollars or cents per day or kWh, as its band says, is None,
-    and the name of each price's field is logged once.
+    not read as dollars or cents per day or kWh, as its band says, or is out
+    of range, is None, and the name of each price's field is logged once.
     """
     meters = require_list(property_data.get("meterPoints"), "meter points")
     if len(meters) != 1:
@@ -237,7 +239,7 @@ def parse_prices(property_data: dict[str, Any]) -> MeridianPrices | None:
 
 
 def _price(rate: dict[str, Any], band: str, unit: str) -> Decimal | None:
-    """Return a rate's price in NZD, or None when it does not read as its band's."""
+    """Return a rate's price in NZD; None unless it reads as its band's, in range."""
     field = (
         "formattedRateIncludingTaxIncludingDiscount"
         if rate.get("hasDiscount") is True
@@ -248,7 +250,10 @@ def _price(rate: dict[str, Any], band: str, unit: str) -> Decimal | None:
     for pattern, dollars in ((_DOLLAR_RATE, Decimal(1)), (_CENT_RATE, Decimal(100))):
         match = pattern.fullmatch(text)
         if match is not None and match[2] == unit:
-            return Decimal(match[1]) / dollars
+            amount = Decimal(match[1])
+            if amount.adjusted() <= _LARGEST_EXPONENT:
+                return amount / dollars
+            break
     if (band, field) not in _logged_rates:
         _logged_rates.add((band, field))
         _LOGGER.info(
