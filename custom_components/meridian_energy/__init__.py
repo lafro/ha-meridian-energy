@@ -49,8 +49,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: MeridianConfigEntry) -> 
 
     async def async_store_tokens(tokens: MeridianTokenSet) -> None:
         if (
-            entry.data.get(CONF_REFRESH_TOKEN) == tokens.refresh_token
-            and entry.data.get(CONF_FIREBASE_USER_ID) == tokens.user_id
+            # A refresh that outlived the entry's removal, as one update_entity
+            # asked for can, has no entry to store them in.
+            hass.config_entries.async_get_entry(entry.entry_id) is None
+            or (
+                entry.data.get(CONF_REFRESH_TOKEN) == tokens.refresh_token
+                and entry.data.get(CONF_FIREBASE_USER_ID) == tokens.user_id
+            )
         ):
             return
         hass.config_entries.async_update_entry(

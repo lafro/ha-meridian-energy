@@ -10,7 +10,13 @@ from typing import Any
 from uuid import uuid4
 
 import probatio
-from homeassistant.config_entries import SOURCE_REAUTH, ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    SOURCE_IGNORE,
+    SOURCE_REAUTH,
+    ConfigEntryState,
+    ConfigFlow,
+    ConfigFlowResult,
+)
 from homeassistant.const import CONF_EMAIL
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import AbortFlow, FlowResultType
@@ -87,10 +93,17 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
 
         A setup of the same email left at a form, as in a closed browser
         tab, does not block this one: Home Assistant aborts it once either
-        creates the entry.
+        creates the entry. An entry an earlier version made, refused as too
+        old, must be deleted first, so the abort says so.
         """
         email = str(user_input[CONF_EMAIL]).strip().lower()
-        await self.async_set_unique_id(email, raise_on_progress=False)
+        existing = await self.async_set_unique_id(email, raise_on_progress=False)
+        if (
+            existing is not None
+            and existing.state is ConfigEntryState.MIGRATION_ERROR
+            and existing.source != SOURCE_IGNORE
+        ):
+            return self.async_abort(reason="earlier_entry")
         self._abort_if_unique_id_configured()
         self._email = email
         self._journey_id = str(uuid4())

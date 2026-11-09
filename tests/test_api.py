@@ -53,7 +53,7 @@ from custom_components.meridian_energy.models import (
 )
 from custom_components.meridian_energy.parsers import optional_date
 
-from .meridian_http import balance_data, prices_data
+from .meridian_http import FakeMeridianSession, balance_data, prices_data
 
 
 def _tokens() -> MeridianTokenSet:
@@ -1860,3 +1860,44 @@ async def test_a_graphql_failure_logs_only_codes_in_krakens_form(
         in caplog.text
     )
     assert "A-TEST-1" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_client_sends_only_these_operation_names_and_urls() -> None:
+    """
+    Pin every (URL, operation name) the client sends, across all its queries.
+
+    The web app's names go to ``?opName=<name>``. Discovery and billing keep
+    the integration's own names on the plain endpoint, as since 0.2.x; a new
+    name, or a name moved to another URL, fails here.
+    """
+    session = FakeMeridianSession(datetime(2026, 7, 16, 0, 30, tzinfo=UTC))
+    client = MeridianApiClient(session, tokens=_tokens())  # type: ignore[arg-type]
+
+    (account,) = await client.async_get_accounts()
+    (prop,) = account.properties
+    await client.async_get_window(
+        account_number=account.number,
+        property_id=prop.id,
+        direction="CONSUMPTION",
+        start_on=date(2026, 7, 9),
+        end_on=date(2026, 7, 15),
+        last=214,
+    )
+    await client.async_get_billing_period(account.number)
+    await client.async_get_balance(account.number)
+    await client.async_get_prices(account.number, prop.id)
+
+    plain = "https://api.meridianenergy.nz/v1/graphql/"
+    assert plain == GRAPHQL_URL
+    assert set(session.posts) == {
+        (plain, "accountsList"),
+        (plain, "account"),
+        (plain, "billingPeriods"),
+        (f"{plain}?opName=GetMeasurements", "GetMeasurements"),
+        (f"{plain}?opName=GetAccountBalance", "GetAccountBalance"),
+        (
+            f"{plain}?opName=GetAccountPropertyAgreements",
+            "GetAccountPropertyAgreements",
+        ),
+    }

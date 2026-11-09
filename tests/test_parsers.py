@@ -94,7 +94,7 @@ def test_a_day_node_off_new_zealand_midnights_is_refused(start: str, end: str) -
 
 
 @pytest.mark.parametrize("field", ["value", "cost"])
-def test_a_number_past_1e12_is_refused(field: str) -> None:
+def test_a_number_from_1e13_is_refused(field: str) -> None:
     """No kWh, nor any cost in cents, comes near: the sum of a few would overflow."""
 
     def node(number: str) -> dict[str, Any]:

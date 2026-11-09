@@ -12,7 +12,13 @@ from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 import probatio
 import pytest
-from homeassistant.config_entries import SOURCE_REAUTH, SOURCE_USER, ConfigFlowResult
+from homeassistant.config_entries import (
+    SOURCE_IGNORE,
+    SOURCE_REAUTH,
+    SOURCE_USER,
+    ConfigEntryState,
+    ConfigFlowResult,
+)
 from homeassistant.const import CONF_EMAIL
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType, UnknownFlow
@@ -277,6 +283,62 @@ async def test_user_flow_prevents_duplicate(hass) -> None:
 
     assert result["type"] is FlowResultType.ABORT
     assert result["reason"] == "already_configured"
+
+
+@pytest.mark.asyncio
+async def test_adding_over_an_entry_refused_as_too_old_says_to_delete_it(
+    hass: HomeAssistant, meridian: _FakeMeridian
+) -> None:
+    """An entry an earlier version set up must be deleted first; no code is sent."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title=NAME,
+        unique_id=_TEST_EMAIL,
+        version=3,
+        data={
+            CONF_EMAIL: _TEST_EMAIL,
+            CONF_REFRESH_TOKEN: "old-refresh",
+            CONF_FIREBASE_USER_ID: "old-user",
+        },
+    )
+    entry.add_to_hass(hass)
+    assert not await hass.config_entries.async_setup(entry.entry_id)
+    assert entry.state is ConfigEntryState.MIGRATION_ERROR
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={"source": SOURCE_USER},
+        data={CONF_EMAIL: f" {_TEST_EMAIL.upper()} "},
+    )
+
+    assert result["type"] is FlowResultType.ABORT
+    assert result["reason"] == "earlier_entry"
+    meridian.async_send_otp.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_an_ignored_entry_never_blocks_adding_the_login(
+    hass: HomeAssistant, meridian: _FakeMeridian
+) -> None:
+    """A login an ignored entry holds can be added, whatever the entry's state."""
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title=NAME,
+        unique_id=_TEST_EMAIL,
+        version=3,
+        source=SOURCE_IGNORE,
+        data={},
+    )
+    entry.add_to_hass(hass)
+    entry.mock_state(hass, ConfigEntryState.MIGRATION_ERROR)
+
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}, data={CONF_EMAIL: _TEST_EMAIL}
+    )
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "otp"
+    meridian.async_send_otp.assert_awaited_once()
 
 
 # Errors from a request to Meridian that got no usable answer, as each form

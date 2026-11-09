@@ -135,6 +135,8 @@ _EXTRA_LOST = {
     "using the one it has",
     "billing": "Meridian Energy couldn't get the billing period; the billing "
     "period sensors show unknown until it can",
+    "billing_so_far": "Meridian Energy couldn't get the billing period; the "
+    "billing period and 'so far' sensors show unknown until it can",
     "billing_bill": "Meridian Energy couldn't get the billing period; the billing "
     "period and bill sensors show unknown until it can",
     "days": "Meridian Energy couldn't get the bill's day totals; the 'so far' "
@@ -158,7 +160,8 @@ _EXTRA_BACK = {
 # How much each lost line leaves unknown: across accounts, the wider is said.
 _LOST_RANK = {
     "billing": 0,
-    "billing_bill": 1,
+    "billing_so_far": 1,
+    "billing_bill": 2,
     "days": 0,
     "days_all": 1,
     "balance": 0,
@@ -445,8 +448,13 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         that follows a failure.
         """
         self._failed_updates += 1
-        if self.config_entry is None or not (
-            no_accounts or self._failed_updates >= FAILED_UPDATES_BEFORE_ISSUE
+        entry = self.config_entry
+        if (
+            entry is None
+            # A refresh that outlived the entry's removal, as one update_entity
+            # asked for can, leaves no notice behind.
+            or self.hass.config_entries.async_get_entry(entry.entry_id) is None
+            or not (no_accounts or self._failed_updates >= FAILED_UPDATES_BEFORE_ISSUE)
         ):
             return
         ir.async_create_issue(
@@ -1124,7 +1132,13 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         billing.lost = period is None and (billing.failing or (ended and billing.lost))
         if billing.lost:
             _lose(
-                lost, "billing", "billing_bill" if bill == BillFigures() else "billing"
+                lost,
+                "billing",
+                "billing_bill"
+                if bill == BillFigures()
+                else "billing_so_far"
+                if bill.usage is None
+                else "billing",
             )
         extra = await self._async_extra(
             "balance", number, now, partial(self.client.async_get_balance, number)
@@ -1348,7 +1362,10 @@ def _is_transient(err: MeridianConnectionError) -> bool:
         return False
     if isinstance(err, MeridianUpstreamError):
         return err.status is None or err.status in TRANSIENT_STATUSES
-    return http_status(err) is None
+    # A status from Google's session service, as at a token renewal, is
+    # judged as Meridian's would be.
+    status = http_status(err)
+    return status is None or status in TRANSIENT_STATUSES
 
 
 def _is_refusal(err: Exception) -> bool:

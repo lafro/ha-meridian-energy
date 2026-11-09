@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
@@ -26,6 +27,7 @@ from homeassistant.exceptions import (
 )
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
     snapshot_platform,
@@ -42,6 +44,7 @@ from custom_components.meridian_energy import (
     async_setup_entry,
     async_unload_entry,
 )
+from custom_components.meridian_energy import coordinator as coordinator_module
 from custom_components.meridian_energy.api import (
     MeridianApiClient,
     MeridianAuthenticationError,
@@ -69,6 +72,9 @@ from custom_components.meridian_energy.models import (
     PropertySyncResult,
 )
 from custom_components.meridian_energy.statistics import account_key, energy_metadata
+
+from .meridian_http import ID_TOKEN, FakeMeridianSession, Response, json_response
+from .syncs import NOW
 
 
 def _entry(
@@ -727,3 +733,107 @@ class TestPublicConfigEntryLifecycle:
         assert entry.state is ConfigEntryState.SETUP_ERROR
         flows = hass.config_entries.flow.async_progress_by_handler(DOMAIN)
         assert [flow["context"]["source"] for flow in flows] == [SOURCE_REAUTH]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("release", ["third_failure", "refused_session"])
+    async def test_an_update_entity_sync_that_outlives_its_entry_leaves_nothing(
+        self, recorder_mock, hass, caplog, release: str
+    ) -> None:
+        """
+        A refresh update_entity asked for, which removal doesn't stop, ends quietly.
+
+        Its measurements answer is held while the entry is removed. Released
+        as the third failed update in a row, it raises no repair notice;
+        released as a refused session, whose renewal rotates the refresh
+        token, it stores nothing in the removed entry. Either way nothing is
+        logged as an error.
+        """
+        del recorder_mock
+        session = FakeMeridianSession(NOW)
+        entry = _entry()
+        entry.add_to_hass(hass)
+        assert await async_setup_component(hass, "homeassistant", {})
+        renewals: list[str] = []
+
+        def renew(operation: str) -> Response | None:
+            if operation != "session_refresh":
+                return None
+            renewals.append(operation)
+            return json_response(
+                {
+                    "id_token": ID_TOKEN,
+                    "refresh_token": "synthetic-rotated-refresh",
+                    "expires_in": "3600",
+                    "user_id": "synthetic-user-0123",
+                }
+            )
+
+        with (
+            patch(
+                "custom_components.meridian_energy.async_get_clientsession",
+                return_value=session,
+            ),
+            patch.object(coordinator_module, "_utcnow", return_value=NOW),
+        ):
+            assert await hass.config_entries.async_setup(entry.entry_id)
+            await hass.async_block_till_done(wait_background_tasks=True)
+            coordinator = entry.runtime_data.coordinator
+            assert coordinator.last_update_success
+            unavailable = json_response({}, status=503)
+            gate = asyncio.Event()
+            if release == "third_failure":
+                session.hook = lambda operation, _variables: (
+                    unavailable if operation == "measurements" else None
+                )
+                await coordinator.async_refresh()
+                await coordinator.async_refresh()
+                assert coordinator._failed_updates == 2
+                held = iter([Response(b"{}", status=503, gate=gate)])
+                after: Response | None = unavailable
+            else:
+                held = iter([Response(b"{}", status=401, gate=gate)])
+                after = None
+                session.auth_hook = renew
+            session.hook = lambda operation, _variables: (
+                next(held, after) if operation == "measurements" else None
+            )
+            sensor = next(
+                item.entity_id
+                for item in er.async_entries_for_config_entry(
+                    er.async_get(hass), entry.entry_id
+                )
+                if item.unique_id.endswith("_estimated_readings")
+            )
+            sent = session.operations.count("measurements")
+            caplog.clear()
+
+            service = hass.async_create_task(
+                hass.services.async_call(
+                    "homeassistant",
+                    "update_entity",
+                    {"entity_id": sensor},
+                    blocking=True,
+                )
+            )
+            for _ in range(1000):
+                if session.operations.count("measurements") > sent:
+                    break
+                await asyncio.sleep(0.01)
+            assert session.operations.count("measurements") == sent + 1
+            await hass.config_entries.async_remove(entry.entry_id)
+            gate.set()
+            await service
+            await hass.async_block_till_done(wait_background_tasks=True)
+
+        assert hass.config_entries.async_get_entry(entry.entry_id) is None
+        assert (
+            ir.async_get(hass).async_get_issue(DOMAIN, f"sync_failing_{entry.entry_id}")
+            is None
+        )
+        if release == "refused_session":
+            assert renewals
+        assert [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno >= logging.ERROR
+        ] == []

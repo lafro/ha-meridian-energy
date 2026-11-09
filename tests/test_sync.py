@@ -9,7 +9,8 @@ statistics kept in memory (``syncs.Statistics``). Every value is synthetic.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from typing import Any
@@ -388,6 +389,80 @@ async def test_a_failure_that_will_not_pass_is_not_resent(
         await sync(coordinator, NOW, session)
 
     assert session.operations.count("measurements") == 1
+
+
+def _renewals_failing_once(session: FakeMeridianSession, status: int) -> list[str]:
+    """
+    Answer the next session renewal with a status, then as usual.
+
+    The coordinator's session is made due for renewal, as at nearly every
+    hourly update, so the renewal comes inside its first measurements request.
+    Returns the renewals sent, which grows as they are.
+    """
+    failures = iter([json_response({}, status=status)])
+    renewals: list[str] = []
+
+    def answer(operation: str) -> Response | None:
+        if operation != "session_refresh":
+            return None
+        renewals.append(operation)
+        return next(failures, None)
+
+    session.auth_hook = answer
+    return renewals
+
+
+def _renew_at_next_request(coordinator: Any) -> None:
+    """Make the coordinator's session token due for renewal."""
+    coordinator.client._tokens = replace(
+        coordinator.client._tokens,
+        expires_at=datetime.now(UTC) + timedelta(minutes=1),
+    )
+
+
+async def test_a_session_renewal_that_may_pass_is_resent_once(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture, waits: Any
+) -> None:
+    session = FakeMeridianSession(NOW)
+    coordinator = coordinator_for(hass, session)
+    await sync(coordinator, NOW, session)
+    _renew_at_next_request(coordinator)
+    renewals = _renewals_failing_once(session, 503)
+    waits.reset_mock()
+    caplog.clear()
+    caplog.set_level(logging.DEBUG)
+
+    await refresh(coordinator, NOW + HOUR, session)
+
+    assert coordinator.last_update_success
+    assert len(renewals) == 2
+    resend = [call.args[0] for call in waits.await_args_list if call.args[0] > 1]
+    assert len(resend) == 1
+    assert "Resending a request that failed (HTTP 503)" in caplog.messages
+    loud = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert loud == []
+
+
+async def test_a_session_renewal_that_will_not_pass_is_not_resent(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture, waits: Any
+) -> None:
+    session = FakeMeridianSession(NOW)
+    coordinator = coordinator_for(hass, session)
+    await sync(coordinator, NOW, session)
+    _renew_at_next_request(coordinator)
+    renewals = _renewals_failing_once(session, 404)
+    sent = len(session.operations)
+    waits.reset_mock()
+    caplog.set_level(logging.DEBUG)
+
+    with pytest.raises(UpdateFailed) as failure:
+        await sync(coordinator, NOW + HOUR, session)
+
+    assert failure.value.translation_key == "cannot_connect"
+    assert renewals
+    assert "measurements" not in session.operations[sent:]
+    assert [call.args[0] for call in waits.await_args_list if call.args[0] > 1] == []
+    assert not any(m.startswith("Resending") for m in caplog.messages)
 
 
 async def test_a_failed_fill_window_waits_longer_each_time_and_says_so_after_a_day(

@@ -69,8 +69,10 @@ def parse_firebase_tokens(payload: dict[str, Any]) -> MeridianTokenSet:
         if not isinstance(raw_expires, (str, int)):
             raise TypeError
         expires_in = int(raw_expires)
-    except (TypeError, ValueError) as err:
-        raise TokenParseError("Firebase returned an invalid expiry") from err
+    except TypeError, ValueError:
+        # int()'s message quotes the string, and a failed update or setup logs
+        # the traceback at DEBUG: keep the value out.
+        raise TokenParseError("Firebase returned an invalid expiry") from None
     if expires_in <= 0 or expires_in > _MAX_TOKEN_LIFETIME_SECONDS:
         raise TokenParseError("Firebase returned an invalid expiry")
     return MeridianTokenSet(

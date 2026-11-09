@@ -15,7 +15,7 @@ import asyncio
 import logging
 import re
 from collections.abc import Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from unittest.mock import patch
@@ -42,6 +42,7 @@ from .meridian_http import (
     REFRESH_TOKEN,
     FakeMeridianSession,
     Response,
+    json_response,
 )
 
 _NOW = datetime(2026, 7, 16, 12, 30, tzinfo=UTC)
@@ -317,3 +318,57 @@ async def test_logs_stay_private_when_a_first_sync_is_stopped(
     assert meridian.operations.count("measurements") == 2
     assert not gate.is_set()
     _assert_private(records, meridian)
+
+
+@pytest.mark.asyncio
+async def test_a_session_renewal_with_an_unreadable_expiry_quotes_nothing(
+    hass: HomeAssistant,
+    meridian: FakeMeridianSession,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    An expiry that is no number reaches no record, on an update or a reload.
+
+    The token's renewal comes at an update, when it is due, and at every
+    setup; both log the failure's traceback at DEBUG.
+    """
+    caplog.set_level(logging.DEBUG, logger=_INTEGRATION)
+    marker = "synthetic-expiry-marker"
+    result = await _sign_in(hass)
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    entry = result["result"]
+    await hass.async_block_till_done(wait_background_tasks=True)
+    coordinator = entry.runtime_data.coordinator
+    coordinator.client._tokens = replace(
+        coordinator.client._tokens,
+        expires_at=datetime.now(UTC) + timedelta(minutes=1),
+    )
+    meridian.auth_hook = lambda operation: (
+        json_response(
+            {
+                "id_token": ID_TOKEN,
+                "refresh_token": REFRESH_TOKEN,
+                "expires_in": marker,
+                "user_id": "synthetic-user-0123",
+            }
+        )
+        if operation == "session_refresh"
+        else None
+    )
+    caplog.clear()
+
+    await coordinator.async_refresh()
+    assert not coordinator.last_update_success
+    assert not await hass.config_entries.async_reload(entry.entry_id)
+    await hass.async_block_till_done()
+
+    formatter = logging.Formatter()
+    tracebacks = [record for record in caplog.records if record.exc_info]
+    assert {record.getMessage() for record in tracebacks} >= {
+        "Full error:",
+        "Full exception",
+    }
+    for record in caplog.records:
+        assert marker not in formatter.format(record), record.getMessage()
+    _assert_private(_integration_records(caplog), meridian)
+    assert await hass.config_entries.async_unload(entry.entry_id)

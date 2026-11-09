@@ -3,6 +3,7 @@
   "config": {
     "abort": {
       "already_configured": "This Meridian login is already set up.",
+      "earlier_entry": "Meridian Energy is already set up for this login by an earlier version. Delete it under Settings → Devices & services, then add it again.",
       "login_expired": "This sign-in has expired. Start again to get a new code.",
       "no_accounts": "Meridian has no active electricity account for this email."
     },

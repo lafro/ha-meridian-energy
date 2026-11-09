@@ -53,6 +53,10 @@ _BILLING_LOST = (
     "Meridian Energy couldn't get the billing period; the billing period sensors "
     "show unknown until it can"
 )
+_BILLING_SO_FAR_LOST = (
+    "Meridian Energy couldn't get the billing period; the billing period and "
+    "'so far' sensors show unknown until it can"
+)
 _BILLING_BACK = "Meridian Energy is getting the billing period again"
 _DAYS_ALL_LOST = (
     "Meridian Energy couldn't get the bill's day totals; the bill sensors show "
@@ -473,20 +477,48 @@ async def test_a_current_period_is_kept_two_days_when_its_refresh_fails(
     (result,) = data.account_results
     assert result.billing_period is None
     # The day totals got a day ago are past their keep; the estimate is kept
-    # until the period ends.
+    # until the period ends, and the line says the 'so far' sensors are unknown.
     assert result.bill == BillFigures(estimate=Decimal("111.6"))
-    assert _own(caplog, logging.INFO) == [
-        (
-            "Meridian Energy couldn't get the billing period; the billing period "
-            "sensors show unknown until it can"
-        )
-    ]
+    assert _own(caplog, logging.INFO) == [_BILLING_SO_FAR_LOST]
 
     session.hook = lambda _operation, _variables: None
     data = await sync(coordinator, NOW + 3 * DAY, session)
     assert data.account_results[0].billing_period == first
     assert _own(caplog, logging.INFO)[1:] == [
         "Meridian Energy is getting the billing period again"
+    ]
+
+
+async def test_the_lost_billing_line_widens_when_the_so_far_figures_go(
+    hass: HomeAssistant,
+    session: FakeMeridianSession,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Hourly, with the billing period failing from the first hour on.
+
+    The period is kept two days, then shows unknown; the day totals, no longer
+    asked for, are kept until six hours later, when the 'so far' figures show
+    unknown too and the line says so. Once Meridian answers again, at 72
+    hours, one line says the period is back.
+    """
+    caplog.set_level(logging.INFO)
+    _billing_asks(session, range(1, 72))
+    coordinator = coordinator_for(hass, session)
+    said: list[tuple[int, str]] = []
+    shown: list[int] = []
+    for update in range(76):
+        data = await sync(coordinator, NOW + update * HOUR, session)
+        (result,) = data.account_results
+        if result.billing_period is not None:
+            shown.append(update)
+        said.extend((update, line) for line in _own(caplog, logging.INFO)[len(said) :])
+
+    assert shown == [*range(48), *range(72, 76)]
+    assert said == [
+        (48, _BILLING_LOST),
+        (54, _BILLING_SO_FAR_LOST),
+        (72, _BILLING_BACK),
     ]
 
 
@@ -806,7 +838,9 @@ async def test_with_two_accounts_a_narrower_billing_line_waits_for_the_wider(
         False,
         True,
     ]
-    assert _own(caplog, logging.INFO) == [_BILLING_AND_BILL_LOST, _BILLING_LOST]
+    # The other's day totals are past their keep: its 'so far' figures are
+    # unknown too.
+    assert _own(caplog, logging.INFO) == [_BILLING_AND_BILL_LOST, _BILLING_SO_FAR_LOST]
 
 
 _TWO_ORDERS = [(ACCOUNT_NUMBER, "A-TEST-2"), ("A-TEST-2", ACCOUNT_NUMBER)]
@@ -878,11 +912,14 @@ async def test_an_ended_period_never_failed_joins_no_other_accounts_loss(
         ],
     )
 
-    # Kept two days after it was got: lost at 48 and 120 hours, back when asked.
+    # Kept two days after it was got: lost at 48 and 120 hours, the 'so far'
+    # figures 6 hours later, back when asked.
     assert said == [
         (48, _BILLING_LOST),
+        (54, _BILLING_SO_FAR_LOST),
         (72, _BILLING_BACK),
         (120, _BILLING_LOST),
+        (126, _BILLING_SO_FAR_LOST),
         (168, _BILLING_BACK),
     ]
 
