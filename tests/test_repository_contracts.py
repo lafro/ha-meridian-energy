@@ -13,6 +13,7 @@ from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 
+from custom_components.meridian_energy.const import HISTORY_DAYS
 from scripts import check_versions, compat_results, journeys
 
 # Each document's word limit, counted as ``wc -w`` counts.
@@ -23,6 +24,8 @@ WORD_LIMITS = {
     "docs/architecture.md": 2000,
     "docs/releasing.md": 700,
 }
+# The 0.3.0 CHANGELOG section, which is also each 0.3.0 release's notes.
+NOTES_WORD_LIMIT = 250
 LINKED_DOCS = (
     "README.md",
     "CLAUDE.md",
@@ -355,6 +358,9 @@ def test_release_gates_skip_the_cache_and_publish_changelog_notes() -> None:
     publish = workflow["jobs"]["release"]["steps"][-1]
     assert publish["env"]["RELEASE_NOTES"] == "${{ needs.python.outputs.notes }}"
     assert "--notes-file" in publish["run"]
+    # The notes are the CHANGELOG section alone, with no list of pull requests.
+    assert "--generate-notes" not in publish["run"]
+    assert "--fail-on-no-commits" in publish["run"]
 
 
 def test_check_versions_requires_a_changelog_section(tmp_path: Path) -> None:
@@ -402,7 +408,12 @@ def test_check_versions_reads_a_beta_from_its_release_section(tmp_path: Path) ->
     check_versions.main(["v9.8.7b2", "--release-notes", str(notes)], root)
 
     text = notes.read_text()
-    assert text.startswith("Beta of 9.8.7 for testing.")
+    assert text.split("\n\n", 1)[0] == (
+        "Beta of 9.8.7 for testing. The Marketplace (or HACS before Home Assistant "
+        "2026.11) offers it only to installations that include pre-releases for "
+        "this repository."
+    )
+    assert "beta versions" not in text
     assert text.endswith("### Fixed\n\n- New.\n")
     with pytest.raises(SystemExit, match="Tag mismatch"):
         check_versions.main(["v9.8.7"], root)
@@ -444,6 +455,16 @@ def test_repository_versions_and_changelog_agree(tmp_path: Path) -> None:
     )
     assert notes.read_text().endswith(section)
     assert section.strip()
+
+
+def test_the_0_3_0_notes_are_short_and_say_how_much_history_comes_back() -> None:
+    """The notes users read before updating, as published, stay short and true."""
+    section = check_versions.changelog_section(
+        "0.3.0", Path("CHANGELOG.md").read_text()
+    )
+    assert f"last {HISTORY_DAYS} days" in section
+    words = len(section.split())
+    assert words <= NOTES_WORD_LIMIT, f"0.3.0 notes have {words} words"
 
 
 @pytest.mark.parametrize(("name", "limit"), WORD_LIMITS.items())

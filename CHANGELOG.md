@@ -6,22 +6,22 @@ Notable changes to Meridian Energy for Home Assistant. Releases from v0.2.6 onwa
 
 ### Before you update
 
-1. Remove **Meridian Energy** under **Settings → Devices & services**. If asked "Also uninstall Meridian Energy?", choose **Keep**, so that the update is still offered.
-2. Delete its statistics under **Settings → Tools → Statistics**: select them, then **Delete selected statistics**.
+1. Remove **Meridian Energy** under **Settings → Devices & services**. If asked "Also uninstall Meridian Energy?", choose **Keep**, so the update is still offered.
+2. Delete its statistics under **Settings → Tools → Statistics**: select them, then **Delete selected statistics**. Only the last 90 days are fetched again.
 3. Update, restart Home Assistant, and add Meridian Energy again.
 
-An entry set up by an earlier version is refused, with a message asking you to remove it and add Meridian Energy again.
+An entry set up by an earlier version is refused, with a message asking you to remove it and add it again.
 
 ### New
 
-- Sensors for your bill: **Bill usage so far**, **Bill cost so far**, **Bill export so far** and **Bill credit so far**; **Bill estimate**; **Total due**; **Last bill**; **Last payment**; and, on an all-day plan, **Daily charge** and **Anytime price**. They replace the Current bill sensors and have new entity IDs, so update any automations and dashboards that used those.
+- Sensors for your bill: **Bill usage so far** and **Bill cost so far**; with a feed-in register, **Bill export so far** and **Bill credit so far**; **Bill estimate**; **Total due**; **Last bill**; **Last payment**; and, on an all-day plan, **Daily charge** and **Anytime price**. They replace the Current bill sensors, with new entity IDs: update automations and dashboards that used those.
 - A repair notice, **Meridian Energy isn't updating**, when updates keep failing. It says why, and goes away by itself once an update works.
 - Clearer sign-in and error messages.
 
 ### Fixed
 
-- Setup no longer fails when Meridian is slow: it finishes once Meridian accepts your code, and your history loads in the background. Its sensors show as unavailable until then.
-- Setup works on accounts with a solar feed-in register.
+- Setup no longer waits for your history: it finishes once Meridian accepts your code and finds your account, and your history loads in the background. Its sensors show as unavailable until then.
+- Setup works with a solar feed-in register.
 - Each hour's cost counts every charge and credit Meridian's app counts, each with its sign, so a credit lowers it.
 
 **Requires Home Assistant 2026.10 or newer.**

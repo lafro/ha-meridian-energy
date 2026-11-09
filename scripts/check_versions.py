@@ -93,8 +93,9 @@ def main(argv: list[str] | None = None, root: Path = ROOT) -> None:
     )
     if notes_version != manifest_version:
         notes = (
-            f"Beta of {notes_version} for testing. HACS offers it only to "
-            "installations that turn on beta versions for this repository.\n\n" + notes
+            f"Beta of {notes_version} for testing. The Marketplace (or HACS before "
+            "Home Assistant 2026.11) offers it only to installations that include "
+            "pre-releases for this repository.\n\n" + notes
         )
     if notes_path is not None:
         notes_path.write_text(notes, encoding="utf-8")
