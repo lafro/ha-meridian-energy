@@ -226,6 +226,85 @@ async def test_a_payment_not_made_is_never_the_last_payment(
     )
 
 
+@pytest.mark.parametrize(
+    "status",
+    [
+        "SCHEDULED",
+        "PENDING",
+        "CLEARED",
+        "FULFILLED",
+        "HISTORIC",
+        "THIRD_PARTY",
+        "REQUESTED",
+    ],
+)
+async def test_a_payment_made_by_today_is_the_last_payment_whatever_its_status(
+    hass: HomeAssistant, session: FakeMeridianSession, status: str
+) -> None:
+    """Every status Meridian sends but those not made counts, REQUESTED as before."""
+    session.balance = {
+        **session.balance,
+        "payments": {
+            "edges": [
+                {
+                    "node": {
+                        "amount": 9000,
+                        "paymentDate": (TODAY - 2 * DAY).isoformat(),
+                        "status": status,
+                    }
+                },
+                {
+                    "node": {
+                        "amount": 5000,
+                        "paymentDate": (TODAY - 10 * DAY).isoformat(),
+                        "status": "CLEARED",
+                    }
+                },
+            ]
+        },
+    }
+    coordinator = coordinator_for(hass, session)
+
+    data = await sync(coordinator, NOW, session)
+
+    assert data.account_results[0].last_payment == MeridianPayment(
+        amount_cents=9000, paid_on=TODAY - 2 * DAY, status=status
+    )
+
+
+@pytest.mark.parametrize(
+    "status",
+    [None, "missing", "", "REVERSED"],
+    ids=["null", "missing", "empty", "not one Meridian sends"],
+)
+async def test_a_payment_of_unknown_status_is_never_the_last_payment(
+    hass: HomeAssistant, session: FakeMeridianSession, status: str | None
+) -> None:
+    """A status missing or not known says nothing of a payment made: it is left out."""
+    newer: dict[str, Any] = {
+        "amount": 9000,
+        "paymentDate": (TODAY - 2 * DAY).isoformat(),
+    }
+    if status != "missing":
+        newer["status"] = status
+    cleared = {
+        "amount": 5000,
+        "paymentDate": (TODAY - 10 * DAY).isoformat(),
+        "status": "CLEARED",
+    }
+    session.balance = {
+        **session.balance,
+        "payments": {"edges": [{"node": newer}, {"node": cleared}]},
+    }
+    coordinator = coordinator_for(hass, session)
+
+    data = await sync(coordinator, NOW, session)
+
+    assert data.account_results[0].last_payment == MeridianPayment(
+        amount_cents=5000, paid_on=TODAY - 10 * DAY, status="CLEARED"
+    )
+
+
 async def test_a_meter_with_two_registers_sums_both_over_two_pages(
     hass: HomeAssistant, session: FakeMeridianSession
 ) -> None:
@@ -1449,12 +1528,13 @@ async def test_only_a_property_with_feed_in_is_asked_for_its_export_days(
 
 _UNREADABLE_ANYTIME = (
     "Meridian Energy can't read the anytime price in formattedRateIncludingTax, "
-    "which looks like '$N.NN /AAA'; Anytime price shows unknown"
+    "which looks like '$N.NN /AAA' (N a digit, A a letter); Anytime price shows "
+    "unknown"
 )
 _UNREADABLE_DISCOUNT = (
     "Meridian Energy can't read the daily charge in "
-    "formattedRateIncludingTaxIncludingDiscount, which looks like '$N.NN AAA'; "
-    "Daily charge shows unknown"
+    "formattedRateIncludingTaxIncludingDiscount, which looks like '$N.NN AAA' "
+    "(N a digit, A a letter); Daily charge shows unknown"
 )
 
 
@@ -1498,6 +1578,58 @@ async def test_an_unreadable_price_is_warned_once_by_its_shape(
     assert (prices.daily_charge, prices.anytime) == (None, Decimal("0.3"))
     assert _own(caplog, logging.WARNING) == [_UNREADABLE_ANYTIME, _UNREADABLE_DISCOUNT]
     assert "$1.80" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("text", "words"),
+    [(None, "is missing"), ("", "is empty"), (2, "is not text")],
+    ids=["null", "empty", "a number"],
+)
+async def test_a_price_with_no_text_to_mask_is_warned_of_in_words(
+    hass: HomeAssistant,
+    session: FakeMeridianSession,
+    caplog: pytest.LogCaptureFixture,
+    text: object,
+    words: str,
+) -> None:
+    """With nothing to mask, the WARNING says why, never as if it were a shape."""
+    caplog.set_level(logging.WARNING)
+    standing = rate("STANDING_CHARGE", "$2.000000")
+    standing["formattedRateIncludingTax"] = text
+    session.prices = _plan_of(standing, rate("CONSUMPTION_CHARGE", "$0.300000"))
+
+    await sync(coordinator_for(hass, session), NOW, session)
+
+    assert _own(caplog, logging.WARNING) == [
+        (
+            "Meridian Energy can't read the daily charge in formattedRateIncludingTax, "
+            f"which {words}; Daily charge shows unknown"
+        )
+    ]
+    assert "looks like" not in caplog.text
+
+
+async def test_a_discount_flag_not_true_or_false_is_warned_of_in_words(
+    hass: HomeAssistant,
+    session: FakeMeridianSession,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING)
+    standing = rate("STANDING_CHARGE", "$2.000000")
+    standing["hasDiscount"] = None
+    session.prices = _plan_of(standing, rate("CONSUMPTION_CHARGE", "$0.300000"))
+
+    data = await sync(coordinator_for(hass, session), NOW, session)
+
+    prices = data.account_results[0].prices
+    assert prices is not None
+    assert (prices.daily_charge, prices.anytime) == (None, Decimal("0.3"))
+    assert _own(caplog, logging.WARNING) == [
+        (
+            "Meridian Energy can't read the daily charge in hasDiscount, which is "
+            "not true or false; Daily charge shows unknown"
+        )
+    ]
 
 
 def _plan_of(*rates: dict[str, Any]) -> dict[str, Any]:
@@ -2009,6 +2141,45 @@ async def test_an_account_without_billing_options_has_no_period_and_nothing_fail
     assert session.operations.count("billingPeriods") == 1
     assert coordinator.extras_diagnostics()["billing"]["failing"] == 0
     assert _own(caplog, logging.INFO) == []
+
+
+async def test_billing_options_gone_in_a_period_take_its_bill_with_them(
+    hass: HomeAssistant,
+    session: FakeMeridianSession,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Meridian answers with no options: no period, so no bill, and nothing lost.
+
+    The day totals got for the period before are dropped, not kept as its
+    estimate until that period would have ended; they are asked for at once
+    when a period comes back.
+    """
+    caplog.set_level(logging.INFO)
+    coordinator = coordinator_for(hass, session)
+    await sync(coordinator, NOW, session)
+    caplog.clear()
+    session.kraken.requests.clear()
+    session.hook = lambda operation, _variables: (
+        json_response({"data": {"account": {"billingOptions": None}}})
+        if operation == "billingPeriods"
+        else None
+    )
+
+    data = await sync(coordinator, NOW + DAY + HOUR, session)
+
+    (result,) = data.account_results
+    assert result.billing_period is None
+    assert result.bill == BillFigures()
+    assert _day_requests(session) == []
+    assert _own(caplog, logging.INFO) == []
+
+    session.hook = lambda _operation, _variables: None
+    data = await sync(coordinator, NOW + 2 * DAY + 2 * HOUR, session)
+    (result,) = data.account_results
+    assert result.billing_period is not None
+    assert len(_day_requests(session)) == 1
+    assert result.bill.estimate is not None
 
 
 @pytest.mark.parametrize(

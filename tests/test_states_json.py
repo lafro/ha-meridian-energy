@@ -11,6 +11,7 @@ the integration, not left as the unavailable state Home Assistant restores.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -91,11 +92,23 @@ async def _set_up(hass: HomeAssistant, caplog: pytest.LogCaptureFixture) -> str:
 
 
 def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """
+    Return the lines at WARNING and above, but asyncio's slow steps.
+
+    Tests run the event loop in debug mode, which warns of any step that
+    takes 0.1 s or more. Setting up the entry has steps of about 40 ms, which
+    a busy machine can stretch past that: such a line says how busy the
+    machine was, not what was written.
+    """
     return [
         f"{record.name}: {record.getMessage()}"
         for record in caplog.records
-        if record.levelno >= logging.WARNING
+        if record.levelno >= logging.WARNING and not _slow_step(record)
     ]
+
+
+def _slow_step(record: logging.LogRecord) -> bool:
+    return record.name == "asyncio" and record.getMessage().startswith("Executing ")
 
 
 async def test_a_credit_is_shown_and_recorded(
@@ -145,6 +158,22 @@ async def test_every_state_of_the_entry_is_json(
     for state in shown:
         assert state.as_dict_json, state.entity_id
         assert state.as_compressed_state_json, state.entity_id
+    assert _warnings(caplog) == []
+
+
+async def test_a_busy_machine_s_slow_steps_are_no_warning_of_a_state(
+    hass: HomeAssistant,
+    meridian: FakeMeridianSession,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """As if every step took too long: the states' warnings are still none."""
+    caplog.set_level(logging.WARNING)
+    meridian.feed_in = frozenset({ACCOUNT_NUMBER})
+    asyncio.get_running_loop().slow_callback_duration = 0.001
+
+    await _set_up(hass, caplog)
+
+    assert any(_slow_step(record) for record in caplog.records)
     assert _warnings(caplog) == []
 
 

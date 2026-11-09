@@ -308,7 +308,7 @@ async def test_a_price_that_cannot_be_read_is_logged_by_its_shape_alone(
         (
             "Meridian Energy can't read the anytime price in "
             "formattedRateIncludingTax, which looks like '$N.NNNNNN AAAAAAAAA "
-            "AAA…'; Anytime price shows unknown"
+            "AAA…' (N a digit, A a letter); Anytime price shows unknown"
         )
     ]
     _assert_private(records, meridian)

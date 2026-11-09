@@ -881,6 +881,102 @@ async def test_a_recent_window_refused_when_the_store_cannot_be_read_fails_its_u
     assert coordinator._memory[(KEY, "CONSUMPTION")].fill_stopped is False
 
 
+# Answers that refuse a request but say nothing of the dates asked for.
+_NO_DATE_REFUSED = pytest.mark.parametrize(
+    "answer",
+    [
+        pytest.param(json_response({}, status=401), id="401 after renewal"),
+        pytest.param(json_response({}, status=403), id="JSON 403"),
+        pytest.param(
+            Response(b"Forbidden", status=403, headers={"Content-Type": "text/plain"}),
+            id="text 403",
+        ),
+        pytest.param(_coded("KT-CT-1112"), id="KT-CT-1112"),
+    ],
+)
+
+
+def _answer_for(end_on: Any, answer: Response) -> Any:
+    """Return a hook giving ``answer`` to every request for the window ending then."""
+    refused = end_on.isoformat()
+    return lambda operation, variables: (
+        answer
+        if operation == "measurements" and variables["endOn"] == refused
+        else None
+    )
+
+
+@_NO_DATE_REFUSED
+async def test_an_answer_naming_no_dates_makes_a_fill_window_wait(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture, answer: Response
+) -> None:
+    """A new install's first fill window waits, and the fill goes on later."""
+    caplog.set_level(logging.INFO)
+    session = FakeMeridianSession(NOW)
+    session.hook = _answer_for(TODAY - 21 * DAY, answer)
+    coordinator = coordinator_for(hass, session)
+
+    await sync(coordinator, NOW, session)
+
+    memory = coordinator._memory[(KEY, "CONSUMPTION")]
+    assert memory.fill_stopped is False
+    assert set(memory.cooldowns) == set(_days(TODAY - 27 * DAY, TODAY - 21 * DAY))
+    assert _own(caplog, logging.INFO) == []
+
+    session.hook = lambda _operation, _variables: None
+    await sync(coordinator, NOW + 2 * HOUR, session)
+    (unit,) = coordinator.unit_diagnostics()
+    assert (unit["fill_stopped"], unit["history_complete"]) == (False, True)
+
+
+@_NO_DATE_REFUSED
+async def test_an_answer_naming_no_dates_on_a_recent_window_fails_its_unit(
+    hass: HomeAssistant, answer: Response
+) -> None:
+    """A new install with nothing stored: its history start is not found there."""
+    session = FakeMeridianSession(NOW)
+    session.hook = _answer_for(TODAY - 7 * DAY, answer)
+    coordinator = coordinator_for(hass, session)
+
+    with pytest.raises(UpdateFailed) as failure:
+        await sync(coordinator, NOW, session)
+
+    assert failure.value.translation_key == "invalid_data"
+    assert coordinator._memory[(KEY, "CONSUMPTION")].fill_stopped is False
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        pytest.param(json_response({}, status=400), id="400"),
+        pytest.param(_coded("KT-CT-4321"), id="KT-CT-4321"),
+        pytest.param(
+            json_response(
+                {
+                    "errors": [
+                        {"extensions": {"errorCode": "KT-CT-1112"}},
+                        {"extensions": {"errorCode": "KT-CT-4321"}},
+                    ]
+                }
+            ),
+            id="KT-CT-1112 and another",
+        ),
+    ],
+)
+async def test_a_refusal_of_a_new_install_s_first_fill_window_stops_the_fill(
+    hass: HomeAssistant, caplog: pytest.LogCaptureFixture, answer: Response
+) -> None:
+    caplog.set_level(logging.INFO)
+    session = FakeMeridianSession(NOW)
+    session.hook = _answer_for(TODAY - 21 * DAY, answer)
+    coordinator = coordinator_for(hass, session)
+
+    await sync(coordinator, NOW, session)
+
+    assert coordinator._memory[(KEY, "CONSUMPTION")].fill_stopped is True
+    assert _own(caplog, logging.INFO) == [_STOPPED]
+
+
 async def test_a_rate_limit_stops_the_sync_writes_what_came_and_waits(
     hass: HomeAssistant, statistics: Statistics
 ) -> None:

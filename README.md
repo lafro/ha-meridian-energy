@@ -56,7 +56,7 @@ Each account has one device, **Meridian Energy**. Amounts are in NZD.
 | Sensor | Shows |
 |---|---|
 | Bill usage so far | Grid import in the current billing period, actual readings only, as the app's **Usage → Trends** shows |
-| Bill cost so far | The cost of that usage, as Trends shows; Home's **Total cost so far** adds today's estimate, usually about a day's cost more |
+| Bill cost so far | The cost of that usage, as Trends shows; Home's **Total cost so far** adds the estimates of days not yet read, today's included |
 | Bill export so far, Bill credit so far | Grid export in the period, and its credit (feed-in register only) |
 | Bill estimate | Meridian's estimate of the whole period's cost |
 | Total due | What you owe (0 in credit), as the app's **Billing → Transactions** **Balance**; its Home and Billing card can differ while you owe. Its credit attribute holds any credit |

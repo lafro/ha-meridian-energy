@@ -157,8 +157,10 @@ class UnreadablePrice:
     """
     A price whose text couldn't be read: its sensor's key, field and shape.
 
-    The shape is the text masked, digits as N and letters as A, and cut
-    short, so it says how the text looked without what it said.
+    The shape is the text masked, numbers as N and letters as A, after
+    compatibility normalisation, and cut short, so it says how the text
+    looked without what it said; or, with no text to mask, a word for why:
+    ``missing``, ``not text``, ``empty`` or ``not true or false``.
     """
 
     key: str

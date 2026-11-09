@@ -464,9 +464,9 @@ class MeridianApiClient:
         Ask Meridian to email a one-time login code.
 
         As in Meridian's app, the status decides: any 2xx answer counts as
-        sent, whatever its body; HTTP 404 refuses the email, as does 403, a
-        login of another brand, unless it is a web page, which is taken to
-        come from something in between. Any other status is no answer.
+        sent, whatever its body, and HTTP 404 or 403 refuses the email.
+        Unlike the app, a 403 that is a web page is taken to come from
+        something in between and, like any other status, is no answer.
         """
         payload = {
             "email": email,
@@ -475,6 +475,7 @@ class MeridianApiClient:
             "journeyId": journey_id,
             "otpEnabled": True,
         }
+        note = AnswerNote()
         try:
             await self._async_json_request(
                 AUTH_EMAIL_URL,
@@ -482,6 +483,7 @@ class MeridianApiClient:
                 json=payload,
                 headers={"X-Client-Platform": CLIENT_PLATFORM},
                 authenticated=False,
+                note=note,
             )
         except _MeridianHttpError as err:
             if err.status == _HTTP_TOO_MANY_REQUESTS:
@@ -494,12 +496,17 @@ class MeridianApiClient:
                 ) from err
             raise _connection_error(err) from err
         except ValueError:
-            # A 2xx answer whose body is empty, or JSON but not an object.
-            return
+            # An answer whose body is empty, or JSON but not an object: the
+            # body is not read, and the status decides below.
+            pass
         except MeridianConnectionError as err:
-            # A 2xx answer that is not JSON is sent all the same.
-            if not is_unreadable(err) or http_status(err) not in _HTTP_SUCCESS:
+            # An answer that is not JSON: a 2xx one is sent all the same.
+            if not is_unreadable(err) or note.status not in _HTTP_SUCCESS:
                 raise
+        if note.status not in _HTTP_SUCCESS:
+            raise MeridianConnectionError(
+                f"Meridian service returned HTTP {note.status}"
+            )
 
     async def async_validate_otp(
         self, email: str, otp: str, journey_id: str
@@ -539,7 +546,7 @@ class MeridianApiClient:
             if _no_refusal(err):
                 raise _connection_error(err) from err
             raise MeridianOtpError(
-                str(code or "OTP_INVALID"), "Meridian rejected the login code"
+                str(code or ""), "Meridian rejected the login code"
             ) from err
 
         custom_token = response.get("customToken")

@@ -392,15 +392,16 @@ def _otp_error_key(code: str) -> str:
     """
     Return the form error for a refused code.
 
-    A refusal named otherwise keeps the form, as a wrong code does: Meridian's
-    app lets the code be tried again with the same sign-in.
+    A refusal named otherwise, or not named, keeps the form, as a wrong code
+    does: Meridian's app lets the code be tried again with the same sign-in.
+    Its message names no cause, only that the code wasn't accepted.
     """
     return {
         "OTP_EXPIRED": "otp_expired",
         "OTP_INVALID": "otp_invalid",
         "OTP_TOO_MANY_ATTEMPTS": "otp_too_many_attempts",
         "OTP_NOT_FOUND": "otp_not_found",
-    }.get(code, "otp_invalid")
+    }.get(code, "otp_refused")
 
 
 def _connection_error_key(err: MeridianConnectionError) -> str:

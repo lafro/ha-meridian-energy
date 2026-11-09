@@ -313,6 +313,9 @@ def test_a_price_is_its_dollar_amount_as_written(
         ("$.30", "$.NN"),
         ("$0.", "$N."),
         ("€0.30", "€N.NN"),
+        # Digits of another script, or full width, are digits all the same.
+        ("$\u0662", "$N"),
+        ("$\uff12", "$N"),
         # Nothing to read.
         ("", "empty"),
         ("   ", "empty"),
@@ -399,9 +402,27 @@ def test_a_discounted_price_that_cannot_be_read_names_its_field() -> None:
     )
 
 
-@pytest.mark.parametrize("has_discount", ["missing", None, "true", 1, False], ids=repr)
-def test_a_discount_counts_only_when_it_is_true(has_discount: object) -> None:
-    """Without hasDiscount true, the price is the one including tax."""
+@pytest.mark.parametrize(
+    ("has_discount", "daily"),
+    [(True, Decimal("1.8")), (False, Decimal(2))],
+    ids=repr,
+)
+def test_a_discount_counts_only_when_it_is_true_or_false(
+    has_discount: object, daily: Decimal
+) -> None:
+    """hasDiscount true picks the discounted price, false the one including tax."""
+    standing = rate("STANDING_CHARGE", "$2.000000", discount="$1.800000")
+    standing["hasDiscount"] = has_discount
+    prices = parse_prices(_plan(standing, rate("CONSUMPTION_CHARGE", "$0.300000")))
+
+    assert prices == MeridianPrices("Synthetic Plan", daily, Decimal("0.3"))
+
+
+@pytest.mark.parametrize("has_discount", ["missing", None, "true", 1, 0], ids=repr)
+def test_a_discount_flag_not_true_or_false_leaves_the_price_unknown(
+    has_discount: object,
+) -> None:
+    """Neither text can be said to be the price: it is unknown, and listed."""
     standing = rate("STANDING_CHARGE", "$2.000000", discount="$1.800000")
     if has_discount == "missing":
         del standing["hasDiscount"]
@@ -409,7 +430,36 @@ def test_a_discount_counts_only_when_it_is_true(has_discount: object) -> None:
         standing["hasDiscount"] = has_discount
     prices = parse_prices(_plan(standing, rate("CONSUMPTION_CHARGE", "$0.300000")))
 
-    assert prices == MeridianPrices("Synthetic Plan", Decimal(2), Decimal("0.3"))
+    assert prices == MeridianPrices(
+        "Synthetic Plan",
+        None,
+        Decimal("0.3"),
+        (UnreadablePrice("daily_charge", "hasDiscount", "not true or false"),),
+    )
+
+
+@pytest.mark.parametrize(
+    ("discounted", "shape"),
+    [("delete", "missing"), (None, "missing"), ("", "empty")],
+    ids=["missing", "null", "empty"],
+)
+def test_a_discount_without_its_price_never_falls_back_to_the_full_one(
+    discounted: str | None, shape: str
+) -> None:
+    """A discount's price is its discounted text: without one, it is unknown."""
+    standing = rate("STANDING_CHARGE", "$2.000000", discount="$1.800000")
+    if discounted == "delete":
+        del standing[_DISCOUNTED]
+    else:
+        standing[_DISCOUNTED] = discounted
+    prices = parse_prices(_plan(standing, rate("CONSUMPTION_CHARGE", "$0.300000")))
+
+    assert prices == MeridianPrices(
+        "Synthetic Plan",
+        None,
+        Decimal("0.3"),
+        (UnreadablePrice("daily_charge", _DISCOUNTED, shape),),
+    )
 
 
 def test_the_parser_logs_no_price(caplog: pytest.LogCaptureFixture) -> None:
@@ -424,6 +474,12 @@ def test_a_price_shape_keeps_no_letter_or_digit() -> None:
     assert price_shape("Synthetic 0123 ABC-9") == "AAAAAAAAA NNNN AAA-N"
     assert price_shape("x" * 24) == "A" * 24
     assert price_shape("x" * 25) == "A" * 23 + "…"
+    # Numbers and letters of any kind, after compatibility normalisation:
+    # Roman numerals, fractions and circled ones; an accent is a letter's.
+    assert price_shape("\u216b\u00bd\u2469 \u00e9 \u24b6") == "AAAN\u2044NNN A A"
+    assert price_shape("\u00bd\u2460\u3007") == "N\u2044NNN"
+    # A combining mark that is no letter's is no character it can keep.
+    assert price_shape("e\u0301 \u0301") == "A ?"
 
 
 def _plan(*rates: dict[str, Any]) -> dict[str, Any]:

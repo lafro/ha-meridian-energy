@@ -477,6 +477,7 @@ def test_the_readme_names_the_stored_user_id_and_the_app_figures_matched() -> No
     assert "**Billing → Transactions** **Balance**" in total_due
     cost = next(line for line in readme.splitlines() if "| Bill cost so far |" in line)
     assert "**Total cost so far**" in cost
+    assert "days not yet read" in cost
 
 
 def test_starting_again_says_how_much_history_comes_back() -> None:

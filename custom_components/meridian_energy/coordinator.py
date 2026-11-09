@@ -87,6 +87,7 @@ from .models import (
     MeridianSyncData,
     PropertySyncResult,
 )
+from .parsers import SHAPE_EMPTY, SHAPE_MISSING, SHAPE_NOT_BOOL, SHAPE_NOT_TEXT
 from .statistics import (
     account_key,
     async_stored_hours,
@@ -180,10 +181,29 @@ _LOST_RANK = {
     "prices_no_agreement": 1,
 }
 
-# Payments that are not a payment made: a FAILED one, which Meridian's app
-# shows as a failed auto-pay, never as paid, and, to be safe, PROMISE_BROKEN,
-# DELETED and PROMISED, a promise to pay.
-_NOT_PAID = frozenset({"FAILED", "PROMISE_BROKEN", "DELETED", "PROMISED"})
+# The payments that count as made: every status Meridian is known to send
+# but FAILED, which Meridian's app shows as a failed auto-pay, never as paid,
+# and, to be safe, PROMISE_BROKEN, DELETED and PROMISED, a promise to pay. A
+# payment whose status is missing, or not one Meridian is known to send, is
+# left out too, to be safe.
+_PAID = frozenset(
+    {
+        "SCHEDULED",
+        "PENDING",
+        "CLEARED",
+        "FULFILLED",
+        "HISTORIC",
+        "THIRD_PARTY",
+        "REQUESTED",
+    }
+)
+# Answers that refuse a request but say nothing of its dates: a 401 after the
+# session was renewed, a 403, and KT-CT-1112 alone (no Authorization header).
+# On an older window they make it wait, as a failure does, never end the fill.
+_NOT_A_DATE_REFUSAL = frozenset({401, 403})
+_MISSING_HEADER_CODES = frozenset({"KT-CT-1112"})
+# The shapes of a price with no text to mask, which the log says as words.
+_SHAPE_WORDS = frozenset({SHAPE_MISSING, SHAPE_NOT_TEXT, SHAPE_EMPTY, SHAPE_NOT_BOOL})
 # Each price's name in the log, and its sensor's, by the sensor's key.
 _PRICE_NAMES = {"daily_charge": "daily charge", "anytime_price": "anytime price"}
 _PRICE_SENSORS = {"daily_charge": "Daily charge", "anytime_price": "Anytime price"}
@@ -1300,6 +1320,10 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 billing.due,
                 now + BILL_DAYS_INTERVAL if ended else local_midnight(last.end + _DAY),
             )
+        if billing.at is not None and billing.value is None and not billing.failing:
+            # Meridian answered with no billing options: the day totals got
+            # for the period before are no bill's any more.
+            self._extras.pop(("days", number), None)
         bill = await self._async_bill(account, period, failed, now, lost)
         billing.lost = period is None and (billing.failing or (ended and billing.lost))
         if billing.lost:
@@ -1345,7 +1369,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 (
                     payment
                     for payment in balance.payments
-                    if payment.paid_on <= today and payment.status not in _NOT_PAID
+                    if payment.paid_on <= today and payment.status in _PAID
                 ),
                 key=attrgetter("paid_on"),
                 default=None,
@@ -1560,11 +1584,12 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 continue
             self._prices_noted.add((item.key, item.field))
             _LOGGER.warning(
-                "Meridian Energy can't read the %s in %s, which looks like %s; "
-                "%s shows unknown",
+                "Meridian Energy can't read the %s in %s, which %s; %s shows unknown",
                 _PRICE_NAMES[item.key],
                 item.field,
-                repr(item.shape),
+                f"is {item.shape}"
+                if item.shape in _SHAPE_WORDS
+                else f"looks like {item.shape!r} (N a digit, A a letter)",
                 _PRICE_SENSORS[item.key],
             )
 
@@ -1602,12 +1627,21 @@ def _missing(
 
 
 def _is_refusal(err: Exception) -> bool:
-    """Return whether Meridian refused a request: a coded error or a client error."""
+    """
+    Return whether Meridian refused a request's dates.
+
+    That is a coded GraphQL error or a client error, but not a 401 or 403, or
+    KT-CT-1112 alone, which say nothing of the dates asked for.
+    """
     if isinstance(err, MeridianGraphQLError):
-        return not is_service_failure(err.codes) and not QUERY_LIMIT_CODES.intersection(
-            err.codes
+        return (
+            not is_service_failure(err.codes)
+            and not QUERY_LIMIT_CODES.intersection(err.codes)
+            and set(err.codes) != _MISSING_HEADER_CODES
         )
-    return isinstance(err, MeridianRejectedError)
+    return (
+        isinstance(err, MeridianRejectedError) and err.status not in _NOT_A_DATE_REFUSAL
+    )
 
 
 def _error_key(err: BaseException) -> str:

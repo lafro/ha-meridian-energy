@@ -456,8 +456,10 @@ async def test_user_flow_send_errors(hass, error: Exception, expected: str) -> N
         ("OTP_INVALID", "otp_invalid"),
         ("OTP_TOO_MANY_ATTEMPTS", "otp_too_many_attempts"),
         ("OTP_NOT_FOUND", "otp_not_found"),
-        # A refusal named otherwise keeps the form, as a wrong code does.
-        ("OTHER", "otp_invalid"),
+        # A refusal named otherwise, or not named, keeps the form, as a wrong
+        # code does, and says only that the code wasn't accepted.
+        ("OTHER", "otp_refused"),
+        ("", "otp_refused"),
     ],
 )
 @pytest.mark.asyncio
@@ -492,6 +494,9 @@ async def test_otp_service_errors(
         (429, "OTP_TOO_MANY_ATTEMPTS", "otp_too_many_attempts"),
         (429, None, "rate_limited"),
         (400, "OTP_EXPIRED", "otp_expired"),
+        (400, "OTP_INVALID", "otp_invalid"),
+        (400, "SOMETHING_ELSE", "otp_refused"),
+        (400, None, "otp_refused"),
     ],
 )
 @pytest.mark.asyncio
@@ -608,9 +613,9 @@ async def test_reauth_send_errors(hass, error: Exception, expected: str) -> None
     """
     Reauthentication names its failures as setup does, but for the email.
 
-    Its form has no email to correct, so a refused email says code sign-in
-    may not be open to the login yet, or to set Meridian Energy up again
-    with the email now used for MyMeridian.
+    Its form has no email to correct, so a refused email says to try again
+    later, or to set Meridian Energy up again with the email now used for
+    MyMeridian.
     """
     entry = _configured_entry(hass)
     client = MagicMock()
@@ -1117,6 +1122,16 @@ async def test_an_answer_that_refuses_nothing_is_no_answer_at_the_code_step(
         (json_response({"error": "Unprocessable"}, status=422), "cannot_connect"),
         (json_response({}, status=500), "cannot_connect"),
         (_page(502, "text/html"), "cannot_connect"),
+        # A redirect, or anything else short of 2xx, is no answer either.
+        (json_response({}, status=300), "cannot_connect"),
+        (json_response({"sent": True}, status=302), "cannot_connect"),
+        (json_response(["not", "an", "object"], status=300), "cannot_connect"),
+        (Response(b"", status=304, headers={}), "cannot_connect"),
+        (
+            Response(b"", status=300, headers={"Content-Type": "application/json"}),
+            "cannot_connect",
+        ),
+        (_page(300, "text/html"), "cannot_connect"),
     ],
     ids=[
         "404 JSON",
@@ -1136,6 +1151,12 @@ async def test_an_answer_that_refuses_nothing_is_no_answer_at_the_code_step(
         "422 JSON",
         "500 JSON",
         "502 page",
+        "300 JSON object",
+        "302 JSON without Location",
+        "300 JSON not an object",
+        "304 empty",
+        "300 empty JSON",
+        "300 page",
     ],
 )
 @pytest.mark.asyncio
@@ -1161,6 +1182,7 @@ async def test_the_send_code_step_is_decided_by_its_status(
         _page(content_type="text/html"),
         Response(b"", status=204, headers={}),
         json_response({"sent": True}, status=202),
+        _page(202, "text/html"),
     ],
     ids=[
         "success",
@@ -1171,6 +1193,7 @@ async def test_the_send_code_step_is_decided_by_its_status(
         "a web page",
         "204",
         "202",
+        "202 page",
     ],
 )
 @pytest.mark.asyncio

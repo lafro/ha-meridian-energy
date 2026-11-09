@@ -59,6 +59,7 @@ from custom_components.meridian_energy.parsers import (
     optional_local_date,
     parse_firebase_tokens,
 )
+from custom_components.meridian_energy.transport import AnswerNote
 
 from .kraken_fake import NZ
 from .meridian_http import FakeMeridianSession, balance_data, prices_data
@@ -158,10 +159,21 @@ class _FakeSession:
         return self.response
 
 
+def _answered(body: dict[str, Any], status: int = 200) -> AsyncMock:
+    """Return a request answering ``body``, noting its status as the transport does."""
+
+    async def request(*_args: Any, note: AnswerNote | None = None, **_kwargs: Any):
+        if note is not None:
+            note.status = status
+        return body
+
+    return AsyncMock(side_effect=request)
+
+
 @pytest.mark.asyncio
 async def test_send_otp() -> None:
     client = MeridianApiClient(MagicMock())
-    client._async_json_request = AsyncMock(return_value={"success": True})
+    client._async_json_request = _answered({"success": True})
 
     await client.async_send_otp("person@example.com", "journey")
 
@@ -173,13 +185,29 @@ async def test_send_otp() -> None:
 
 
 @pytest.mark.parametrize("answer", [{"success": False}, {}, {"sent": "yes"}])
+@pytest.mark.parametrize("status", [200, 202])
 @pytest.mark.asyncio
-async def test_any_success_status_counts_as_a_sent_code(answer: dict) -> None:
+async def test_any_success_status_counts_as_a_sent_code(
+    answer: dict[str, Any], status: int
+) -> None:
     """The body of a sent code's answer is not read, as in Meridian's app."""
     client = MeridianApiClient(MagicMock())
-    client._async_json_request = AsyncMock(return_value=answer)
+    client._async_json_request = _answered(answer, status)
 
     await client.async_send_otp("person@example.com", "journey")
+
+
+@pytest.mark.parametrize("status", [300, 302, 304])
+@pytest.mark.asyncio
+async def test_a_redirect_to_the_send_code_step_is_no_answer(status: int) -> None:
+    """Whatever its body, only a 2xx answer says the code was sent."""
+    client = MeridianApiClient(MagicMock())
+    client._async_json_request = _answered({"success": True}, status)
+
+    with pytest.raises(MeridianConnectionError) as raised:
+        await client.async_send_otp("person@example.com", "journey")
+
+    assert str(raised.value) == f"Meridian service returned HTTP {status}"
 
 
 @pytest.mark.asyncio

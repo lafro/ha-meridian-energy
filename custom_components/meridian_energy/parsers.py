@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import re
+import unicodedata
 from datetime import UTC, date, datetime, time, timedelta, tzinfo
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -60,6 +61,13 @@ _STANDING, _CONSUMPTION = "STANDING_CHARGE", "CONSUMPTION_CHARGE"
 _PRICE_KEYS = {_STANDING: "daily_charge", _CONSUMPTION: "anytime_price"}
 # The longest shape an unreadable price is shown in, so no worded text is.
 _SHAPE_LENGTH = 24
+# What an unreadable price's shape is instead when there is no text to mask:
+# none, none that is text, only spaces, or a discount flag not true or false.
+# A masked text can't read as one of these.
+SHAPE_MISSING = "missing"
+SHAPE_NOT_TEXT = "not text"
+SHAPE_EMPTY = "empty"
+SHAPE_NOT_BOOL = "not true or false"
 
 
 def parse_firebase_tokens(payload: dict[str, Any]) -> MeridianTokenSet:
@@ -221,8 +229,10 @@ def parse_prices(
     discount, else its text, which must be a dollar amount alone. The band
     gives the unit: NZD per day for the daily charge, per kWh for the
     anytime price. Any other text, or an amount out of range, is None, and
-    is listed in ``unreadable`` with its masked shape. A meter point with
-    no agreement in force says nothing of the plan (``MeridianNoAgreement``).
+    is listed in ``unreadable`` with its masked shape. A price whose
+    ``hasDiscount`` is not true or false is None too, and listed by that
+    field. A meter point with no agreement in force says nothing of the
+    plan (``MeridianNoAgreement``).
     """
     meters = require_list(property_data.get("meterPoints"), "meter points")
     if len(meters) != 1:
@@ -258,9 +268,16 @@ def _price(
     rate: dict[str, Any], band: str, unreadable: list[UnreadablePrice]
 ) -> Decimal | None:
     """Return a rate's price in NZD, or None, noted in ``unreadable``."""
+    has_discount = rate.get("hasDiscount")
+    if not isinstance(has_discount, bool):
+        # Neither text can be said to be the price.
+        unreadable.append(
+            UnreadablePrice(_PRICE_KEYS[band], "hasDiscount", SHAPE_NOT_BOOL)
+        )
+        return None
     field = (
         "formattedRateIncludingTaxIncludingDiscount"
-        if rate.get("hasDiscount") is True
+        if has_discount
         else "formattedRateIncludingTax"
     )
     text = rate.get(field)
@@ -278,31 +295,34 @@ def price_shape(text: Any) -> str:
     """
     Return how a price's text looks, without what it says.
 
-    Digits are N and letters A; other characters are kept, any space as
-    one space and anything unprintable as ``?``. A shape longer than
+    After compatibility normalisation, numbers are N and letters A, in any
+    script; any space is one space, and a combining mark or anything
+    unprintable ``?``. Other characters are kept. A shape longer than
     ``_SHAPE_LENGTH`` is cut short, ending in an ellipsis.
     """
     if text is None:
-        return "missing"
+        return SHAPE_MISSING
     if not isinstance(text, str):
-        return "not text"
-    shape = "".join(
-        "N"
-        if char.isdigit()
-        else "A"
-        if char.isalpha()
-        else " "
-        if char.isspace()
-        else char
-        if char.isprintable()
-        else "?"
-        for char in text.strip()
-    )
+        return SHAPE_NOT_TEXT
+    shape = "".join(map(_masked, unicodedata.normalize("NFKC", text.strip())))
     if not shape:
-        return "empty"
+        return SHAPE_EMPTY
     if len(shape) > _SHAPE_LENGTH:
         return shape[: _SHAPE_LENGTH - 1] + "…"
     return shape
+
+
+def _masked(char: str) -> str:
+    """Return one character of a price's shape."""
+    if char.isnumeric():
+        return "N"
+    if char.isalpha():
+        return "A"
+    if char.isspace():
+        return " "
+    if unicodedata.category(char).startswith("M") or not char.isprintable():
+        return "?"
+    return char
 
 
 def _measurement_channel_id(filters: dict[str, Any]) -> str:
