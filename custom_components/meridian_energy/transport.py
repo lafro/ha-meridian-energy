@@ -5,6 +5,7 @@ from __future__ import annotations
 import json as json_module
 import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from time import monotonic
@@ -55,9 +56,12 @@ class MeridianHttpError(MeridianTransportError):
     """
     Meridian returned an unsuccessful HTTP status.
 
-    ``json_body`` says the body was JSON, as Meridian's own errors are; a
-    gateway's error page is not. ``error_class`` names the network library's
-    error when the body failed after the status had arrived.
+    ``json_body`` says the body was JSON, as Meridian's own errors are
+    assumed to be; a gateway's error page is taken not to be. ``html_body``
+    says it was a web page, by its Content-Type or its first character.
+    ``error_class`` names the network library's error when the body failed
+    after the status had arrived. ``retry_after_given`` says whether the
+    answer carried Retry-After.
     """
 
     def __init__(
@@ -68,12 +72,24 @@ class MeridianHttpError(MeridianTransportError):
         *,
         error_class: str | None = None,
         json_body: bool = False,
+        html_body: bool = False,
+        retry_after_given: bool = False,
     ) -> None:
         super().__init__(f"Meridian returned HTTP {status}", error_class=error_class)
         self.status = status
         self.payload = payload
         self.retry_after = retry_after
         self.json_body = json_body
+        self.html_body = html_body
+        self.retry_after_given = retry_after_given
+
+
+@dataclass(slots=True)
+class AnswerNote:
+    """What an answer said besides its body: its status, and any Retry-After."""
+
+    status: int | None = None
+    retry_after_given: bool = False
 
 
 class _Head(NamedTuple):
@@ -82,6 +98,7 @@ class _Head(NamedTuple):
     status: int
     content: str
     retry_after: float
+    retry_after_given: bool
 
 
 class MeridianTransport:
@@ -100,6 +117,7 @@ class MeridianTransport:
         data: dict[str, str] | None = None,
         headers: dict[str, str] | None = None,
         context: str = "",
+        note: AnswerNote | None = None,
     ) -> dict[str, Any]:
         """
         Post a request and return a validated JSON object.
@@ -111,7 +129,9 @@ class MeridianTransport:
         which can hold the URL. Making the connection has its own limit, so a
         connection never made is a network error, never a timeout of
         Meridian's answer. An unsuccessful status that arrived before its
-        body failed is the answer: it is raised as that HTTP error.
+        body failed is the answer: it is raised as that HTTP error. ``note``,
+        when given, records the answer's status and whether it carried
+        Retry-After.
         """
         started = monotonic()
         head: _Head | None = None
@@ -128,13 +148,16 @@ class MeridianTransport:
             ) as response:
                 response_headers = getattr(response, "headers", {})
                 status = response.status
+                retry_after = _header(response_headers, "retry-after")
                 head = _Head(
                     status=status,
                     content=_content_class(_header(response_headers, "content-type")),
-                    retry_after=parse_retry_after(
-                        _header(response_headers, "retry-after")
-                    ),
+                    retry_after=parse_retry_after(retry_after),
+                    retry_after_given=bool(retry_after.strip()),
                 )
+                if note is not None:
+                    note.status = status
+                    note.retry_after_given = head.retry_after_given
                 body = await response.read()
         except (ClientError, TimeoutError) as err:
             # ConnectionTimeoutError is the connect limit: nothing reached
@@ -162,7 +185,13 @@ class MeridianTransport:
         except ValueError as err:
             if status >= _HTTP_BAD_REQUEST:
                 # An error page is not expected to be JSON; its status says it all.
-                raise MeridianHttpError(status, {}, head.retry_after) from None
+                raise MeridianHttpError(
+                    status,
+                    {},
+                    head.retry_after,
+                    html_body=head.content == "html" or body.lstrip()[:1] == b"<",
+                    retry_after_given=head.retry_after_given,
+                ) from None
             raise MeridianUnreadableResponseError(status, head.content) from err
         if status >= _HTTP_BAD_REQUEST:
             raise MeridianHttpError(
@@ -170,6 +199,8 @@ class MeridianTransport:
                 payload if isinstance(payload, dict) else {},
                 head.retry_after,
                 json_body=payload is not None,
+                html_body=payload is None and head.content == "html",
+                retry_after_given=head.retry_after_given,
             )
         return require_mapping(payload, "HTTP response")
 
@@ -200,7 +231,12 @@ def _status_failure(head: _Head | None, err: Exception) -> MeridianHttpError | N
     if head is None or head.status < _HTTP_BAD_REQUEST:
         return None
     return MeridianHttpError(
-        head.status, {}, head.retry_after, error_class=type(err).__name__
+        head.status,
+        {},
+        head.retry_after,
+        error_class=type(err).__name__,
+        html_body=head.content == "html",
+        retry_after_given=head.retry_after_given,
     )
 
 

@@ -36,6 +36,7 @@ from .meridian_http import (
     ACCOUNT_NUMBER,
     FakeMeridianSession,
     Response,
+    account_data,
     json_response,
     property_id,
 )
@@ -63,6 +64,14 @@ def _coded(*codes: str | None) -> Response:
                 for code in codes
             ]
         }
+    )
+
+
+def _ended(status: int = 401, code: str = "KT-CT-1124") -> Response:
+    """Return an answer whose body says the session has ended."""
+    return json_response(
+        {"errors": [{"message": "Synthetic", "extensions": {"errorCode": code}}]},
+        status=status,
     )
 
 
@@ -172,11 +181,14 @@ async def test_an_hour_too_large_to_add_is_unusable_data(
     assert failure.value.translation_placeholders == {"detail": "unexpected data"}
 
 
-async def test_a_json_rejection_after_a_fresh_session_ends_the_sign_in(
-    hass: HomeAssistant,
+@pytest.mark.parametrize(
+    "code", ["KT-CT-1111", "KT-CT-1120", "KT-CT-1124", "KT-CT-1143"]
+)
+async def test_a_session_code_in_a_401_after_a_renewal_ends_the_sign_in(
+    hass: HomeAssistant, code: str
 ) -> None:
     session = FakeMeridianSession(NOW)
-    session.hook = _measurements(json_response({"error": "Synthetic"}, status=401))
+    session.hook = _measurements(_ended(code=code))
     coordinator = coordinator_for(hass, session)
 
     with pytest.raises(ConfigEntryAuthFailed) as failure:
@@ -185,6 +197,40 @@ async def test_a_json_rejection_after_a_fresh_session_ends_the_sign_in(
     assert failure.value.translation_key == "invalid_auth"
     # The session was renewed once before.
     assert session.operations.count("measurements") == 2
+
+
+@pytest.mark.parametrize(
+    ("answer", "detail"),
+    [
+        (json_response({"error": "Synthetic"}, status=401), "HTTP 401"),
+        (_ended(code="KT-CT-1112"), "HTTP 401, KT-CT-1112"),
+        (_ended(status=403), "HTTP 403, KT-CT-1124"),
+        (json_response({"error": "Synthetic"}, status=403), "HTTP 403"),
+    ],
+    ids=["401", "401 KT-CT-1112", "403 KT-CT-1124", "403"],
+)
+async def test_a_refused_request_is_no_ended_sign_in(
+    hass: HomeAssistant, answer: Response, detail: str
+) -> None:
+    """
+    A 403, or a 401 without a code that ends the session, is a refusal.
+
+    A 401 is sent once more with a renewed session; a 403 is not sent again.
+    The update fails, worded as Meridian refusing the request, and no
+    reauthentication starts.
+    """
+    session = FakeMeridianSession(NOW)
+    session.hook = _measurements(answer)
+    coordinator = coordinator_for(hass, session)
+
+    with pytest.raises(UpdateFailed) as failure:
+        await sync(coordinator, NOW, session)
+
+    assert failure.value.translation_key == "invalid_data"
+    assert failure.value.translation_placeholders == {"detail": detail}
+    assert session.operations.count("measurements") == (
+        2 if answer.status == 401 else 1
+    )
 
 
 async def test_a_gateway_page_refusing_a_fresh_session_is_a_refusal(
@@ -530,10 +576,69 @@ async def test_no_account_raises_the_notice_at_once_and_removal_clears_it(
     assert registry.async_get_issue(DOMAIN, issue_id) is None
 
 
+async def test_an_account_with_no_property_has_a_notice_of_its_own(
+    hass: HomeAssistant,
+) -> None:
+    """Listed, but with no property to follow."""
+    entry = _entry(hass)
+    session = FakeMeridianSession(NOW)
+    session.hook = lambda operation, _variables: (
+        json_response({"data": {"account": {**account_data(), "properties": []}}})
+        if operation == "account"
+        else None
+    )
+    coordinator = coordinator_for(hass, session, config_entry=entry)
+
+    with pytest.raises(UpdateFailed) as failure:
+        await sync(coordinator, NOW, session)
+
+    assert failure.value.translation_key == "no_properties"
+    issue = ir.async_get(hass).async_get_issue(DOMAIN, f"sync_failing_{entry.entry_id}")
+    assert issue is not None
+    assert "but no property on it" in issue.translation_placeholders["reason"]
+
+
+async def test_a_first_sync_whose_only_property_cannot_be_read_tries_again(
+    hass: HomeAssistant,
+) -> None:
+    """
+    Nothing says Meridian lists no property, so no notice says so.
+
+    It is data that can't be read, tried again as any failed first sync is,
+    with the notice after the third failure; the first answer that reads
+    is followed.
+    """
+    entry = _entry(hass)
+    session = FakeMeridianSession(NOW)
+    account = account_data()
+    account["properties"][0]["id"] = None
+    session.hook = lambda operation, _variables: (
+        json_response({"data": {"account": account}})
+        if operation == "account"
+        else None
+    )
+    coordinator = coordinator_for(hass, session, config_entry=entry)
+    registry = ir.async_get(hass)
+    issue_id = f"sync_failing_{entry.entry_id}"
+
+    for update in range(3):
+        assert registry.async_get_issue(DOMAIN, issue_id) is None
+        with pytest.raises(UpdateFailed) as failure:
+            await sync(coordinator, NOW + update * HOUR, session)
+        assert failure.value.translation_key == "invalid_data"
+    assert registry.async_get_issue(DOMAIN, issue_id) is not None
+
+    session.hook = lambda _operation, _variables: None
+    data = await sync(coordinator, NOW + 3 * HOUR, session)
+
+    assert data.property_count == 1
+    assert registry.async_get_issue(DOMAIN, issue_id) is None
+
+
 async def test_an_ended_sign_in_never_raises_the_notice(hass: HomeAssistant) -> None:
     entry = _entry(hass)
     session = FakeMeridianSession(NOW)
-    session.hook = _measurements(json_response({}, status=401))
+    session.hook = _measurements(_ended())
     coordinator = coordinator_for(hass, session, config_entry=entry)
 
     for update in range(4):
@@ -550,7 +655,11 @@ async def test_an_ended_sign_in_never_raises_the_notice(hass: HomeAssistant) -> 
     ("answer", "accounts", "error", "key"),
     [
         (None, (), ConfigEntryNotReady, "no_accounts"),
-        (json_response({}, status=401), None, ConfigEntryAuthFailed, "invalid_auth"),
+        (_ended(), None, ConfigEntryAuthFailed, "invalid_auth"),
+        (_coded("KT-CT-1120"), None, ConfigEntryAuthFailed, "invalid_auth"),
+        (json_response({}, status=401), None, ConfigEntryNotReady, "invalid_data"),
+        (json_response({}, status=403), None, ConfigEntryNotReady, "invalid_data"),
+        (_coded("KT-CT-1112"), None, ConfigEntryNotReady, "invalid_data"),
         (Response(b"", status=429), None, ConfigEntryNotReady, "rate_limited"),
         (json_response({}, status=504), None, ConfigEntryNotReady, "cannot_connect"),
         (_coded("KT-CT-4321"), None, ConfigEntryNotReady, "invalid_data"),
@@ -576,6 +685,43 @@ async def test_setup_maps_each_failure_of_the_account_list(
 
     assert getattr(failure.value, "translation_key", None) == key
     assert str(failure.value) != key
+
+
+@pytest.mark.parametrize(
+    ("answer", "said"),
+    [
+        (
+            Response(b"", status=429, headers={"Retry-After": "60"}),
+            "(HTTP 429, no code, with Retry-After)",
+        ),
+        (Response(b"", status=429), "(HTTP 429, no code, without Retry-After)"),
+        (_coded("KT-CT-1199"), "(HTTP 200, KT-CT-1199, without Retry-After)"),
+    ],
+    ids=["429 with Retry-After", "429 without", "in band"],
+)
+async def test_a_rate_limit_at_setup_is_noted_with_what_its_answer_said(
+    hass: HomeAssistant,
+    caplog: pytest.LogCaptureFixture,
+    answer: Response,
+    said: str,
+) -> None:
+    """Setup is tried again later; the log keeps the limit's form."""
+    caplog.set_level(logging.INFO, logger="custom_components.meridian_energy")
+    session = FakeMeridianSession(NOW)
+    session.hook = lambda operation, _variables: (
+        answer if operation == "accountsList" else None
+    )
+    coordinator = coordinator_for(hass, session)
+
+    with pytest.raises(ConfigEntryNotReady):
+        await coordinator.async_prepare_topology()
+
+    assert [m for m in caplog.messages if "asked Meridian Energy to wait" in m] == [
+        (
+            f"Meridian asked Meridian Energy to wait {said}; Home Assistant tries "
+            "setting it up again later"
+        )
+    ]
 
 
 async def test_an_entry_that_cannot_reach_meridian_retries_setup(

@@ -26,6 +26,8 @@
             'total_due': True,
           }),
           'price_sensors': True,
+          'unreadable_prices': dict({
+          }),
         }),
       ]),
       'extras': dict({
@@ -62,7 +64,9 @@
           }),
         }),
       ]),
+      'rate_limits': 2,
       'requests': 5,
+      'skipped_account_count': 1,
       'sync_duration_seconds': 12.346,
       'synced_at': HAFakeDatetime(2026, 7, 15, 1, 0, tzinfo=datetime.timezone.utc),
       'units': list([

@@ -13,6 +13,7 @@ from pytest_homeassistant_custom_component.syrupy import (
 )
 from syrupy.assertion import SnapshotAssertion
 
+from custom_components.meridian_energy import api as api_module
 from custom_components.meridian_energy import coordinator as coordinator_module
 
 # ha_deprecations fails the run on any deprecation Home Assistant reports for
@@ -60,12 +61,17 @@ def recorder_stand_in(request: pytest.FixtureRequest) -> Generator[SimpleNamespa
 @pytest.fixture(autouse=True)
 def waits() -> Generator[AsyncMock]:
     """
-    Make the coordinator's waits between requests return at once.
+    Make the waits between requests return at once.
 
-    Requests are paced at least 1 s apart and a resend waits 2-5 s. The
-    returned mock records each wait asked for, so a test can check them.
+    The coordinator paces requests at least 1 s apart, and the client waits
+    2-5 s before a resend. The returned mock records each wait asked for,
+    so a test can check them.
     """
-    with patch.object(coordinator_module, "_async_wait", new=AsyncMock()) as wait:
+    wait = AsyncMock()
+    with (
+        patch.object(coordinator_module, "_async_wait", new=wait),
+        patch.object(api_module, "_async_wait", new=wait),
+    ):
         yield wait
 
 

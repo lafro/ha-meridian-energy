@@ -249,3 +249,18 @@ def test_the_setup_dialog_is_brief() -> None:
     config = _source_strings()["config"]
     for text in _texts(config):
         assert len(text) <= 250, text
+
+
+def test_a_refusal_claims_no_cause_meridian_does_not_give() -> None:
+    """A refused email or a missing code says only what the refusal shows."""
+    errors = _source_strings()["config"]["error"]
+    # A new email refused for code sign-in may still be the right one: code
+    # sign-in may not be open to its login yet, or it is another brand's.
+    assert "another brand" in errors["email_not_found"]
+    # The email of an entry that has signed in before gives neither reason.
+    assert "try again later" in errors["reauth_email_refused"]
+    assert "yet" not in errors["reauth_email_refused"]
+    # A code not found says nothing of whether it was used, and a refusal
+    # Meridian doesn't name says only that the code wasn't accepted.
+    assert "used" not in errors["otp_not_found"]
+    assert "isn't right" not in errors["otp_refused"]

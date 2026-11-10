@@ -383,8 +383,8 @@ def billing_data(period: tuple[date, date] | None = None) -> dict[str, Any]:
     return {
         "billingOptions": {
             "periodLength": "MONTHLY",
-            "periodLengthMultiplier": 1,
-            "isFixed": False,
+            "periodLengthMultiplier": None,
+            "isFixed": True,
             "currentBillingPeriodStartDate": start and start.isoformat(),
             "currentBillingPeriodEndDate": end and end.isoformat(),
             "nextBillingDate": end and (end + timedelta(days=1)).isoformat(),
@@ -432,9 +432,7 @@ def balance_data(today: date) -> dict[str, Any]:
     }
 
 
-def prices_data(
-    daily: str = "$2.000000 /day", anytime: str = "$0.300000 /kWh"
-) -> dict[str, Any]:
+def prices_data(daily: str = "$2.000000", anytime: str = "$0.300000") -> dict[str, Any]:
     """Return a synthetic all-day plan: one daily charge and one price per kWh."""
     return {
         "meterPoints": [

@@ -15,12 +15,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import random
 from collections import Counter
-from collections.abc import Awaitable, Callable, Collection, Iterable
+from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, date, datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from functools import partial
 from operator import attrgetter
 from time import monotonic
@@ -34,6 +33,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 from sqlalchemy.exc import SQLAlchemyError
 
 from .api import (
+    InvertedPeriodError,
     MeridianApiClient,
     MeridianAuthenticationError,
     MeridianConnectionError,
@@ -41,9 +41,13 @@ from .api import (
     MeridianGraphQLError,
     MeridianRateLimitError,
     MeridianRejectedError,
+    MeridianSignInServiceError,
+    MeridianSignInServiceUnreadableError,
     MeridianUpstreamError,
-    exception_chain,
     http_status,
+    is_passing_failure,
+    is_unreadable,
+    log_rate_limit,
 )
 from .const import (
     BALANCE_INTERVAL,
@@ -67,8 +71,6 @@ from .const import (
     READING_GENERATION,
     RECENT_DATES,
     TOPOLOGY_CACHE_INTERVAL,
-    TRANSIENT_RESEND_DELAY_SECONDS,
-    TRANSIENT_STATUSES,
     UPDATE_INTERVAL,
 )
 from .graphql import QUERY_LIMIT_CODES, is_service_failure, shown_codes
@@ -79,11 +81,13 @@ from .models import (
     MeridianBalance,
     MeridianBillingPeriod,
     MeridianMeasurement,
+    MeridianNoAgreement,
     MeridianPrices,
     MeridianProperty,
     MeridianSyncData,
     PropertySyncResult,
 )
+from .parsers import SHAPE_EMPTY, SHAPE_MISSING, SHAPE_NOT_BOOL, SHAPE_NOT_TEXT
 from .statistics import (
     account_key,
     async_stored_hours,
@@ -94,7 +98,6 @@ from .statistics import (
     generation_ids,
     property_key,
 )
-from .transport import MeridianUnreadableResponseError
 from .windows import (
     HOUR,
     MeasurementWindow,
@@ -111,11 +114,12 @@ _LOGGER = logging.getLogger(__name__)
 _DAY = timedelta(days=1)
 _ACTUAL = "ACTUAL"
 _CENTS_PER_DOLLAR = Decimal(100)
-# A request that failed in a way that may pass is sent once more.
-_SENDS = 2
+# The bill figures' step: each is rounded to it once summed.
+_HUNDREDTH = Decimal("0.01")
 _LABELS = {READING_CONSUMPTION: "grid import", READING_GENERATION: "grid export"}
 # How often each kind of an account's other figures is asked for. A failed
-# one is asked again after as long, and its value is kept for two of these.
+# one is asked again after as long, or at the next update after a failure
+# that may pass, and its value is kept for two of these.
 _INTERVALS = {
     "billing": BILLING_CACHE_INTERVAL,
     "days": BILL_DAYS_INTERVAL,
@@ -135,18 +139,25 @@ _EXTRA_LOST = {
     "using the one it has",
     "billing": "Meridian Energy couldn't get the billing period; the billing "
     "period sensors show unknown until it can",
+    "billing_so_far": "Meridian Energy couldn't get the billing period; the "
+    "billing period and 'so far' sensors show unknown until it can",
     "billing_bill": "Meridian Energy couldn't get the billing period; the billing "
     "period and bill sensors show unknown until it can",
     "days": "Meridian Energy couldn't get the bill's day totals; the 'so far' "
     "sensors show unknown until it can",
     "days_all": "Meridian Energy couldn't get the bill's day totals; the bill "
     "sensors show unknown until it can",
+    "days_skipped": "Meridian Energy can't read one of the properties Meridian "
+    "lists on an account; that account's bill sensors show unknown until it can",
     "balance": "Meridian Energy couldn't get the balance; Total due, Last bill "
     "and Last payment show unknown until it can",
     "prices": "Meridian Energy couldn't get the prices; Daily charge and Anytime "
     "price show unknown until it can",
-    "prices_unanswered": "Meridian Energy couldn't get the prices; it asks again "
-    "in a day",
+    "prices_unanswered": "Meridian Energy couldn't get the prices; it asks again later",
+    "prices_no_agreement": "Meridian lists no plan in force for the meter; "
+    "Meridian Energy asks again later",
+    "estimate": "Meridian's day totals leave out a date of the billing period; "
+    "Bill estimate shows unknown until they don't",
 }
 _EXTRA_BACK = {
     "accounts": "Meridian Energy has refreshed the list of accounts again",
@@ -154,17 +165,48 @@ _EXTRA_BACK = {
     "days": "Meridian Energy is getting the bill's day totals again",
     "balance": "Meridian Energy is getting the balance again",
     "prices": "Meridian Energy is getting the prices again",
+    "estimate": "Meridian's day totals cover the billing period again",
 }
 # How much each lost line leaves unknown: across accounts, the wider is said.
 _LOST_RANK = {
     "billing": 0,
-    "billing_bill": 1,
+    "billing_so_far": 1,
+    "billing_bill": 2,
     "days": 0,
     "days_all": 1,
+    "days_skipped": 2,
     "balance": 0,
     "prices_unanswered": 0,
     "prices": 1,
+    "prices_no_agreement": 1,
 }
+
+# The payments that count as made: every status Meridian is known to send
+# but FAILED, which Meridian's app shows as a failed auto-pay, never as paid,
+# and, to be safe, PROMISE_BROKEN, DELETED and PROMISED, a promise to pay. A
+# payment whose status is missing, or not one Meridian is known to send, is
+# left out too, to be safe.
+_PAID = frozenset(
+    {
+        "SCHEDULED",
+        "PENDING",
+        "CLEARED",
+        "FULFILLED",
+        "HISTORIC",
+        "THIRD_PARTY",
+        "REQUESTED",
+    }
+)
+# Answers that refuse a request but say nothing of its dates: a 401 after the
+# session was renewed, a 403, and KT-CT-1112 alone (no Authorization header).
+# On an older window they make it wait, as a failure does, never end the fill.
+_NOT_A_DATE_REFUSAL = frozenset({401, 403})
+_MISSING_HEADER_CODES = frozenset({"KT-CT-1112"})
+# The shapes of a price with no text to mask, which the log says as words.
+_SHAPE_WORDS = frozenset({SHAPE_MISSING, SHAPE_NOT_TEXT, SHAPE_EMPTY, SHAPE_NOT_BOOL})
+# Each price's name in the log, and its sensor's, by the sensor's key.
+_PRICE_NAMES = {"daily_charge": "daily charge", "anytime_price": "anytime price"}
+_PRICE_SENSORS = {"daily_charge": "Daily charge", "anytime_price": "Anytime price"}
 
 type UnitKey = tuple[str, str]
 
@@ -180,7 +222,11 @@ def _utcnow() -> datetime:
 
 
 class _NoAccountsError(Exception):
-    """Meridian listed no active or dormant account, or no property, to follow."""
+    """Meridian listed no active or dormant account to follow."""
+
+
+class _NoPropertiesError(_NoAccountsError):
+    """Meridian listed accounts to follow, but no property on any of them."""
 
 
 @dataclass(slots=True)
@@ -279,11 +325,19 @@ class _Extra:
 
 
 class _Bill(NamedTuple):
-    """A bill's figures from the day totals, and the period they are for."""
+    """
+    A bill's figures from the day totals, and the period they are for.
+
+    ``whole`` says whether the grid import's day totals held every date of
+    the period; ``retry`` that its grid export failed in a way that may
+    pass, so the day totals are asked for again at the next update.
+    """
 
     start: date
     end: date
     figures: BillFigures
+    whole: bool = True
+    retry: bool = False
 
 
 class _Outcome(NamedTuple):
@@ -320,9 +374,17 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         self._extras_lost: dict[str, str] = {}
         self._synced = False
         self._first_sync_failures = self._rate_limits = self._failed_updates = 0
+        # Every rate limit met since the entry loaded; _rate_limits counts
+        # those in a row.
+        self.rate_limits_met = 0
         self._rate_limit: MeridianRateLimitError | None = None
         self._requests = 0
         self._last_request: float | None = None
+        # The properties whose unread feed-in flag was logged, by whether
+        # what was read before was kept.
+        self._feed_in_noted: set[tuple[str, bool]] = set()
+        # The prices whose text couldn't be read, by sensor key and field.
+        self._prices_noted: set[tuple[str, str]] = set()
 
     @property
     def accounts(self) -> tuple[MeridianAccount, ...]:
@@ -390,6 +452,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 translation_domain=DOMAIN, translation_key="invalid_auth"
             ) from err
         except (_NoAccountsError, MeridianError, ValueError) as err:
+            if isinstance(err, MeridianRateLimitError):
+                log_rate_limit(err, "Home Assistant tries setting it up again later")
             raise ConfigEntryNotReady(
                 translation_domain=DOMAIN,
                 translation_key=_error_key(err),
@@ -412,10 +476,30 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         try:
             data = await self._async_sync(_utcnow())
         except MeridianAuthenticationError as err:
+            if self._removed:
+                # A refresh that outlived the entry's removal, as one
+                # update_entity asked for can, starts no reauthentication.
+                return self._removed_failure(
+                    UpdateFailed(
+                        translation_domain=DOMAIN, translation_key="invalid_auth"
+                    ),
+                    err,
+                )
             raise ConfigEntryAuthFailed(
                 translation_domain=DOMAIN, translation_key="invalid_auth"
             ) from err
         except (_NoAccountsError, MeridianError, ValueError) as err:
+            if self._removed:
+                # Nor does it log a failure, raise a notice or count a rate
+                # limit: the entry is gone.
+                return self._removed_failure(
+                    UpdateFailed(
+                        translation_domain=DOMAIN,
+                        translation_key=_error_key(err),
+                        translation_placeholders={"detail": _error_detail(err)},
+                    ),
+                    err,
+                )
             failure = UpdateFailed(
                 translation_domain=DOMAIN,
                 translation_key=_error_key(err),
@@ -423,7 +507,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 retry_after=self._failure_wait(err, first_sync=first_sync),
             )
             self._note_failed_update(
-                failure, no_accounts=_error_key(err) == "no_accounts"
+                failure, no_accounts=isinstance(err, _NoAccountsError)
             )
             raise failure from err
         self._synced = True
@@ -432,10 +516,34 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             ir.async_delete_issue(self.hass, DOMAIN, self._issue_id)
         return data
 
+    def _removed_failure(
+        self, failure: UpdateFailed, err: Exception
+    ) -> MeridianSyncData:
+        """
+        End a failed refresh of a removed entry as quietly as it can be.
+
+        A failure after a success is the one Home Assistant logs, so it is
+        not raised: the data is kept. After a failure it is raised, waiting
+        no longer and counted nowhere, so Home Assistant logs nothing, where
+        returning would have it log a recovery that never came.
+        """
+        if self.last_update_success:
+            return self.data
+        raise failure from err
+
     @property
     def _issue_id(self) -> str:
         entry_id = self.config_entry.entry_id if self.config_entry else ""
         return f"sync_failing_{entry_id}"
+
+    @property
+    def _removed(self) -> bool:
+        """Return whether the entry is gone, as during a refresh that outlived it."""
+        entry = self.config_entry
+        return (
+            entry is not None
+            and self.hass.config_entries.async_get_entry(entry.entry_id) is None
+        )
 
     def _note_failed_update(self, failure: UpdateFailed, *, no_accounts: bool) -> None:
         """
@@ -445,8 +553,12 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         that follows a failure.
         """
         self._failed_updates += 1
-        if self.config_entry is None or not (
-            no_accounts or self._failed_updates >= FAILED_UPDATES_BEFORE_ISSUE
+        if (
+            self.config_entry is None
+            # A refresh that outlived the entry's removal, as one update_entity
+            # asked for can, leaves no notice behind.
+            or self._removed
+            or not (no_accounts or self._failed_updates >= FAILED_UPDATES_BEFORE_ISSUE)
         ):
             return
         ir.async_create_issue(
@@ -463,6 +575,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         """Return when a failed update is tried again, None for the usual hour."""
         if isinstance(err, MeridianRateLimitError):
             return self._rate_limit_wait(err)
+        # Any other failure ends a run of rate limits.
+        self._rate_limits = 0
         if not first_sync:
             return None
         wait = FIRST_SYNC_RETRY_SCHEDULE[
@@ -472,8 +586,16 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         return wait
 
     def _rate_limit_wait(self, err: MeridianRateLimitError) -> float:
-        """Return Meridian's wait, doubled for each rate limit in a row, up to a day."""
+        """
+        Return Meridian's wait, doubled for each rate limit in a row, up to a day.
+
+        The first of a run of limits is logged at INFO with what its answer
+        said, so a real limit leaves a trace of its form.
+        """
         self._rate_limits += 1
+        self.rate_limits_met += 1
+        if self._rate_limits == 1:
+            log_rate_limit(err, "it waits before its next update")
         doubled = err.retry_after * 2 ** min(5, self._rate_limits - 1)
         return float(min(MAX_RETRY_AFTER_SECONDS, doubled))
 
@@ -486,7 +608,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         accounts = await self._async_get_topology(now)
         units = self._units(accounts)
         if not units:
-            raise _NoAccountsError
+            # The accounts are listed, but no property on any of them.
+            raise _NoPropertiesError
         outcome = _Outcome([], [])
         for unit in units:
             try:
@@ -505,8 +628,8 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 unit.memory.failure = None
         self._settle(outcome)
         failed = {
-            (property_key(unit.account_number, unit.property_id), unit.direction)
-            for unit, _err in outcome.failed
+            (property_key(unit.account_number, unit.property_id), unit.direction): err
+            for unit, err in outcome.failed
         }
         account_results = await self._async_account_results(accounts, failed, now)
         if self._rate_limit is None:
@@ -572,7 +695,9 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 key = property_key(account.number, property_data.id)
                 suffix = place = ""
                 if count > 1:
-                    suffix = f" — {_one_line_address(property_data.address)}"
+                    # Labelled by address, or by position without one.
+                    address = _one_line_address(property_data.address or "")
+                    suffix = f" — {address or f'property {number} of {count}'}"
                     place = f" for property {number} of {count}"
                 for direction, ids in _directions(key, property_data):
                     units.append(
@@ -876,32 +1001,22 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
     async def _async_request(
         self, unit: _Unit, window: MeasurementWindow, now: datetime
     ) -> tuple[MeridianMeasurement, ...]:
-        """Ask for one window, resending once after a failure that may pass."""
+        """Ask for one window; the client resends a page after a passing failure."""
         today = nz_date(now)
         context = (
             f"{unit.kind.replace(' ', '_')} "
             f"window={(window.start_on - today).days}..{(window.end_on - today).days}d"
         )
-        for attempt in range(_SENDS):
-            try:
-                return await self.client.async_get_window(
-                    account_number=unit.account_number,
-                    property_id=unit.property_id,
-                    direction=unit.direction,
-                    start_on=window.start_on,
-                    end_on=window.end_on,
-                    last=window.last,
-                    pace=self._async_pace,
-                    context=context,
-                )
-            except MeridianConnectionError as err:
-                if attempt == _SENDS - 1 or not _is_transient(err):
-                    raise
-                _LOGGER.debug(
-                    "Resending a request that failed (%s)", _error_detail(err)
-                )
-                await _async_wait(random.uniform(*TRANSIENT_RESEND_DELAY_SECONDS))  # noqa: S311
-        raise AssertionError  # pragma: no cover - the loop returns or raises
+        return await self.client.async_get_window(
+            account_number=unit.account_number,
+            property_id=unit.property_id,
+            direction=unit.direction,
+            start_on=window.start_on,
+            end_on=window.end_on,
+            last=window.last,
+            pace=self._async_pace,
+            context=context,
+        )
 
     async def _async_pace(self) -> None:
         """Keep the starts of measurements requests at least 1 s apart."""
@@ -942,10 +1057,12 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         """
         Return every account to follow, asking Meridian once they are a day old.
 
-        When asking fails with a cached list, the cached one is kept and
-        asked for again at the next update; a rate limit or an ended sign-in
-        still stops the sync. An empty list is never cached. Fresh accounts
-        wake quiet units.
+        When asking fails, or a property in the answer can't be read, a
+        cached list is kept and asked for again at the next update; a rate
+        limit or an ended sign-in still stops the sync. Without a cached
+        list, one with a property that can't be read is used, and asked for
+        again at the next update. An empty list is never cached. Fresh
+        accounts wake quiet units.
         """
         cached_at = self._topology_cached_at
         if (
@@ -963,13 +1080,70 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 raise
             self._note_extra("accounts", "accounts")
             return self._topology
+        partial = any(account.skipped_properties for account in accounts)
+        if partial and self._topology is not None:
+            self._note_extra("accounts", "accounts")
+            return self._topology
         self._note_extra("accounts", None)
         if not accounts:
             raise _NoAccountsError
+        accounts = self._read_feed_in(accounts)
         self._topology = accounts
-        self._topology_cached_at = now
+        self._topology_cached_at = None if partial else now
         self._prune(accounts)
         return accounts
+
+    def _read_feed_in(
+        self, accounts: tuple[MeridianAccount, ...]
+    ) -> tuple[MeridianAccount, ...]:
+        """
+        Keep a known exporter's feed-in when its flag can't be read.
+
+        A property whose feed-in flag couldn't be read takes its meter
+        points' feed-in from the cached list, by position, so a refresh
+        never drops a known exporter's grid export; with none known, it is
+        taken as not exporting. Either is logged once at INFO, naming the
+        property as the unit lines do.
+        """
+        known = {
+            property_key(account.number, item.id): item.meter_points
+            for account in self._topology or ()
+            for item in account.properties
+        }
+        count = sum(len(account.properties) for account in accounts)
+        number = 0
+        read: list[MeridianAccount] = []
+        for account in accounts:
+            properties: list[MeridianProperty] = []
+            for item in account.properties:
+                number += 1
+                if not item.feed_in_unread:
+                    properties.append(item)
+                    continue
+                key = property_key(account.number, item.id)
+                before = known.get(key, ())
+                meters = tuple(
+                    replace(meter, has_feed_in=True)
+                    if index < len(before) and before[index].has_feed_in
+                    else meter
+                    for index, meter in enumerate(item.meter_points)
+                )
+                properties.append(replace(item, meter_points=meters))
+                kept = any(meter.has_feed_in for meter in meters)
+                if (key, kept) not in self._feed_in_noted:
+                    self._feed_in_noted.add((key, kept))
+                    _LOGGER.info(
+                        "Meridian Energy can't read whether %s sends power to the "
+                        "grid; %s",
+                        f"property {number} of {count}"
+                        if count > 1
+                        else "the property",
+                        "it keeps what it read before"
+                        if kept
+                        else "it takes it as not",
+                    )
+            read.append(replace(account, properties=tuple(properties)))
+        return tuple(read)
 
     def _prune(self, accounts: tuple[MeridianAccount, ...]) -> None:
         """Forget accounts and units Meridian no longer lists; wake the rest."""
@@ -1008,16 +1182,24 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
     def _property_result(
         self, account: MeridianAccount, property_data: MeridianProperty
     ) -> PropertySyncResult:
-        """Return a property's summary, from its grid import's reading qualities."""
+        """
+        Return a property's summary, from its grid import's reading qualities.
+
+        The latest reading is the end of the newest actual hour: Meridian
+        returns an estimate for every hour that has ended but not been read.
+        """
         key = property_key(account.number, property_data.id)
         memory = self._memory.get((key, READING_CONSUMPTION), _Memory())
         estimated = sorted(
             hour for hour, quality in memory.quality.items() if quality != _ACTUAL
         )
+        actual = [
+            hour for hour, quality in memory.quality.items() if quality == _ACTUAL
+        ]
         return PropertySyncResult(
             property_key=key,
             account_key=account_key(account.number),
-            latest_reading=max(memory.quality) + HOUR if memory.quality else None,
+            latest_reading=max(actual) + HOUR if actual else None,
             estimated_rows=len(estimated),
             oldest_estimated=estimated[0] if estimated else None,
             newest_estimated=estimated[-1] if estimated else None,
@@ -1037,9 +1219,10 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         Ask for one kind of an account's figures when it is due; return it.
 
         A failure keeps what was got and asks again after the kind's
-        interval. A rate limit fails nothing: it makes the next update wait,
-        and no more requests go out in this one. An ended sign-in stops the
-        sync.
+        interval, or at the next update after a failure that may pass, as a
+        brief outage. A rate limit fails nothing: it makes the next update
+        wait, and no more requests go out in this one. An ended sign-in
+        stops the sync.
         """
         extra = self._extras.setdefault((kind, account_number), _Extra())
         if self._rate_limit is not None or not (
@@ -1056,19 +1239,25 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         except (MeridianError, ValueError) as err:
             extra.failing = True
             _LOGGER.debug("Couldn't get the %s (%s)", _NAMES[kind], _error_detail(err))
+            extra.due = None if is_passing_failure(err) else now + _INTERVALS[kind]
         else:
             extra.at = now
             extra.failing = False
-        extra.due = now + _INTERVALS[kind]
+            extra.due = now + _INTERVALS[kind]
         return extra
 
     async def _async_account_results(
         self,
         accounts: tuple[MeridianAccount, ...],
-        failed: set[UnitKey],
+        failed: Mapping[UnitKey, Exception],
         now: datetime,
     ) -> tuple[AccountSyncResult, ...]:
-        """Return every account's figures, then log each kind lost or back."""
+        """
+        Return every account's figures, then log each kind lost or back.
+
+        So too Bill estimate, which the current bills' day totals leave
+        unknown while one of them leaves out a date of its period.
+        """
         lost: dict[str, str] = {}
         results = [
             await self._async_account_result(account, failed, now, lost)
@@ -1083,12 +1272,23 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 if name == kind
             ):
                 self._note_extra(kind, None)
+        bills: list[_Bill] = [
+            extra.value
+            for (name, _number), extra in self._extras.items()
+            if name == "days"
+            and extra.value is not None
+            and nz_date(now) <= extra.value.end
+        ]
+        if bills:
+            self._note_extra(
+                "estimate", None if all(bill.whole for bill in bills) else "estimate"
+            )
         return tuple(results)
 
     async def _async_account_result(
         self,
         account: MeridianAccount,
-        failed: set[UnitKey],
+        failed: Mapping[UnitKey, Exception],
         now: datetime,
         lost: dict[str, str],
     ) -> AccountSyncResult:
@@ -1120,11 +1320,25 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 billing.due,
                 now + BILL_DAYS_INTERVAL if ended else local_midnight(last.end + _DAY),
             )
+        if billing.at is not None and billing.value is None and not billing.failing:
+            # Meridian answered with no billing options: the day totals got
+            # for the period before are no bill's any more.
+            self._extras.pop(("days", number), None)
         bill = await self._async_bill(account, period, failed, now, lost)
         billing.lost = period is None and (billing.failing or (ended and billing.lost))
         if billing.lost:
+            # An account with a property that can't be read has its own
+            # line for its bill.
             _lose(
-                lost, "billing", "billing_bill" if bill == BillFigures() else "billing"
+                lost,
+                "billing",
+                "billing"
+                if account.skipped_properties
+                else "billing_bill"
+                if bill == BillFigures()
+                else "billing_so_far"
+                if bill.usage is None
+                else "billing",
             )
         extra = await self._async_extra(
             "balance", number, now, partial(self.client.async_get_balance, number)
@@ -1136,7 +1350,9 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         result = AccountSyncResult(
             account_key=account_key(number),
             billing_period=period,
-            has_feed_in=_has_feed_in(account),
+            # Undecided while a property that can't be read may export.
+            has_feed_in=_has_feed_in(account)
+            or (None if account.skipped_properties else False),
             bill=bill,
             price_sensors=price_sensors,
             prices=prices,
@@ -1150,7 +1366,11 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             credit=Decimal(cents) / _CENTS_PER_DOLLAR if cents > 0 else None,
             last_bill=max(balance.bills, key=attrgetter("issued"), default=None),
             last_payment=max(
-                (payment for payment in balance.payments if payment.paid_on <= today),
+                (
+                    payment
+                    for payment in balance.payments
+                    if payment.paid_on <= today and payment.status in _PAID
+                ),
                 key=attrgetter("paid_on"),
                 default=None,
             ),
@@ -1160,7 +1380,7 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         self,
         account: MeridianAccount,
         period: MeridianBillingPeriod | None,
-        failed: set[UnitKey],
+        failed: Mapping[UnitKey, Exception],
         now: datetime,
         lost: dict[str, str],
     ) -> BillFigures:
@@ -1169,16 +1389,22 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
 
         They need every property's, so they are not asked for while one of
         the account's properties failed its recent grid import dates in this
-        sync, and are asked for at once when the period changes. Once their period has
-        ended they are withheld; until then the 'so far' figures are kept
-        for two intervals, and the estimate throughout.
+        sync, or for an account with no property, and are asked for at once
+        when the period changes; nor at all for an account with a property
+        that couldn't be read, whose figures show unknown. Once their period
+        has ended they are withheld; until then the 'so far' figures are
+        kept for two intervals, and the estimate throughout.
         """
         number = account.number
+        if account.skipped_properties:
+            _lose(lost, "days", "days_skipped")
+            return BillFigures()
         extra = self._extras.get(("days", number))
         if (
             period is not None
             and period.start is not None
             and period.end is not None
+            and account.properties
             and not any(
                 (property_key(number, item.id), READING_CONSUMPTION) in failed
                 for item in account.properties
@@ -1196,6 +1422,9 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 and (known.start, known.end) != (period.start, period.end)
                 and not (extra is not None and extra.failing),
             )
+            if extra.value is not None and extra.value.retry and not extra.failing:
+                # Its grid export failed in a way that may pass.
+                extra.due = None
         if extra is None:
             return BillFigures()
         bill: _Bill | None = extra.value
@@ -1212,54 +1441,81 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
         account: MeridianAccount,
         start_on: date,
         end_on: date,
-        failed: set[UnitKey],
+        failed: Mapping[UnitKey, Exception],
     ) -> _Bill:
         """
         Return a bill's figures from every property's day totals.
 
         'So far' counts the actual days only; the estimate adds every day's
-        cost, future estimates included. The export and its credit are asked
-        for after the rest, and are unknown when a property's grid export
-        failed in this sync or its day totals fail.
+        cost, future estimates included, and is unknown when the answer left
+        out a date of the period. Each figure is rounded to 0.01 once
+        summed. The export and its credit are asked for after the rest, and
+        are unknown when a property's grid export failed in this sync or its
+        day totals fail; after a failure that may pass, the bill says to ask
+        again at the next update.
         """
         number = account.number
-        days = await self._async_days(account, start_on, end_on, READING_CONSUMPTION)
+        days, whole = await self._async_days(
+            account, start_on, end_on, READING_CONSUMPTION
+        )
         used = [day for day in days if day.quality == _ACTUAL]
+        if not whole:
+            _LOGGER.debug(
+                "Meridian's day totals left out a date of the billing period; "
+                "Bill estimate shows unknown"
+            )
         figures = BillFigures(
-            usage=sum((day.energy for day in used), Decimal(0)),
-            cost=_dollars(used),
-            estimate=_dollars(days),
+            usage=_hundredths(sum((day.energy for day in used), Decimal(0))),
+            cost=_hundredths(_dollars(used)),
+            estimate=_hundredths(_dollars(days)) if whole else None,
         )
         if not _has_feed_in(account):
-            return _Bill(start_on, end_on, figures)
-        if any(
-            (property_key(number, item.id), READING_GENERATION) in failed
+            return _Bill(start_on, end_on, figures, whole)
+        errors = [
+            failed[unit]
             for item in account.properties
-        ):
+            if (unit := (property_key(number, item.id), READING_GENERATION)) in failed
+        ]
+        if errors:
             _LOGGER.debug("Not asking for the bill's grid export: it failed")
-            return _Bill(start_on, end_on, figures)
+            return _Bill(
+                start_on,
+                end_on,
+                figures,
+                whole,
+                retry=all(is_passing_failure(err) for err in errors),
+            )
         try:
-            days = await self._async_days(account, start_on, end_on, READING_GENERATION)
+            days, _whole = await self._async_days(
+                account, start_on, end_on, READING_GENERATION
+            )
         except MeridianAuthenticationError, MeridianRateLimitError:
             raise
         except (MeridianError, ValueError) as err:
             _LOGGER.debug(
                 "Couldn't get the bill's grid export (%s)", _error_detail(err)
             )
-            return _Bill(start_on, end_on, figures)
+            return _Bill(
+                start_on, end_on, figures, whole, retry=is_passing_failure(err)
+            )
         sent = [day for day in days if day.quality == _ACTUAL]
         figures = replace(
             figures,
-            export=sum((day.energy for day in sent), Decimal(0)),
-            credit=_dollars(sent),
+            export=_hundredths(sum((day.energy for day in sent), Decimal(0))),
+            credit=_hundredths(_dollars(sent)),
         )
-        return _Bill(start_on, end_on, figures)
+        return _Bill(start_on, end_on, figures, whole)
 
     async def _async_days(
         self, account: MeridianAccount, start_on: date, end_on: date, direction: str
-    ) -> list[Reading]:
-        """Return one direction's day totals from each property that has it."""
+    ) -> tuple[list[Reading], bool]:
+        """
+        Return one direction's day totals from each property that has it.
+
+        Also whether every such property's answer held every date asked for.
+        """
         days: list[Reading] = []
+        whole = True
         for property_data in account.properties:
             key = property_key(account.number, property_data.id)
             if direction not in dict(_directions(key, property_data)):
@@ -1275,8 +1531,10 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
                 pace=self._async_pace,
                 context=f"{_LABELS[direction].replace(' ', '_')} bill_days",
             )
-            days.extend(day_readings(rows, start_on, end_on).values())
-        return days
+            readings = day_readings(rows, start_on, end_on)
+            whole = whole and len(readings) == (end_on - start_on).days + 1
+            days.extend(readings.values())
+        return days, whole
 
     async def _async_prices(
         self, account: MeridianAccount, now: datetime, lost: dict[str, str]
@@ -1286,10 +1544,15 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
 
         Only an account with one property and one meter point is asked; the
         answer says whether its plan is all-day. Until an answer has come,
-        there is no saying (None): sensors already registered stay, showing
-        unknown.
+        while Meridian lists no agreement in force for the meter (when that
+        happens is not known), or while one of the account's properties
+        couldn't be read, there is no saying (None): sensors already
+        registered stay, showing unknown. A price whose text can't be read is
+        logged once.
         """
         properties = account.properties
+        if account.skipped_properties:
+            return None, None
         if len(properties) != 1 or len(properties[0].meter_points) != 1:
             return False, None
         extra = await self._async_extra(
@@ -1302,12 +1565,33 @@ class MeridianDataCoordinator(DataUpdateCoordinator[MeridianSyncData]):
             if extra.failing:
                 _lose(lost, "prices", "prices_unanswered")
             return None, None
+        if isinstance(extra.value, MeridianNoAgreement):
+            _lose(lost, "prices", "prices_no_agreement")
+            return None, None
         if extra.value is None:
             return False, None
         prices: MeridianPrices | None = extra.kept("prices", now)
         if extra.failing and prices is None:
             _lose(lost, "prices", "prices")
+        if prices is not None:
+            self._note_unreadable_prices(prices)
         return True, prices
+
+    def _note_unreadable_prices(self, prices: MeridianPrices) -> None:
+        """Log a WARNING for each price that can't be read, once per field."""
+        for item in prices.unreadable:
+            if (item.key, item.field) in self._prices_noted:
+                continue
+            self._prices_noted.add((item.key, item.field))
+            _LOGGER.warning(
+                "Meridian Energy can't read the %s in %s, which %s; %s shows unknown",
+                _PRICE_NAMES[item.key],
+                item.field,
+                f"is {item.shape}"
+                if item.shape in _SHAPE_WORDS
+                else f"looks like {item.shape!r} (N a digit, A a letter)",
+                _PRICE_SENSORS[item.key],
+            )
 
 
 def _lose(lost: dict[str, str], kind: str, key: str) -> None:
@@ -1342,31 +1626,33 @@ def _missing(
     )
 
 
-def _is_transient(err: MeridianConnectionError) -> bool:
-    """Return whether a failure may pass on its own, so a resend may succeed."""
-    if isinstance(err, MeridianRateLimitError | MeridianRejectedError):
-        return False
-    if isinstance(err, MeridianUpstreamError):
-        return err.status is None or err.status in TRANSIENT_STATUSES
-    return http_status(err) is None
-
-
 def _is_refusal(err: Exception) -> bool:
-    """Return whether Meridian refused a request: a coded error or a client error."""
+    """
+    Return whether Meridian refused a request's dates.
+
+    That is a coded GraphQL error or a client error, but not a 401 or 403, or
+    KT-CT-1112 alone, which say nothing of the dates asked for.
+    """
     if isinstance(err, MeridianGraphQLError):
-        return not is_service_failure(err.codes) and not QUERY_LIMIT_CODES.intersection(
-            err.codes
+        return (
+            not is_service_failure(err.codes)
+            and not QUERY_LIMIT_CODES.intersection(err.codes)
+            and set(err.codes) != _MISSING_HEADER_CODES
         )
-    return isinstance(err, MeridianRejectedError)
+    return (
+        isinstance(err, MeridianRejectedError) and err.status not in _NOT_A_DATE_REFUSAL
+    )
 
 
 def _error_key(err: BaseException) -> str:
     """Return the translation key of a failure's category."""
     if isinstance(err, _NoAccountsError):
-        return "no_accounts"
+        return "no_properties" if isinstance(err, _NoPropertiesError) else "no_accounts"
     if isinstance(err, MeridianRateLimitError):
-        return "rate_limited"
-    if isinstance(err, MeridianRejectedError) or _unreadable(err):
+        return "sign_in_rate_limited" if err.sign_in_service else "rate_limited"
+    if isinstance(
+        err, MeridianRejectedError | MeridianSignInServiceUnreadableError
+    ) or is_unreadable(err):
         return "invalid_data"
     if isinstance(err, MeridianConnectionError):
         return "cannot_connect"
@@ -1377,30 +1663,36 @@ def _error_key(err: BaseException) -> str:
 
 def _error_detail(err: BaseException) -> str:
     """Describe a failure without identifiers, as in ``HTTP 504``."""
-    if isinstance(err, MeridianUpstreamError | MeridianRejectedError):
+    if isinstance(
+        err,
+        MeridianUpstreamError
+        | MeridianRejectedError
+        | MeridianSignInServiceError
+        | InvertedPeriodError,
+    ):
         return err.detail
     if isinstance(err, MeridianGraphQLError):
         return ", ".join(shown_codes(err.codes)) or "a Meridian service error"
-    if _unreadable(err):
+    if is_unreadable(err):
         return "not JSON"
     if isinstance(err, MeridianConnectionError):
         status = http_status(err)
         return "network error" if status is None else f"HTTP {status}"
     if isinstance(err, _NoAccountsError):
-        return "no account"
+        return "no property" if isinstance(err, _NoPropertiesError) else "no account"
     return "unexpected data"
-
-
-def _unreadable(err: BaseException) -> bool:
-    """Return whether a failure is an answer that is not JSON, as a web page."""
-    return any(
-        isinstance(item, MeridianUnreadableResponseError)
-        for item in exception_chain(err)
-    )
 
 
 def _error_phrase(err: Exception) -> str:
     """Describe a unit's failure for its WARNING, as ``no answer: HTTP 504``."""
+    if isinstance(err, MeridianSignInServiceUnreadableError):
+        return (
+            "the sign-in service sent an answer Meridian Energy can't read: "
+            f"{err.reason}"
+        )
+    if isinstance(err, MeridianSignInServiceError):
+        # Its detail names the service: "sign-in service: HTTP 503".
+        return f"no answer from the {_error_detail(err)}"
     if _error_key(err) == "cannot_connect":
         return f"no answer from Meridian: {_error_detail(err)}"
     return (
@@ -1417,6 +1709,11 @@ def _dollars(days: Collection[Reading]) -> Decimal | None:
     return sum((cost for cost in cents if cost is not None), Decimal(0)) / (
         _CENTS_PER_DOLLAR
     )
+
+
+def _hundredths(value: Decimal | None) -> Decimal | None:
+    """Round a summed bill figure to 0.01, a half away from zero, as money is."""
+    return None if value is None else value.quantize(_HUNDREDTH, ROUND_HALF_UP)
 
 
 def _has_feed_in(account: MeridianAccount) -> bool:

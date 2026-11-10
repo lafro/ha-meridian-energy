@@ -30,8 +30,9 @@ REQUEST_TIMEOUT_SECONDS = 30
 # running out as a connection timeout. Without it, a connection never made
 # used up the request's whole limit and read as Meridian not answering.
 CONNECT_TIMEOUT_SECONDS = 20
-# Above the gateway's apparent limit of about 60 s, so a slow answer is told
-# apart from the gateway's 504, and below Cloudflare's own 100 s limit.
+# Chosen on an assumption, never measured: that a gateway in front of
+# Meridian's API gives up after about 60 s, and a Cloudflare proxy, if there
+# is one, after 100 s. Meridian has answered 7-date windows well within it.
 MEASUREMENTS_TIMEOUT_SECONDS = 75
 
 UPDATE_INTERVAL = timedelta(hours=1)
@@ -64,8 +65,9 @@ MAX_FILL_COOLDOWN = timedelta(days=1)
 MEASUREMENTS_PACING_SECONDS = 1.0
 # The wait before one resend after a passing failure, chosen at random.
 TRANSIENT_RESEND_DELAY_SECONDS = (2.0, 5.0)
-# Statuses of a gateway or service that failed in a way a resend may not meet.
-TRANSIENT_STATUSES = frozenset({408, 502, 503, 504, 520, 521, 522, 523, 524})
+# The statuses after which Meridian's web app resends a query: a gateway or
+# service that failed in a way a resend may not meet.
+TRANSIENT_STATUSES = frozenset({502, 503, 504})
 
 FIRST_SYNC_RETRY_SECONDS = 600
 # Until an entry's first sync has succeeded, a failed one is tried again after

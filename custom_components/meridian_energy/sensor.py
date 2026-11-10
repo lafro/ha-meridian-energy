@@ -119,11 +119,7 @@ DESCRIPTIONS = (
         entity_category=EntityCategory.DIAGNOSTIC,
         state_class=SensorStateClass.MEASUREMENT,
         suggested_display_precision=0,
-        value_fn=lambda data, result: sum(
-            item.estimated_rows
-            for item in data.results
-            if item.account_key == result.account_key
-        ),
+        value_fn=lambda data, result: _estimated_rows(data, result.account_key),
     ),
     _EnergyDescription(
         key="bill_usage",
@@ -298,11 +294,16 @@ def _conditions(
     Return whether an account meets each sensor condition, None if unknown.
 
     Before the first sync, the feed-in register comes from the cached
-    accounts, and the plan is unknown. None when the sync's results lack
-    the account.
+    accounts, and the plan is unknown; so is the feed-in register while one
+    of the account's properties can't be read and no readable one has it.
+    None when the sync's results lack the account.
     """
     if data is None:
-        return {_FEED_IN: _account_has_feed_in(account), _PRICES: None}
+        return {
+            _FEED_IN: _account_has_feed_in(account)
+            or (None if account.skipped_properties else False),
+            _PRICES: None,
+        }
     result = _account_result(data, key)
     if result is None:
         return None
@@ -459,6 +460,12 @@ def _account_result(
     return next(
         (item for item in data.account_results if item.account_key == key), None
     )
+
+
+def _estimated_rows(data: MeridianSyncData, key: str) -> int | None:
+    """Return an account's estimated hours, None for an account with no property."""
+    rows = [item.estimated_rows for item in data.results if item.account_key == key]
+    return sum(rows) if rows else None
 
 
 def _account_has_feed_in(account: MeridianAccount) -> bool:

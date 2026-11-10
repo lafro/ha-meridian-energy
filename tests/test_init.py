@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import replace
@@ -26,6 +27,8 @@ from homeassistant.exceptions import (
 )
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers import issue_registry as ir
+from homeassistant.helpers.translation import async_get_translations
+from homeassistant.setup import async_setup_component
 from pytest_homeassistant_custom_component.common import (
     MockConfigEntry,
     snapshot_platform,
@@ -42,6 +45,7 @@ from custom_components.meridian_energy import (
     async_setup_entry,
     async_unload_entry,
 )
+from custom_components.meridian_energy import coordinator as coordinator_module
 from custom_components.meridian_energy.api import (
     MeridianApiClient,
     MeridianAuthenticationError,
@@ -69,6 +73,9 @@ from custom_components.meridian_energy.models import (
     PropertySyncResult,
 )
 from custom_components.meridian_energy.statistics import account_key, energy_metadata
+
+from .meridian_http import ID_TOKEN, FakeMeridianSession, Response, json_response
+from .syncs import NOW
 
 
 def _entry(
@@ -210,6 +217,34 @@ async def test_setup_entry_and_rotating_token_persistence(hass) -> None:
     assert entry.data[CONF_REFRESH_TOKEN] == "rotated-refresh"
     assert "id_token" not in entry.data
     reload_entry.assert_not_awaited()
+
+
+@pytest.mark.parametrize("user_id", ["null", "absent"])
+@pytest.mark.asyncio
+async def test_an_entry_kept_without_a_user_id_sets_up(hass, user_id: str) -> None:
+    """Nothing sends the user ID, so an entry without one loads as any other."""
+    data: dict[str, object] = {
+        "email": "person@example.com",
+        CONF_REFRESH_TOKEN: "old-refresh",
+    }
+    if user_id == "null":
+        data[CONF_FIREBASE_USER_ID] = None
+    entry = _entry(data=data)
+    entry.add_to_hass(hass)
+
+    with (
+        patch("custom_components.meridian_energy.MeridianApiClient") as client_class,
+        patch(
+            "custom_components.meridian_energy.MeridianDataCoordinator",
+            return_value=_mock_coordinator(),
+        ),
+        patch.object(hass.config_entries, "async_forward_entry_setups", AsyncMock()),
+    ):
+        assert await async_setup_entry(hass, entry) is True
+        await hass.async_block_till_done(wait_background_tasks=True)
+
+    tokens = client_class.call_args.kwargs["tokens"]
+    assert (tokens.refresh_token, tokens.user_id) == ("old-refresh", None)
 
 
 @pytest.mark.asyncio
@@ -461,6 +496,10 @@ class TestPublicConfigEntryLifecycle:
 
         assert entry.state is ConfigEntryState.MIGRATION_ERROR
         assert entry.error_reason_translation_key == "entry_too_old"
+        # The reason the card shows says how to keep the statistics.
+        reasons = await async_get_translations(hass, "en", "exceptions", [DOMAIN])
+        reason = reasons[f"component.{DOMAIN}.exceptions.entry_too_old.message"]
+        assert "(choose Keep if asked)" in reason
         assert entry.version == 3
         assert dict(entry.data) == _VERSION_3_DATA
         after = await instance.async_add_executor_job(
@@ -529,7 +568,7 @@ class TestPublicConfigEntryLifecycle:
                 data.account_results[0],
                 billing_period=MeridianBillingPeriod(
                     period_length="MONTHLY",
-                    period_length_multiplier=1,
+                    period_length_multiplier=None,
                     is_fixed=True,
                     start=date(2026, 7, 1),
                     end=date(2026, 7, 31),
@@ -727,3 +766,140 @@ class TestPublicConfigEntryLifecycle:
         assert entry.state is ConfigEntryState.SETUP_ERROR
         flows = hass.config_entries.flow.async_progress_by_handler(DOMAIN)
         assert [flow["context"]["source"] for flow in flows] == [SOURCE_REAUTH]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "release",
+        [
+            "first_failure",
+            "second_failure",
+            "third_failure",
+            "refused_session",
+            "ended_session",
+            "ended_after_failures",
+        ],
+    )
+    async def test_an_update_entity_sync_that_outlives_its_entry_ends_quietly(
+        self, recorder_mock, hass, caplog, release: str
+    ) -> None:
+        """
+        A refresh update_entity asked for, which removal doesn't stop, ends quietly.
+
+        Its measurements answer is held while the entry is removed. Released
+        as a first failed update, it logs no error saying it tries again;
+        released as the third in a row, it raises no repair notice; released
+        as a refused session, whose renewal rotates the refresh token, it
+        stores nothing in the removed entry; released as a session ended
+        after its renewal, it starts no reauthentication. Either way nothing
+        is logged as an error, nor a recovery that never came. It may still
+        write the hours it fetched, as statistics outlive the entry.
+        """
+        del recorder_mock
+        caplog.set_level(logging.INFO)
+        session = FakeMeridianSession(NOW)
+        entry = _entry()
+        entry.add_to_hass(hass)
+        assert await async_setup_component(hass, "homeassistant", {})
+        renewals: list[str] = []
+
+        def renew(operation: str) -> Response | None:
+            if operation != "session_refresh":
+                return None
+            renewals.append(operation)
+            return json_response(
+                {
+                    "id_token": ID_TOKEN,
+                    "refresh_token": "synthetic-rotated-refresh",
+                    "expires_in": "3600",
+                    "user_id": "synthetic-user-0123",
+                }
+            )
+
+        with (
+            patch(
+                "custom_components.meridian_energy.async_get_clientsession",
+                return_value=session,
+            ),
+            patch.object(coordinator_module, "_utcnow", return_value=NOW),
+        ):
+            assert await hass.config_entries.async_setup(entry.entry_id)
+            await hass.async_block_till_done(wait_background_tasks=True)
+            coordinator = entry.runtime_data.coordinator
+            assert coordinator.last_update_success
+            unavailable = json_response({}, status=503)
+            gate = asyncio.Event()
+            failed_before = {
+                "second_failure": 1,
+                "third_failure": 2,
+                "ended_after_failures": 2,
+            }.get(release, 0)
+            session.hook = lambda operation, _variables: (
+                unavailable if operation == "measurements" else None
+            )
+            for _failure in range(failed_before):
+                await coordinator.async_refresh()
+            assert coordinator._failed_updates == failed_before
+            if release.endswith("_failure"):
+                held = iter([Response(b"{}", status=503, gate=gate)])
+                after: Response | None = unavailable
+            else:
+                held = iter([Response(b"{}", status=401, gate=gate)])
+                after = (
+                    json_response(
+                        {"errors": [{"extensions": {"errorCode": "KT-CT-1124"}}]},
+                        status=401,
+                    )
+                    if release.startswith("ended")
+                    else None
+                )
+                session.auth_hook = renew
+            session.hook = lambda operation, _variables: (
+                next(held, after) if operation == "measurements" else None
+            )
+            sensor = next(
+                item.entity_id
+                for item in er.async_entries_for_config_entry(
+                    er.async_get(hass), entry.entry_id
+                )
+                if item.unique_id.endswith("_estimated_readings")
+            )
+            sent = session.operations.count("measurements")
+            caplog.clear()
+
+            service = hass.async_create_task(
+                hass.services.async_call(
+                    "homeassistant",
+                    "update_entity",
+                    {"entity_id": sensor},
+                    blocking=True,
+                )
+            )
+            for _ in range(1000):
+                if session.operations.count("measurements") > sent:
+                    break
+                await asyncio.sleep(0.01)
+            assert session.operations.count("measurements") == sent + 1
+            await hass.config_entries.async_remove(entry.entry_id)
+            gate.set()
+            await service
+            await hass.async_block_till_done(wait_background_tasks=True)
+
+        assert hass.config_entries.async_get_entry(entry.entry_id) is None
+        assert (
+            ir.async_get(hass).async_get_issue(DOMAIN, f"sync_failing_{entry.entry_id}")
+            is None
+        )
+        if not release.endswith("_failure"):
+            assert renewals
+        assert hass.config_entries.flow.async_progress_by_handler(DOMAIN) == []
+        assert [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno >= logging.ERROR
+        ] == []
+        # Home Assistant logs a recovery after a failure: there was none.
+        assert [
+            record.getMessage()
+            for record in caplog.records
+            if record.levelno >= logging.INFO and "recovered" in record.getMessage()
+        ] == []

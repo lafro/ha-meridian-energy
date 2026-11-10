@@ -10,7 +10,12 @@ from typing import Any
 from uuid import uuid4
 
 import probatio
-from homeassistant.config_entries import SOURCE_REAUTH, ConfigFlow, ConfigFlowResult
+from homeassistant.config_entries import (
+    SOURCE_IGNORE,
+    SOURCE_REAUTH,
+    ConfigFlow,
+    ConfigFlowResult,
+)
 from homeassistant.const import CONF_EMAIL
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import AbortFlow, FlowResultType
@@ -25,7 +30,11 @@ from .api import (
     MeridianOtpError,
     MeridianRateLimitError,
     MeridianRejectedError,
+    MeridianSignInServiceError,
+    MeridianSignInServiceUnreadableError,
     http_status,
+    is_unreadable,
+    log_rate_limit,
 )
 from .const import (
     CONF_FIREBASE_USER_ID,
@@ -87,10 +96,18 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
 
         A setup of the same email left at a form, as in a closed browser
         tab, does not block this one: Home Assistant aborts it once either
-        creates the entry.
+        creates the entry. An entry an earlier version made, refused as too
+        old, must be deleted first, so the abort says so; one a later
+        version made is simply already set up.
         """
         email = str(user_input[CONF_EMAIL]).strip().lower()
-        await self.async_set_unique_id(email, raise_on_progress=False)
+        existing = await self.async_set_unique_id(email, raise_on_progress=False)
+        if (
+            existing is not None
+            and existing.version < self.VERSION
+            and existing.source != SOURCE_IGNORE
+        ):
+            return self.async_abort(reason="earlier_entry")
         self._abort_if_unique_id_configured()
         self._email = email
         self._journey_id = str(uuid4())
@@ -141,7 +158,13 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
     async def _async_check_code(
         self, user_input: dict[str, Any], email: str, journey_id: str
     ) -> ConfigFlowResult:
-        """Check the emailed code, then renew the entry's sign-in or find accounts."""
+        """
+        Check the emailed code, then renew the entry's sign-in or find accounts.
+
+        Once Meridian has answered that the code is right, it may not take
+        it again, so a later failure says to start again for a new code
+        rather than to send this one again.
+        """
         otp = str(user_input["otp"]).strip()
         if len(otp) != OTP_LENGTH or not otp.isascii() or not otp.isdigit():
             return self._show_otp_form({"base": "otp_invalid"})
@@ -149,10 +172,22 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
             tokens = await self._client.async_validate_otp(email, otp, journey_id)
         except MeridianOtpError as err:
             error = _otp_error_key(err.code)
+        except MeridianSignInServiceError as err:
+            error = _after_code_error_key(err)
+        except MeridianRateLimitError as err:
+            error = (
+                _after_code_error_key(err)
+                if err.sign_in_service
+                else _connection_error_key(err)
+            )
         except MeridianConnectionError as err:
             error = _connection_error_key(err)
         except MeridianAuthenticationError:
             error = "invalid_auth"
+        except ValueError:
+            # The code check, or the sign-in after it, answered in a way that
+            # can't be read.
+            error = _unreadable_answer(code_answered=True)
         else:
             data = {
                 CONF_EMAIL: email,
@@ -201,6 +236,9 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
         else:
             if not accounts:
                 return self.async_abort(reason="no_accounts")
+            if not any(account.properties for account in accounts):
+                # Listed, but with no property on any of them.
+                return self.async_abort(reason="no_properties")
             # Another setup of the same login may have created its entry.
             self._abort_if_unique_id_configured()
             self._created = True
@@ -351,19 +389,62 @@ class MeridianEnergyConfigFlow(ConfigFlow, domain=DOMAIN):
 
 
 def _otp_error_key(code: str) -> str:
+    """
+    Return the form error for a refused code.
+
+    A refusal named otherwise, or not named, keeps the form, as a wrong code
+    does: Meridian's app lets the code be tried again with the same sign-in.
+    Its message names no cause, only that the code wasn't accepted.
+    """
     return {
         "OTP_EXPIRED": "otp_expired",
         "OTP_INVALID": "otp_invalid",
         "OTP_TOO_MANY_ATTEMPTS": "otp_too_many_attempts",
         "OTP_NOT_FOUND": "otp_not_found",
-    }.get(code, "invalid_auth")
+    }.get(code, "otp_refused")
 
 
 def _connection_error_key(err: MeridianConnectionError) -> str:
-    """Return the form error for a request to Meridian that got no usable answer."""
+    """
+    Return the form error for a request that got no usable answer.
+
+    A rate limit is logged with what its answer said, and named by the
+    service that asked to wait. A session answer from the sign-in service
+    that can't be read is that; a page that is not JSON is no answer.
+    """
     if isinstance(err, MeridianRateLimitError):
-        return "rate_limited"
+        log_rate_limit(err, "the form asks to wait")
+        return "sign_in_rate_limited" if err.sign_in_service else "rate_limited"
+    if isinstance(err, MeridianSignInServiceUnreadableError) and not is_unreadable(err):
+        return _unreadable_answer()
     return "cannot_connect"
+
+
+def _after_code_error_key(err: MeridianConnectionError) -> str:
+    """
+    Return the form error for the sign-in service failing after the code.
+
+    Meridian took the code, so each says to start again for a new one.
+    """
+    if isinstance(err, MeridianRateLimitError):
+        log_rate_limit(err, "the form asks to start again")
+        return "sign_in_rate_limited_code"
+    if isinstance(err, MeridianSignInServiceUnreadableError) and not is_unreadable(err):
+        return _unreadable_answer(code_answered=True)
+    return "sign_in_cannot_connect_code"
+
+
+def _unreadable_answer(*, code_answered: bool = False) -> str:
+    """
+    Log a sign-in answer that can't be read, and return its form error.
+
+    Once the code has been answered, the form asks for a new code.
+    """
+    _LOGGER.debug(
+        "A sign-in answer couldn't be read; the form asks to %s",
+        "start again" if code_answered else "try again",
+    )
+    return "sign_in_unreadable_code" if code_answered else "sign_in_unreadable"
 
 
 def _log_discovery_failure(err: Exception) -> None:

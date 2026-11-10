@@ -123,7 +123,7 @@ DAYS_LOST = (
     "Meridian Energy couldn't get the bill's day totals; the bill sensors show "
     "unknown until it can"
 )
-PRICES_UNANSWERED = "Meridian Energy couldn't get the prices; it asks again in a day"
+PRICES_UNANSWERED = "Meridian Energy couldn't get the prices; it asks again later"
 # The repair notice appears after this many failed updates in a row.
 NOTICE_AFTER = 3
 # The outage's answer to every measurements request, from a gateway.
@@ -1395,7 +1395,7 @@ def figures(j: Journey, relaunch: Callable[[], None]) -> None:
 
     The first sync's billing period, bill day totals and prices requests
     fail: the entry loads and its update works, the bill shows unknown, and
-    the integration says so and that it asks for the prices again in a day.
+    the integration says so and that it asks for the prices again later.
     Each is next due hours later, so a reload asks again instead: with the
     day totals still failing, the bill shows unknown and says so; with every
     request answered, every figure has a value. Then Home Assistant restarts

@@ -3,28 +3,32 @@
 from __future__ import annotations
 
 import logging
-from datetime import date
+from datetime import date, time
 from decimal import Decimal
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pytest
 
-from custom_components.meridian_energy import parsers as parsers_module
 from custom_components.meridian_energy.models import (
     MeridianBill,
+    MeridianNoAgreement,
     MeridianPayment,
     MeridianPrices,
+    UnreadablePrice,
 )
 from custom_components.meridian_energy.parsers import (
     parse_balance,
     parse_measurement,
     parse_prices,
+    price_shape,
 )
 from custom_components.meridian_energy.windows import day_readings
 
 from .meridian_http import prices_data, rate
 
 _DAY = "DAY_INTERVAL"
+_NZ = ZoneInfo("Pacific/Auckland")
 
 
 def _day_node(start: str, end: str, *, frequency: str = _DAY) -> dict[str, Any]:
@@ -76,25 +80,51 @@ def test_a_day_node_runs_from_one_new_zealand_midnight_to_the_next(
 
 
 @pytest.mark.parametrize(
-    ("start", "end"),
+    "end",
     [
-        # A UTC day, an hour, a day shifted off midnight, and one that starts
-        # an hour late.
-        ("2026-07-13T00:00:00+00:00", "2026-07-14T00:00:00+00:00"),
-        ("2026-07-13T00:00:00+12:00", "2026-07-13T01:00:00+12:00"),
-        ("2026-07-13T01:00:00+12:00", "2026-07-14T01:00:00+12:00"),
-        ("2026-07-13T01:00:00+12:00", "2026-07-14T00:00:00+12:00"),
-        # 24 hours across the day daylight saving starts: not one date.
-        ("2026-09-27T00:00:00+12:00", "2026-09-28T01:00:00+13:00"),
+        # An hour, 24 hours across the day daylight saving starts, a UTC
+        # midnight, and no end at all.
+        "2026-09-27T01:00:00+12:00",
+        "2026-09-28T01:00:00+13:00",
+        "2026-09-28T00:00:00+00:00",
+        None,
     ],
 )
-def test_a_day_node_off_new_zealand_midnights_is_refused(start: str, end: str) -> None:
-    with pytest.raises(ValueError, match="New Zealand date"):
+def test_a_day_total_is_filed_under_the_date_it_starts_whatever_its_end(
+    end: str | None,
+) -> None:
+    """A total that starts at a New Zealand midnight is that whole date's."""
+    node = _day_node("2026-09-27T00:00:00+12:00", end or "")
+    if end is None:
+        del node["endAt"]
+    measurement = parse_measurement(node, "CONSUMPTION", _DAY)
+
+    assert measurement.start.astimezone(_NZ).date() == date(2026, 9, 27)
+    assert measurement.end is not None
+    # Daylight saving starts that date: 23 hours, to the next midnight.
+    assert (measurement.end - measurement.start).total_seconds() == 23 * 3600
+    assert measurement.end.astimezone(_NZ).time() == time(0)
+
+
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        # A UTC day, a day shifted off midnight, and one that starts an hour
+        # late.
+        ("2026-07-13T00:00:00+00:00", "2026-07-14T00:00:00+00:00"),
+        ("2026-07-13T01:00:00+12:00", "2026-07-14T01:00:00+12:00"),
+        ("2026-07-13T01:00:00+12:00", "2026-07-14T00:00:00+12:00"),
+    ],
+)
+def test_a_day_node_that_does_not_start_at_a_new_zealand_midnight_is_refused(
+    start: str, end: str
+) -> None:
+    with pytest.raises(ValueError, match="New Zealand midnight"):
         parse_measurement(_day_node(start, end), "CONSUMPTION", _DAY)
 
 
 @pytest.mark.parametrize("field", ["value", "cost"])
-def test_a_number_past_1e12_is_refused(field: str) -> None:
+def test_a_number_from_1e13_is_refused(field: str) -> None:
     """No kWh, nor any cost in cents, comes near: the sum of a few would overflow."""
 
     def node(number: str) -> dict[str, Any]:
@@ -237,112 +267,219 @@ def test_a_balance_or_payment_from_1e13_cents_is_refused(
         parse_balance(account(cents))
 
 
-@pytest.fixture(autouse=True)
-def fresh_rate_log() -> None:
-    """Each test starts with no unreadable price field logged yet."""
-    parsers_module._logged_rates.clear()
+_TAX = "formattedRateIncludingTax"
+_DISCOUNTED = "formattedRateIncludingTaxIncludingDiscount"
 
 
 @pytest.mark.parametrize(
     ("daily", "anytime", "expected"),
     [
-        ("$2.000000 /day", "$0.300000 /kWh", (Decimal(2), Decimal("0.3"))),
-        ("$2.12/day", "$0.3141/kWh", (Decimal("2.12"), Decimal("0.3141"))),
-        ("212.500 c/day", "31.41 c/kWh", (Decimal("2.125"), Decimal("0.3141"))),
-        # A wrong unit for its band, or a currency marker it can't read.
-        ("$0.300000 /kWh", "$2.000000 /day", (None, None)),
-        ("€2.00 /day", "NZD 0.30 /kWh", (None, None)),
-        ("2.00 /day", "", (None, None)),
-        # More than a price: the whole text must read as one.
-        ("$2.00 /day + GST", "from $0.30 /kWh", (None, None)),
-        ("$2.00 /day $0.30 /kWh", "$0.30 /kWh, $0.25 /kWh off-peak", (None, None)),
-        ("212.500 c/day extra", "31.41 c/kWh more", (None, None)),
-        # Below 1E+13 in either unit, as written; from 1E+13 up, too large to
-        # divide or to show.
+        ("$2.000000", "$0.300000", (Decimal(2), Decimal("0.3"))),
+        ("$2.12", "$0.3141", (Decimal("2.12"), Decimal("0.3141"))),
+        # Space around it is no part of it; a whole number of dollars reads.
+        (" $2 ", "\t$0.30\n", (Decimal(2), Decimal("0.3"))),
+        ("$0", "$0.0", (Decimal(0), Decimal(0))),
+        # Below 1E+13, as written; from 1E+13 up, too large to show.
         pytest.param(
-            "$1" + "0" * 12 + " /day",
-            "1" + "0" * 12 + " c/kWh",
-            (Decimal("1E12"), Decimal("1E10")),
+            "$1" + "0" * 12,
+            "$" + "9" * 12 + ".5",
+            (Decimal("1E12"), Decimal("999999999999.5")),
             id="at-the-limit",
-        ),
-        pytest.param(
-            "$1" + "0" * 13 + " /day",
-            "1" + "0" * 13 + " c/kWh",
-            (None, None),
-            id="past-the-limit",
-        ),
-        pytest.param(
-            "$" + "9" * 400 + " /day",
-            "9" * 400 + " c/kWh",
-            (None, None),
-            id="past-a-float",
-        ),
-        pytest.param(
-            "$1" + "0" * 1_000_000 + " /day",
-            "1" + "0" * 1_000_003 + " c/kWh",
-            (None, None),
-            id="too-large-to-divide",
         ),
     ],
 )
-def test_prices_read_dollars_or_cents_per_their_band_unit(
-    daily: str, anytime: str, expected: tuple[Decimal | None, Decimal | None]
+def test_a_price_is_its_dollar_amount_as_written(
+    daily: str, anytime: str, expected: tuple[Decimal, Decimal]
 ) -> None:
+    """The amount is the price, its unit given by its band, with no arithmetic."""
     prices = parse_prices(prices_data(daily, anytime))
 
     assert prices == MeridianPrices("Synthetic Plan", *expected)
 
 
-_DAILY_UNREAD = (
-    "Meridian Energy can't read the daily charge in formattedRateIncludingTax; "
-    "it shows unknown"
+@pytest.mark.parametrize(
+    ("text", "shape"),
+    [
+        # A unit, cents, a currency in letters, and words around the amount.
+        ("$0.300000 /kWh", "$N.NNNNNN /AAA"),
+        ("31.41c", "NN.NNA"),
+        ("NZD 0.30", "AAA N.NN"),
+        ("from $0.30", "AAAA $N.NN"),
+        ("$0.30 + GST", "$N.NN + AAA"),
+        # A negative amount, and amounts written otherwise.
+        ("-$0.30", "-$N.NN"),
+        ("$-0.30", "$-N.NN"),
+        ("$1,000.00", "$N,NNN.NN"),
+        ("$.30", "$.NN"),
+        ("$0.", "$N."),
+        ("€0.30", "€N.NN"),
+        # Digits of another script, or full width, are digits all the same.
+        ("$\u0662", "$N"),
+        ("$\uff12", "$N"),
+        # Nothing to read.
+        ("", "empty"),
+        ("   ", "empty"),
+        (None, "missing"),
+        (0.3, "not text"),
+        # Space as one space, and what can't be printed as "?".
+        ("$0.30\u00a0\u200b", "$N.NN ?"),
+        # A long text is cut short.
+        (
+            "$0.30 per kWh including GST and the levy",
+            "$N.NN AAA AAA AAAAAAAAA…",
+        ),
+    ],
 )
-_ANYTIME_UNREAD = (
-    "Meridian Energy can't read the anytime price in formattedRateIncludingTax; "
-    "it shows unknown"
+def test_any_other_price_text_is_unknown_and_listed_by_its_shape(
+    text: object, shape: str
+) -> None:
+    """Only a dollar amount alone reads; anything else is listed, never quoted."""
+    plan = prices_data()
+    plan["meterPoints"][0]["activeAgreement"]["rates"][1][_TAX] = text
+    prices = parse_prices(plan)
+
+    assert prices == MeridianPrices(
+        "Synthetic Plan",
+        Decimal(2),
+        None,
+        (UnreadablePrice("anytime_price", _TAX, shape),),
+    )
+    assert len(shape) <= 24
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "$1" + "0" * 13,
+        "$" + "9" * 400,
+        "$1" + "0" * 1_000_000,
+    ],
+    ids=["past-the-limit", "past-a-float", "a-million-digits"],
 )
+def test_a_price_from_1e13_is_unknown(text: str) -> None:
+    prices = parse_prices(prices_data(daily=text))
 
-
-def test_an_unreadable_price_logs_its_field_name_once(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Each price's field is named once, though both prices read the same field."""
-    caplog.set_level(logging.INFO)
-    for _answer in range(2):
-        parse_prices(prices_data("2 dollars", "$0.30 /day"))
-
-    assert [record.getMessage() for record in caplog.records] == [
-        _DAILY_UNREAD,
-        _ANYTIME_UNREAD,
+    assert prices is not None
+    assert prices.daily_charge is None
+    assert prices.anytime == Decimal("0.3")
+    assert [(item.key, item.field) for item in prices.unreadable] == [
+        ("daily_charge", _TAX)
     ]
-    assert "2 dollars" not in caplog.text
-    assert "$0.30 /day" not in caplog.text
+    assert len(prices.unreadable[0].shape) <= 24
 
 
-def test_the_other_price_unreadable_later_is_named_too(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    caplog.set_level(logging.INFO)
-    parse_prices(prices_data("2 dollars", "$0.30 /kWh"))
-    parse_prices(prices_data("$2.00 /day", "30 cents"))
+def test_both_prices_unreadable_are_both_listed() -> None:
+    prices = parse_prices(prices_data("$2.00 /day", "30 cents"))
 
-    assert [record.getMessage() for record in caplog.records] == [
-        _DAILY_UNREAD,
-        _ANYTIME_UNREAD,
-    ]
+    assert prices is not None
+    assert prices.unreadable == (
+        UnreadablePrice("daily_charge", _TAX, "$N.NN /AAA"),
+        UnreadablePrice("anytime_price", _TAX, "NN AAAAA"),
+    )
 
 
 def test_a_discount_uses_the_discounted_price() -> None:
-    plan = prices_data()
-    plan["meterPoints"][0]["activeAgreement"]["rates"] = [
-        rate("STANDING_CHARGE", "$2.000000 /day", discount="$1.800000 /day"),
-        rate("CONSUMPTION_CHARGE", "$0.300000 /kWh"),
-    ]
+    plan = _plan(
+        rate("STANDING_CHARGE", "$2.000000", discount="$1.800000"),
+        rate("CONSUMPTION_CHARGE", "$0.300000"),
+    )
+    prices = parse_prices(plan)
+
+    assert prices == MeridianPrices("Synthetic Plan", Decimal("1.8"), Decimal("0.3"))
+
+
+def test_a_discounted_price_that_cannot_be_read_names_its_field() -> None:
+    plan = _plan(
+        rate("STANDING_CHARGE", "$2.000000", discount="$1.80 off"),
+        rate("CONSUMPTION_CHARGE", "$0.300000"),
+    )
     prices = parse_prices(plan)
 
     assert prices is not None
-    assert prices.daily_charge == Decimal("1.8")
-    assert prices.anytime == Decimal("0.3")
+    assert prices.daily_charge is None
+    assert prices.unreadable == (
+        UnreadablePrice("daily_charge", _DISCOUNTED, "$N.NN AAA"),
+    )
+
+
+@pytest.mark.parametrize(
+    ("has_discount", "daily"),
+    [(True, Decimal("1.8")), (False, Decimal(2))],
+    ids=repr,
+)
+def test_a_discount_counts_only_when_it_is_true_or_false(
+    has_discount: object, daily: Decimal
+) -> None:
+    """hasDiscount true picks the discounted price, false the one including tax."""
+    standing = rate("STANDING_CHARGE", "$2.000000", discount="$1.800000")
+    standing["hasDiscount"] = has_discount
+    prices = parse_prices(_plan(standing, rate("CONSUMPTION_CHARGE", "$0.300000")))
+
+    assert prices == MeridianPrices("Synthetic Plan", daily, Decimal("0.3"))
+
+
+@pytest.mark.parametrize("has_discount", ["missing", None, "true", 1, 0], ids=repr)
+def test_a_discount_flag_not_true_or_false_leaves_the_price_unknown(
+    has_discount: object,
+) -> None:
+    """Neither text can be said to be the price: it is unknown, and listed."""
+    standing = rate("STANDING_CHARGE", "$2.000000", discount="$1.800000")
+    if has_discount == "missing":
+        del standing["hasDiscount"]
+    else:
+        standing["hasDiscount"] = has_discount
+    prices = parse_prices(_plan(standing, rate("CONSUMPTION_CHARGE", "$0.300000")))
+
+    assert prices == MeridianPrices(
+        "Synthetic Plan",
+        None,
+        Decimal("0.3"),
+        (UnreadablePrice("daily_charge", "hasDiscount", "not true or false"),),
+    )
+
+
+@pytest.mark.parametrize(
+    ("discounted", "shape"),
+    [("delete", "missing"), (None, "missing"), ("", "empty")],
+    ids=["missing", "null", "empty"],
+)
+def test_a_discount_without_its_price_never_falls_back_to_the_full_one(
+    discounted: str | None, shape: str
+) -> None:
+    """A discount's price is its discounted text: without one, it is unknown."""
+    standing = rate("STANDING_CHARGE", "$2.000000", discount="$1.800000")
+    if discounted == "delete":
+        del standing[_DISCOUNTED]
+    else:
+        standing[_DISCOUNTED] = discounted
+    prices = parse_prices(_plan(standing, rate("CONSUMPTION_CHARGE", "$0.300000")))
+
+    assert prices == MeridianPrices(
+        "Synthetic Plan",
+        None,
+        Decimal("0.3"),
+        (UnreadablePrice("daily_charge", _DISCOUNTED, shape),),
+    )
+
+
+def test_the_parser_logs_no_price(caplog: pytest.LogCaptureFixture) -> None:
+    """The parser only lists what it can't read: the coordinator logs it."""
+    caplog.set_level(logging.DEBUG)
+    parse_prices(prices_data("2 dollars", "$0.30 /day"))
+
+    assert not caplog.records
+
+
+def test_a_price_shape_keeps_no_letter_or_digit() -> None:
+    assert price_shape("Synthetic 0123 ABC-9") == "AAAAAAAAA NNNN AAA-N"
+    assert price_shape("x" * 24) == "A" * 24
+    assert price_shape("x" * 25) == "A" * 23 + "…"
+    # Numbers and letters of any kind, after compatibility normalisation:
+    # Roman numerals, fractions and circled ones; an accent is a letter's.
+    assert price_shape("\u216b\u00bd\u2469 \u00e9 \u24b6") == "AAAN\u2044NNN A A"
+    assert price_shape("\u00bd\u2460\u3007") == "N\u2044NNN"
+    # A combining mark that is no letter's is no character it can keep.
+    assert price_shape("e\u0301 \u0301") == "A ?"
 
 
 def _plan(*rates: dict[str, Any]) -> dict[str, Any]:
@@ -356,19 +493,30 @@ def _plan(*rates: dict[str, Any]) -> dict[str, Any]:
     [
         # A time of use, two daily charges, no price per kWh.
         _plan(
-            rate("STANDING_CHARGE", "$2 /day"),
-            rate("CONSUMPTION_CHARGE", "$0.30 /kWh", bucket="Day"),
+            rate("STANDING_CHARGE", "$2"),
+            rate("CONSUMPTION_CHARGE", "$0.30", bucket="Day"),
         ),
         _plan(
-            rate("STANDING_CHARGE", "$2 /day"),
-            rate("STANDING_CHARGE", "$1 /day"),
-            rate("CONSUMPTION_CHARGE", "$0.30 /kWh"),
+            rate("STANDING_CHARGE", "$2"),
+            rate("STANDING_CHARGE", "$1"),
+            rate("CONSUMPTION_CHARGE", "$0.30"),
         ),
-        _plan(rate("STANDING_CHARGE", "$2 /day")),
-        # Two meter points, or none with a current agreement.
+        _plan(rate("STANDING_CHARGE", "$2")),
+        # Two meter points.
         {"meterPoints": prices_data()["meterPoints"] * 2},
-        {"meterPoints": [{"activeAgreement": None}]},
     ],
 )
 def test_any_plan_but_one_all_day_agreement_has_no_prices(plan: dict[str, Any]) -> None:
     assert parse_prices(plan) is None
+
+
+def test_a_meter_point_with_no_agreement_in_force_says_nothing_of_the_plan() -> None:
+    """
+    No agreement in force is told apart from a plan with no all-day prices.
+
+    No agreement in force says nothing of the plan, so the price sensors
+    stay and show unknown, where a plan they cannot show has none.
+    """
+    assert parse_prices({"meterPoints": [{"activeAgreement": None}]}) == (
+        MeridianNoAgreement()
+    )

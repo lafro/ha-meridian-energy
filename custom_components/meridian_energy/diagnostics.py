@@ -18,7 +18,8 @@ async def async_get_config_entry_diagnostics(
     Units are named by their account's and property's positions and their
     direction, never by an identifier; the last failure by its category and
     the class of the error behind it. Of each account's figures, only
-    whether each is known.
+    whether each is known, and the masked shape of each price that can't
+    be read. Skipped accounts and rate limits are counts.
     """
     del hass
     coordinator = entry.runtime_data.coordinator
@@ -42,6 +43,10 @@ async def async_get_config_entry_diagnostics(
             ),
             "first_sync_pending": data is None,
             "account_count": len(coordinator.accounts),
+            # Accounts the latest list left out for their status.
+            "skipped_account_count": coordinator.client.skipped_accounts,
+            # Rate limits met since the entry loaded.
+            "rate_limits": coordinator.rate_limits_met,
             "extras": coordinator.extras_diagnostics(),
             "units": coordinator.unit_diagnostics(),
         },
@@ -79,6 +84,10 @@ async def async_get_config_entry_diagnostics(
                     ),
                     "has_feed_in": result.has_feed_in,
                     "price_sensors": result.price_sensors,
+                    "unreadable_prices": {
+                        item.key: item.shape
+                        for item in (result.prices.unreadable if result.prices else ())
+                    },
                     "known": {
                         "bill_usage": result.bill.usage is not None,
                         "bill_cost": result.bill.cost is not None,

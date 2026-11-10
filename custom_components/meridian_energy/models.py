@@ -14,49 +14,70 @@ class MeridianTokenSet:
     A renewable Firebase authentication session.
 
     The tokens and the Firebase user ID are left out of ``repr`` so that a
-    token set reaching a log line or a traceback never shows them.
+    token set reaching a log line or a traceback never shows them. The user
+    ID is stored but never sent, so an answer without one is still a session.
     """
 
     id_token: str = field(repr=False)
     refresh_token: str = field(repr=False)
     expires_at: datetime
-    user_id: str = field(repr=False)
+    user_id: str | None = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
 class MeridianMeterPoint:
-    """An electricity meter point."""
+    """An electricity meter point; its ID and ICP are kept but never used."""
 
-    id: str
-    market_identifier: str
+    id: str | None
+    market_identifier: str | None
     has_feed_in: bool
 
 
 @dataclass(frozen=True, slots=True)
 class MeridianProperty:
-    """A Meridian property."""
+    """
+    A Meridian property; its address only labels it, None when not given.
+
+    ``feed_in_unread`` says that a register's feed-in flag couldn't be read
+    and no meter point was read as exporting.
+    """
 
     id: str
-    address: str
+    address: str | None
     meter_points: tuple[MeridianMeterPoint, ...]
+    feed_in_unread: bool = False
 
 
 @dataclass(frozen=True, slots=True)
 class MeridianAccount:
-    """A Meridian customer account."""
+    """
+    A Meridian customer account.
+
+    ``skipped_properties`` counts the properties Meridian listed on it that
+    couldn't be read, and are not among ``properties``.
+    """
 
     number: str
     status: str
     properties: tuple[MeridianProperty, ...]
+    skipped_properties: int = 0
 
 
 @dataclass(frozen=True, slots=True)
 class MeridianBillingPeriod:
-    """Billing-cycle metadata for one Meridian account."""
+    """
+    Billing-cycle metadata for one Meridian account.
+
+    The start and end are read strictly and set the bill's period. The next
+    billing date feeds the Next billing date sensor; the period length and
+    whether it is fixed appear only in diagnostics; the multiplier and start
+    day are kept but unused. Every field but the start and end is None when
+    Meridian gave none, or a value that can't be read.
+    """
 
     period_length: str | None
     period_length_multiplier: int | None
-    is_fixed: bool
+    is_fixed: bool | None
     start: date | None
     end: date | None
     next_billing_date: date | None
@@ -90,8 +111,9 @@ class PropertySyncResult:
     """
     Non-sensitive summary of a property sync, from its usage readings.
 
-    The estimated rows are the hours of the last 21 days whose reading is
-    not ``ACTUAL``, oldest and newest included.
+    The latest reading is the end of the newest ``ACTUAL`` hour of the last
+    21 days. The estimated rows are the hours of the last 21 days whose
+    reading is not ``ACTUAL``, oldest and newest included.
     """
 
     property_key: str
@@ -131,12 +153,38 @@ class MeridianBalance:
 
 
 @dataclass(frozen=True, slots=True)
+class UnreadablePrice:
+    """
+    A price whose text couldn't be read: its sensor's key, field and shape.
+
+    The shape is the text masked, numbers as N and letters as A, after
+    compatibility normalisation, and cut short, so it says how the text
+    looked without what it said; or, with no text to mask, a word for why:
+    ``missing``, ``not text``, ``empty`` or ``not true or false``.
+    """
+
+    key: str
+    field: str
+    shape: str
+
+
+@dataclass(frozen=True, slots=True)
 class MeridianPrices:
-    """An all-day plan's name and prices, in NZD; None where unreadable."""
+    """
+    An all-day plan's name and prices, in NZD; None where unreadable.
+
+    ``unreadable`` holds each price that couldn't be read.
+    """
 
     plan: str | None
     daily_charge: Decimal | None
     anytime: Decimal | None
+    unreadable: tuple[UnreadablePrice, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class MeridianNoAgreement:
+    """A property with no agreement in force today, so no plan and no prices."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,12 +205,14 @@ class AccountSyncResult:
 
     ``price_sensors`` says whether the account has price sensors, which
     exist only for one property and one meter point on an all-day plan:
-    None until Meridian's answer has said.
+    None until Meridian's answer has said. ``has_feed_in`` is None while
+    one of the account's properties can't be read and no readable one
+    sends power to the grid.
     """
 
     account_key: str
     billing_period: MeridianBillingPeriod | None
-    has_feed_in: bool
+    has_feed_in: bool | None
     bill: BillFigures = BillFigures()
     total_due: Decimal | None = None
     credit: Decimal | None = None
